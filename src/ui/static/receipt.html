@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Receipt — Business Store</title>
+  <style>
+    body { font-family: 'Courier New', monospace; margin: 0; padding: 2rem; background: #fff; color: #000; }
+    .receipt { max-width: 400px; margin: 0 auto; border: 1px solid #000; padding: 1rem; }
+    h1 { text-align: center; font-size: 1.2rem; margin-top: 0; margin-bottom: 1rem; }
+    .meta { font-size: 0.8rem; margin-bottom: 1rem; }
+    .meta div { margin-bottom: 0.3rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 0.2rem 0.3rem; border: 1px solid #000; font-size: 0.7rem; }
+    th { background: #f0f0f0; text-align: left; }
+    .totals { margin-top: 1rem; border-top: 1px solid #000; padding-top: 1rem; }
+    .totals div { margin-bottom: 0.3rem; }
+    .note { font-size: 0.6rem; color: #666; margin-top: 1rem; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="receipt">
+    <h1>SALES RECEIPT</h1>
+    
+    <div class="meta">
+      <div>Receipt #: <span id="receiptNumber"></span></div>
+      <div>Date: <span id="receiptDate"></span></div>
+      <div>Cashier: <span id="cashierName"></span></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>S/N</th>
+          <th>Description</th>
+          <th>Brand</th>
+          <th>Serial No</th>
+          <th>Qty</th>
+          <th>Cost Price</th>
+          <th>Interest</th>
+          <th>Total Amt</th>
+        </tr>
+      </thead>
+      <tbody id="receiptItems">
+        <!-- Items loaded dynamically -->
+      </tbody>
+    </table>
+
+    <div class="totals">
+      <div>Subtotal: <span id="subtotal">0</span></div>
+      <div>Interest: <span id="interest">0</span></div>
+      <div>Grand Total: <span id="grandTotal"></span></div>
+    </div>
+
+    <div class="note">
+      Thank you for your purchase!<br>
+      Items sync to other tills when network is available.
+    </div>
+  </div>
+
+  <script>
+    // Load receipt data from the server API
+    async function loadReceipt(saleId) {
+      const response = await fetch(`/api/sales/${saleId}`);
+      const receipt = await response.json();
+      
+      document.getElementById('receiptNumber').textContent = receipt.receiptNumber;
+      document.getElementById('receiptDate').textContent = new Date(receipt.created_at).toLocaleDateString();
+      document.getElementById('cashierName').textContent = receipt.cashierName || 'Unknown';
+      
+      const tbody = document.getElementById('receiptItems');
+      tbody.innerHTML = '';
+      
+      let subtotal = 0;
+      let interest = 0;
+      
+      receipt.items.forEach((item, i) => {
+        const lineTotal = item.quantity * item.unit_price;
+        subtotal += lineTotal;
+        
+        // Calculate interest (simple example: 5% of line total)
+        const lineInterest = Math.round(lineTotal * 0.05);
+        interest += lineInterest;
+        const totalAmt = lineTotal + lineInterest;
+        
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${i + 1}</td>
+          <td>${item.name}</td>
+          <td>${item.brandName || '-'}</td>
+          <td>${item.serialNo || '-'}</td>
+          <td>${item.quantity}</td>
+          <td>${item.costPrice}</td>
+          <td>${lineInterest}</td>
+          <td>${totalAmt}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+      
+      document.getElementById('subtotal').textContent = subtotal;
+      document.getElementById('interest').textContent = interest;
+      document.getElementById('grandTotal').textContent = subtotal + interest;
+    }
+    
+    // Initialize - show receipt for the last sale (from local storage or server)
+    document.addEventListener('DOMContentLoaded', () => {
+      // Try to get the last sale ID from localStorage (set during checkout)
+      const lastSaleId = localStorage.getItem('lastSaleId');
+      if (lastSaleId) {
+        loadReceipt(lastSaleId);
+      } else {
+        // Fallback: show a sample receipt
+        document.getElementById('receiptNumber').textContent = '#' + Math.floor(Math.random() * 9000) + 1000;
+        document.getElementById('receiptDate').textContent = new Date().toLocaleDateString();
+        document.getElementById('cashierName').textContent = 'Cashier';
+        
+        const tbody = document.getElementById('receiptItems');
+        tbody.innerHTML = `
+          <tr><td>1</td><td>MTN SIM Card XL</td><td>MTN</td><td>SIM-CARD-001</td><td>2</td><td>200</td><td>10</td><td>500</td></tr>
+          <tr><td>2</td><td>Glo Tariff Plan</td><td>Glo</td><td>GLO-PLAN-001</td><td>1</td><td>150</td><td>8</td><td>238</td></tr>
+        `;
+        
+        document.getElementById('subtotal').textContent = 350;
+        document.getElementById('interest').textContent = 18;
+        document.getElementById('grandTotal').textContent = 368;
+      }
+    });
+  </script>
+</body>
+</html>

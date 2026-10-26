@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Business Store Till</title>
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <!-- Login: cashier picks a name and enters the PIN bound to this till. -->
+  <section id="login-view">
+    <h1>Business Store Till</h1>
+    <form id="login-form">
+      <select id="login-user" required aria-label="Cashier"></select>
+      <input
+        id="login-pin"
+        type="password"
+        inputmode="numeric"
+        autocomplete="off"
+        placeholder="PIN"
+        required
+        aria-label="PIN"
+      />
+      <button type="submit">Log in</button>
+      <p id="login-error" role="alert"></p>
+    </form>
+  </section>
+
+  <section id="till-view" hidden>
+    <header>
+      <h1>Till</h1>
+      <span id="cashier-name"></span>
+      <span id="shift-status"></span>
+      <button id="open-shift">Open shift</button>
+      <button id="logout">Log out</button>
+      <!-- Manager actions -->
+      <div id="manager-actions" style="display: none; margin-left: 1rem;">
+        <button id="price-override" title="Override price (manager)">Price Adj</button>
+        <button id="stock-adj-large" title="Large stock adjustment (manager)">Stock Adj</button>
+        <button id="shift-approve" title="Approve shift (manager)">Shift App</button>
+      </div>
+      <!-- Admin actions -->
+      <div id="admin-actions" style="display: none; margin-left: 1rem;">
+        <button id="user-mgmt" title="User management (admin)">Users</button>
+        <button id="device-reg" title="Device registration (admin)">Devices</button>
+        <button id="report-view" title="View reports (admin)">Reports</button>
+      </div>
+      <button id="sales-report" style="display: none; margin-left: 1rem; width: 120px;">Sales Report</button>
+
+    <main>
+      <section id="catalog" aria-label="Products"></section>
+
+      <aside id="cart" aria-label="Cart">
+        <h2>Cart</h2>
+        <ul id="cart-lines"></ul>
+        <p id="cart-empty">Cart is empty.</p>
+        <p id="cart-total"></p>
+      <select id="payment-method">
+        <option value="cash">Cash</option>
+        <option value="mobile_money">Mobile Money (Momo)</option>
+        <option value="card">Card</option>
+        <option value="bank_transfer">Bank Transfer</option>
+      </select>
+        <button id="checkout" disabled>Sell (cash)</button>
+        <p id="checkout-error" role="alert"></p>
+      </aside>
+    </main>
+
+    <!-- Receipt shows the AUTHORITATIVE totals repriced by the domain layer. -->
+    <dialog id="receipt">
+      <h3 id="receipt-number"></h3>
+      <ul id="receipt-lines"></ul>
+      <p id="receipt-totals"></p>
+      <div id="detailed-receipt" style="display: none; margin-top: 1rem;">
+        <p><strong>Date:</strong> <span id="receiptDate"></span></p>
+        <p><strong>Cashier:</strong> <span id="cashierName"></span></p>
+        <p><strong>Customer:</strong> <span id="customerRef"></span></p>
+        <p><strong>Payment:</strong> <span id="paymentOption"></span></p>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 0.5rem;">
+          <thead>
+            <tr>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">S/N</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Description</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Brand</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Serial No</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Qty</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Cost Price</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Interest</th>
+              <th style="padding: 0.5rem; border: 1px solid #000; text-align: left;">Total Amt</th>
+            </tr>
+          </thead>
+          <tbody id="detailedItems"></tbody>
+        </table>
+        <p><strong>Grand Total:</strong> <span id="grandTotal"></span></p>
+      </div>
+      <p>Sync pending &mdash; uploads when the network is back.</p>
+      <button id="receipt-close">New sale</button>
+    </dialog>
+  </section>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

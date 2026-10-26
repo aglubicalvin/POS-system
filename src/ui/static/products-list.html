@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Product Catalog — Manager</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #f4f5f7; color: #1c2733; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { margin-top: 0; }
+    .toolbar { margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center; }
+    .toolbar h1 { margin: 0; }
+    .toolbar .btn { display: inline-block; background: #28a745; color: white; padding: 0.5rem 1rem; border-radius: 4px; text-decoration: none; font-size: 0.875rem; }
+    .toolbar .btn-secondary { background: #6c757d; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #dee2e6; }
+    th { background: #e9ecef; }
+    .cell-version { color: #6c757d; font-size: 0.75rem; }
+    .action-btns { display: flex; gap: 0.5rem; }
+    .action-btn { padding: 0.25rem 0.5rem; font-size: 0.75rem; border: none; border-radius: 3px; cursor: pointer; }
+    .action-btn.view { background: #17a2b8; color: white; }
+    .action-btn.edit { background: #ffc107; color: #1c2733; }
+    .action-btn.delete { background: #dc3545; color: white; }
+    .form-group { margin-bottom: 1rem; }
+    .form-group label { display: block; margin-bottom: 0.25rem; font-size: 0.875rem; }
+    .form-group input, .form-group select { width: 100%; padding: 0.5rem; font-size: 1rem; }
+    .form-group .small { font-size: 0.75rem; color: #6c757d; }
+    .btn { display: inline-block; padding: 0.5rem 1rem; font-size: 0.875rem; border: none; border-radius: 4px; cursor: pointer; }
+    .btn-primary { background: #007bff; color: white; }
+    .btn-secondary { background: #6c757d; color: white; }
+    .btn-success { background: #28a745; color: white; }
+    .btn-danger { background: #dc3545; color: white; }
+    .alert { padding: 0.75rem; margin-bottom: 1rem; border-radius: 4px; }
+    .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .alert-error { background: #f8d7da; color: #721f1a; border: 1px solid #f5c6cb; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Product Catalog</h1>
+    <div class="toolbar">
+      <h1>Product Catalog</h1>
+      <a href="#new-product" class="btn btn-primary">Add Product</a>
+      <input type="text" id="searchInput" onkeyup="filterTable()" placeholder="Search SKU or name..." aria-label="Search products" style="padding: 0.5rem; font-size: 1rem;">
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>S/N</th>
+          <th>SKU</th>
+          <th>Name</th>
+          <th>Unit Price</th>
+          <th>Cost Price</th>
+          <th>Tax BP</th>
+          <th>Stock Threshold</th>
+          <th>Active</th>
+          <th>Version</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="productTable">
+        <!-- Products loaded by JavaScript -->
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Edit Product Modal -->
+  <div id="editModal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);justify-content:center;align-items:center;">
+    <div style="background:white;padding:2rem;border-radius:8px;max-width:500px;width:100%;">
+      <h2>Edit Product</h2>
+      <form id="editProductForm">
+        <input type="hidden" id="editProductId">
+        <div class="form-group">
+          <label>SKU</label>
+          <input type="text" id="editSku" required>
+        </div>
+        <div class="form-group">
+          <label>Name</label>
+          <input type="text" id="editName" required>
+        </div>
+        <div class="form-group">
+          <label>Unit Price (minor units)</label>
+          <input type="number" id="editUnitPrice" min="0" required>
+        </div>
+        <div class="form-group">
+          <label>Cost Price (minor units)</label>
+          <input type="number" id="editCostPrice" min="0" required>
+        </div>
+        <div class="form-group">
+          <label>Tax Rate (basis points)</label>
+          <input type="number" id="editTaxRateBp" min="0" max="100000" required>
+        </div>
+        <div class="form-group">
+          <label>Low Stock Threshold</label>
+          <input type="number" id="editLowStockThreshold" min="0" required>
+        </div>
+        <div class="form-group">
+          <label>Is Active</label>
+          <input type="checkbox" id="editIsActive" checked>
+        </div>
+        <div class="form-group">
+          <label>Version (read-only)</label>
+          <span id="editVersion" style="color: #6c757d;"></span>
+        </div>
+        <div style="margin-top: 1.5rem; display: flex; justify-content: flex-end; gap: 0.5rem;">
+          <button type="button" class="btn btn-secondary" onclick="closeEditModal()">Cancel</button>
+          <button type="submit" class="btn btn-success">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    // Load products from the server API
+    async function loadProducts() {
+      const search = document.getElementById('searchInput').value || '';
+      const response = await fetch(`/api/products?search=${encodeURIComponent(search)}`);
+      const products = await response.json();
+      const tbody = document.getElementById('productTable');
+      tbody.innerHTML = '';
+      products.forEach((p, i) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${i + 1}</td>
+          <td>${p.sku}</td>
+          <td>${p.name}</td>
+          <td>${p.unit_price}</td>
+          <td>${p.cost_price}</td>
+          <td>${p.tax_rate_bp}</td>
+          <td>${p.low_stock_threshold}</td>
+          <td>${p.is_active ? 'Yes' : 'No'}</td>
+          <td class="cell-version">${p.version || 1}</td>
+          <td>
+            <button class="action-btn view" onclick="viewProduct('${p.product_id}')">View</button>
+            <button class="action-btn edit" onclick="openEditModal('${p.product_id}')">Edit</button>
+          </td>
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function filterTable() {
+      const search = document.getElementById('searchInput').value.toLowerCase();
+      const rows = document.querySelectorAll('#productTable tr');
+      rows.forEach(row => {
+        const sku = row.cells[1].innerText.toLowerCase();
+        const name = row.cells[2].innerText.toLowerCase();
+        row.style.display = (sku.includes(search) || name.includes(search)) ? '' : 'none';
+      });
+    }
+
+    function openEditModal(productId) {
+      // Fetch product details from server
+      fetch(`/api/products/${productId}`)
+        .then(r => r.json())
+        .then(p => {
+          document.getElementById('editProductId').value = p.product_id;
+          document.getElementById('editSku').value = p.sku;
+          document.getElementById('editName').value = p.name;
+          document.getElementById('editUnitPrice').value = p.unit_price;
+          document.getElementById('editCostPrice').value = p.cost_price;
+          document.getElementById('editTaxRateBp').value = p.tax_rate_bp;
+          document.getElementById('editLowStockThreshold').value = p.low_stock_threshold;
+          document.getElementById('editIsActive').checked = p.is_active === 1;
+          document.getElementById('editVersion').innerText = p.version || 1;
+          document.getElementById('editModal').style.display = 'flex';
+        });
+    }
+
+    function closeEditModal() {
+      document.getElementById('editModal').style.display = 'none';
+      document.getElementById('editProductForm').reset();
+    }
+
+    async function handleEditSubmit(e) {
+      e.preventDefault();
+      const form = e.target;
+      const payload = {
+        sku: form.editSku.value,
+        name: form.editName.value,
+        unitPrice: parseInt(form.editUnitPrice.value),
+        costPrice: parseInt(form.editCostPrice.value),
+        taxRateBp: parseInt(form.editTaxRateBp.value),
+        lowStockThreshold: parseInt(form.editLowStockThreshold.value),
+        isActive: form.editIsActive.checked ? 1 : 0,
+        version: parseInt(form.editVersion.innerText)
+      };
+      
+      const response = await fetch(`/api/products/${form.editProductId.value}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      
+      const result = await response.json();
+      if (response.ok) {
+        alert('Product updated successfully. Version incremented to ' + result.newVersion + '. Changes will sync to other tills.');
+        closeEditModal();
+        loadProducts();
+      } else {
+        alert('Error: ' + (result.message || 'Unknown error'));
+      }
+    }
+
+    document.getElementById('editProductForm').addEventListener('submit', handleEditSubmit);
+
+    // Initialize
+    loadProducts();
+  </script>
+</body>
+</html>

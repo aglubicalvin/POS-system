@@ -1,0 +1,166 @@
+body {
+  font-family: system-ui, sans-serif;
+  margin: 0;
+  background: #f4f5f7;
+  color: #1c2733;
+}
+
+#login-view {
+  max-width: 280px;
+  margin: 12vh auto;
+  padding: 1.5rem;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  text-align: center;
+}
+
+#login-view form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+#login-view select,
+#login-view input,
+#login-view button {
+  padding: 0.6rem;
+  font-size: 1rem;
+}
+
+#login-error {
+  color: #a32121;
+  min-height: 1.2em;
+}
+
+#till-view header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1rem;
+  background: #fff;
+  border-bottom: 1px solid #d8dde3;
+}
+
+#till-view header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+#shift-status {
+  color: #0a7d33;
+}
+
+#till-view main {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+#catalog {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 0.6rem;
+  align-content: start;
+}
+
+.product {
+  background: #fff;
+  border: 1px solid #d8dde3;
+  border-radius: 8px;
+  padding: 0.75rem;
+  cursor: pointer;
+}
+
+.product h3 {
+  font-size: 0.95rem;
+  margin: 0 0 0.4rem;
+}
+
+.product p {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: #5a6a7a;
+}
+
+.product .price {
+  font-weight: 700;
+  color: #1c2733;
+}
+
+.product.out-of-stock {
+  opacity: 0.55;
+}
+
+#cart {
+  background: #fff;
+  border: 1px solid #d8dde3;
+  border-radius: 8px;
+  padding: 0.75rem;
+  align-self: start;
+}
+
+#cart-lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#cart-lines li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #eef1f4;
+}
+
+#cart-lines .name {
+  flex: 1;
+}
+
+#cart-lines button,
+#open-shift,
+#logout,
+#checkout,
+#receipt-close {
+  padding: 0.35rem 0.6rem;
+  cursor: pointer;
+}
+
+#checkout {
+  width: 100%;
+  margin-top: 0.6rem;
+}
+
+#cart-empty {
+  color: #5a6a7a;
+}
+
+#checkout-error {
+  color: #a32121;
+  min-height: 1.2em;
+}
+
+#receipt {
+  border: none;
+  border-radius: 10px;
+  padding: 1.2rem;
+  min-width: 320px;
+}
+
+#receipt::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+#receipt ul {
+  list-style: none;
+  padding: 0;
+  font-size: 0.9rem;
+}
+
+#receipt-lines li {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
