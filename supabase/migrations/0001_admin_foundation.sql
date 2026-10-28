@@ -34,17 +34,12 @@ create table if not exists profiles (
 
 alter table profiles enable row level security;
 
--- A user reads exactly their own row; administrators read all rows. Without
--- a matching row here, the admin app's gate denies access.
-
-create policy profiles_self_read on profiles
-  for select using (auth.uid() = id);
-create policy profiles_admin_read on profiles
-  for select using (public.is_admin());
-
 -- ------------------------------------------------------------------
 -- Authorization helper
 -- ------------------------------------------------------------------
+-- Defined BEFORE the policies below: every one of them references
+-- public.is_admin(), so a single-shot migration apply (Supabase SQL editor,
+-- CLI, psql, or a client transaction) fails otherwise.
 create or replace function public.is_admin() returns boolean
 language sql stable security definer set search_path = public as $$
   select exists (
@@ -53,13 +48,18 @@ language sql stable security definer set search_path = public as $$
   );
 $$;
 
+-- is_admin() must stay executable by authenticated users: policies below call
+-- it. It is SECURITY DEFINER but reads only `profiles`, so it cannot be
+-- abused to leak other tables. (No REVOKE: revoking execute from
+-- `authenticated` would break every policy that references it.)
 
+-- A user reads exactly their own row; administrators read all rows. Without
+-- a matching row here, the admin app's gate denies access.
 
--- Policies on sales etc. call is_admin(), so it must stay executable by
--- authenticated users. It is SECURITY DEFINER but reads only `profiles`, so
--- it cannot be abused to leak other tables.
--- (No REVOKE here: revoking execute from `authenticated` would break every
--- policy that references it.)
+create policy profiles_self_read on profiles
+  for select using (auth.uid() = id);
+create policy profiles_admin_read on profiles
+  for select using (public.is_admin());
 
 -- ------------------------------------------------------------------
 -- Canonical POS tables: administrators get SELECT only. Writes still belong
@@ -111,11 +111,3 @@ from products p
 join stock_on_hand soh on soh.product_id = p.product_id
 where p.is_active and soh.quantity <= p.low_stock_threshold;
 
--- ------------------------------------------------------------------
--- Seed hook for the first administrator. Replace the email below with the
--- owner's Supabase auth identity (create the auth user first via the CLI or
--- the dashboard), then run this block once and REMOVE it afterwards.
--- ------------------------------------------------------------------
--- insert into profiles (id, full_name, role, is_active, mfa_required)
--- select u.id, '<FULL NAME>', 'admin', true, true
--- from auth.users u where u.email = '<admin@example.com>';
