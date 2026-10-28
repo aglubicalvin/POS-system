@@ -76,7 +76,20 @@ export function AdminAuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const supabase = getSupabaseClient();
+      let supabase: ReturnType<typeof getSupabaseClient>;
+      try {
+        supabase = getSupabaseClient();
+      } catch (e) {
+        // Unconfigured environment (missing EXPO_PUBLIC_SUPABASE_*): show a
+        // clear message on the login screen rather than crashing.
+        setState({
+          status: 'signed-out',
+          profile: null,
+          gate: null,
+          message: e instanceof Error ? e.message : 'backend configuration missing',
+        });
+        return;
+      }
       const { data } = await supabase.auth.getSession();
       if (cancelled) return;
       const session = data.session ?? null;
