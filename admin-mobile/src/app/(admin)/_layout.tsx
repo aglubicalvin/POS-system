@@ -15,6 +15,10 @@ export default function AdminLayout() {
     <Stack>
       <Stack.Screen name="dashboard" options={{ title: 'Dashboard', headerShown: true }} />
       <Stack.Screen name="products" options={{ title: 'Products & prices', headerShown: true }} />
+      <Stack.Screen name="customers" options={{ title: 'Customers & Payroll', headerShown: true }} />
+      <Stack.Screen name="hire-purchase" options={{ title: 'Hire Purchase', headerShown: true }} />
+      <Stack.Screen name="inventory" options={{ title: 'Inventory', headerShown: true }} />
+      <Stack.Screen name="pos" options={{ title: 'POS', headerShown: true }} />
     </Stack>
   );
 }

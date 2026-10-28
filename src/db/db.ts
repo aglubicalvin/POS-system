@@ -16,6 +16,7 @@ export function nowIso(): string {
  * Open a database and ensure the schema exists. Passing ':memory:' gives each
  * test an isolated store; on a device this points at the local SQLite file and
  * on CI it can point at a temp file to exercise WAL + durability.
+ * Unified migration tracking.
  */
 export function openDb(path = ':memory:'): Db {
   const db = new DatabaseSync(path);
@@ -24,7 +25,16 @@ export function openDb(path = ':memory:'): Db {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA synchronous = FULL;');
   }
+  // Create migration tracking table for unified migrations
+  db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );`);
   db.exec(SCHEMA_SQLITE);
+  try {
+    db.exec("INSERT OR IGNORE INTO schema_migrations (version, name) VALUES ('0000', 'baseline_schema');");
+  } catch {}
   txDepth.set(db, 0);
   return db;
 }

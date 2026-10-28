@@ -76,7 +76,30 @@ object Schema {
 
     fun apply(dataSource: DataSource) {
         dataSource.connection.use { conn ->
-            conn.createStatement().use { statement -> statement.execute(ddl()) }
+            // Ensure migrations tracking table exists
+            conn.createStatement().use { statement ->
+                statement.execute(
+                    "create schema if not exists supabase_migrations; " +
+                    "create table if not exists supabase_migrations.schema_migrations (" +
+                    " version text primary key," +
+                    " statements jsonb," +
+                    " name text not null," +
+                    " statements_hash text," +
+                    " executed_at timestamp not null default clock_timestamp())"
+                )
+            }
+            // Apply base schema if not already tracked
+            conn.createStatement().use { statement ->
+                statement.execute(ddl())
+            }
+            // Record base schema if not recorded
+            conn.createStatement().use { statement ->
+                statement.execute(
+                    "insert into supabase_migrations.schema_migrations (version, name, statements) " +
+                    "values ('0000', 'baseline_schema', to_jsonb('applied by Schema.apply'::text)) " +
+                    "on conflict (version) do nothing"
+                )
+            }
         }
     }
 
