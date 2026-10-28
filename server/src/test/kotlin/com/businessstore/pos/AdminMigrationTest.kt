@@ -170,10 +170,7 @@ class AdminMigrationTest {
     private fun isAdminAs(subject: UUID?): Boolean = db.read { conn ->
         conn.createStatement().use { it.execute("SET ROLE authenticated") }
         try {
-            conn.prepareStatement("SELECT set_config('request.jwt.claim.sub', ?, false)").use { st ->
-                st.setString(1, subject?.toString() ?: "")
-                st.executeQuery().close()
-            }
+            setJwtSubject(conn, subject)
             conn.createStatement().use { st ->
                 st.executeQuery("SELECT public.is_admin()").use { rs ->
                     rs.next()
@@ -203,6 +200,155 @@ class AdminMigrationTest {
             }
         }
         return id
+    }
+
+    /** Sets the `request.jwt.claim.sub` the auth.uid() shim reads. */
+    private fun setJwtSubject(conn: Connection, subject: UUID?) {
+        conn.prepareStatement("SELECT set_config('request.jwt.claim.sub', ?, false)").use { st ->
+            st.setString(1, subject?.toString() ?: "")
+            st.executeQuery().close()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Migration 0004: the 0002 RPCs run with an empty search_path
+    // ------------------------------------------------------------------
+    @Test
+    fun `admin rpcs are pinned to an empty search_path with qualified objects`() {
+        val defs = db.read { conn ->
+            conn.createStatement().use { st ->
+                st.executeQuery(
+                    """
+                    SELECT p.proname, pg_get_functiondef(p.oid)
+                    FROM pg_proc p
+                    JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'public'
+                      AND p.proname IN ('admin_update_product_price', 'admin_set_product_category')
+                    """.trimIndent(),
+                ).use { rs ->
+                    buildMap {
+                        while (rs.next()) put(rs.getString(1), rs.getString(2))
+                    }
+                }
+            }
+        }
+
+        assertEquals(setOf("admin_update_product_price", "admin_set_product_category"), defs.keys)
+        for ((name, def) in defs) {
+            assertTrue(
+                def.lowercase().contains("set search_path to ''"),
+                "$name must pin search_path to empty (got: ${def.lines().first { it.contains("search_path") }})",
+            )
+            for (unqualified in listOf("from products", "into public.products", "into product_price_audit",
+                                       "into product_categories", "join product_categories")) {
+                val offending = unqualified.removePrefix("public.")
+                assertTrue(
+                    !Regex("(?i)(from|join|update|into)\\s+$offending\\b").containsMatchIn(def),
+                    "$name references $offending unqualified",
+                )
+            }
+        }
+        assertTrue(defs.getValue("admin_update_product_price").contains("public.product_price_audit"))
+        assertTrue(defs.getValue("admin_set_product_category").contains("public.product_categories"))
+    }
+
+    @Test
+    fun `admin rpcs write price audit and category, and refuse non-admins`() {
+        val admin = newAuthUser("Owner", "admin", active = true)
+        val cashierSubject = newAuthUser("Ama", "cashier", active = true)
+        val productId = insertProduct("TV-001", "Television 43in", unitPrice = 100_000, costPrice = 80_000)
+
+        // Happy path, through the real permission path (role + JWT subject).
+        db.transaction { conn ->
+            conn.createStatement().use { it.execute("SET ROLE authenticated") }
+            try {
+                setJwtSubject(conn, admin)
+                conn.prepareStatement("SELECT public.admin_update_product_price(?, ?, ?)").use { st ->
+                    st.setString(1, productId)
+                    st.setLong(2, 105_000)
+                    st.setString(3, "supplier increase")
+                    st.execute()
+                }
+                conn.prepareStatement("SELECT public.admin_set_product_category(?, ?)").use { st ->
+                    st.setString(1, productId)
+                    st.setString(2, "  Electronics  ")
+                    st.execute()
+                }
+            } finally {
+                conn.createStatement().use { it.execute("RESET ROLE") }
+            }
+        }
+
+        val priceAndCategory = db.read { conn ->
+            conn.prepareStatement(
+                """
+                SELECT p.unit_price, c.category
+                FROM products p
+                LEFT JOIN product_categories c ON c.product_id = p.product_id
+                WHERE p.product_id = ?
+                """.trimIndent(),
+            ).use { st ->
+                st.setString(1, productId)
+                st.executeQuery().use { rs ->
+                    rs.next()
+                    rs.getLong(1).toString() to rs.getString(2)
+                }
+            }
+        }
+        assertEquals(105_000L.toString() to "Electronics", priceAndCategory)
+
+        val audit = db.read { conn ->
+            conn.createStatement().use { st ->
+                st.executeQuery(
+                    "SELECT old_price, new_price, changed_by, reason FROM product_price_audit",
+                ).use { rs ->
+                    rs.next()
+                    listOf(
+                        rs.getLong("old_price").toString(),
+                        rs.getLong("new_price").toString(),
+                        rs.getString("changed_by"),
+                        rs.getString("reason"),
+                    )
+                }
+            }
+        }
+        assertEquals(listOf("100000", "105000", admin.toString(), "supplier increase"), audit)
+
+        // A non-admin ctx is refused before anything is touched.
+        val failure = assertFailsWith<SQLException> {
+            // Autocommit reader: after the RPC refuses, the session must still
+            // be usable for RESET ROLE (a transaction would be left aborted).
+            db.read { conn ->
+                conn.createStatement().use { it.execute("SET ROLE authenticated") }
+                try {
+                    setJwtSubject(conn, cashierSubject)
+                    conn.prepareStatement("SELECT public.admin_update_product_price(?, ?, ?)").use { st ->
+                        st.setString(1, productId)
+                        st.setLong(2, 110_000)
+                        st.setString(3, "unauthorized change")
+                        st.execute()
+                    }
+                } finally {
+                    conn.createStatement().use { it.execute("RESET ROLE") }
+                }
+            }
+        }
+        assertTrue(
+            failure.message.orEmpty().contains("only administrators"),
+            "expected the admin gate message, got: ${failure.message}",
+        )
+        val priceAfterRefusal = db.read { conn ->
+            conn.prepareStatement(
+                "SELECT unit_price FROM products WHERE product_id = ?",
+            ).use { st ->
+                st.setString(1, productId)
+                st.executeQuery().use { rs ->
+                    rs.next()
+                    rs.getLong(1)
+                }
+            }
+        }
+        assertEquals(105_000L, priceAfterRefusal)
     }
 
     private fun insertProduct(sku: String, name: String, unitPrice: Long, costPrice: Long): String {
@@ -340,7 +486,8 @@ private object Migrations {
         // Canonical POS schema first — the migrations layer on top of it.
         Schema.apply(db)
         for (file in listOf("0001_admin_foundation.sql", "0002_product_management.sql",
-                            "0003_dashboard_aggregation_and_authz.sql")) {
+                            "0003_dashboard_aggregation_and_authz.sql",
+                            "0004_rpc_search_path_hardening.sql")) {
             val sql = Files.readString(migrationsDir().resolve(file))
             db.read { conn -> conn.createStatement().use { it.execute(sql) } }
         }
