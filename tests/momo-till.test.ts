@@ -10,7 +10,9 @@ import {
   type MomoVerification,
 } from '../src/domain/momo.ts';
 import { startTillUi, type TillUiHandle } from '../src/ui/server.ts';
+import { run } from '../src/db/db.ts';
 import { seedStore, type SeededStore } from './helpers.ts';
+import { verifyChain } from '../src/domain/audit.ts';
 
 /**
  * The mobile-money flow over the REAL till HTTP surface: a MoMo checkout must
@@ -195,6 +197,46 @@ describe('till mobile-money flow over real http', () => {
     const events = paymentEventsFor(receipt.paymentId);
     expect(events).toHaveLength(1);
     expect(events[0]!.payload.status).toBe('failed');
+  });
+
+  it('keeps the audit chain intact — and detectable-tamper — across the momo lifecycle', async () => {
+    const tokenValue = await token();
+
+    // Drive a full lifecycle for one attempt: initiate then confirm at the poll.
+    const confirmed = await momoCheckout(tokenValue);
+    await initiate(tokenValue, confirmed.paymentId);
+    fake.queueVerdicts({ status: 'confirmed' });
+    await fetch(statusUrl(confirmed.paymentId), { headers: auth(tokenValue) });
+
+    // …and a failed one, so both verdict audit entries exist.
+    const failed = await momoCheckout(tokenValue);
+    await initiate(tokenValue, failed.paymentId);
+    fake.queueVerdicts({ status: 'failed', failureReason: 'wallet timed out' });
+    await fetch(statusUrl(failed.paymentId), { headers: auth(tokenValue) });
+
+    // Every money transition the provider caused is in the audit chain, in order.
+    const actions = all<{ action: string; entity_id: string | null }>(
+      store.db,
+      "SELECT action, entity_id FROM audit_log WHERE device_id = ? AND entity_type = 'payment' ORDER BY seq",
+      store.deviceId,
+    );
+    expect(actions.filter((a) => a.entity_id === confirmed.paymentId).map((a) => a.action)).toEqual([
+      'payment.momo_initiated',
+      'payment.confirmed',
+    ]);
+    expect(actions.filter((a) => a.entity_id === failed.paymentId).map((a) => a.action)).toEqual([
+      'payment.momo_initiated',
+      'payment.failed',
+    ]);
+
+    // The chain itself is intact — each row covers its content and its predecessor.
+    expect(verifyChain(store.db, store.deviceId)).toMatchObject({ ok: true });
+
+    // Tamper-evidence: silently editing a historical entry breaks the chain.
+    run(store.db, "UPDATE audit_log SET details = '{\"amount\":1}' WHERE entity_id = ? AND action = 'payment.confirmed'", confirmed.paymentId);
+    const verdict = verifyChain(store.db, store.deviceId);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.reason).toContain('hash mismatch');
   });
 
   it('refuses initiation of anything that is not a pending mobile-money attempt', async () => {
