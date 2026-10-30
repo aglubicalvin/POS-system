@@ -36,15 +36,14 @@ export function validateProductEdit(draft: ProductEditDraft): EditValidation {
     }
   }
 
-  const reason = draft.reason.trim();
-  if (reason.length < 3) {
-    result.ok = false;
-    result.reasonError = 'A reason of at least 3 characters is required';
-  } else {
-    result.reason = reason;
-  }
-
-  if (draft.priceText.trim() !== '') {
+  if (price !== '') {
+    const reason = draft.reason.trim();
+    if (reason.length < 3) {
+      result.ok = false;
+      result.reasonError = 'A reason of at least 3 characters is required';
+    } else {
+      result.reason = reason;
+    }
     result.newPrice = parsePricePesewas(price);
   }
   const category = draft.category.trim();

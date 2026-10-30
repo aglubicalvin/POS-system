@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import { Redirect, Stack } from 'expo-router';
 import { useAdminAuth } from '@/context/AuthContext';
 
@@ -18,7 +17,8 @@ export default function AdminLayout() {
       <Stack.Screen name="customers" options={{ title: 'Customers & Payroll', headerShown: true }} />
       <Stack.Screen name="hire-purchase" options={{ title: 'Hire Purchase', headerShown: true }} />
       <Stack.Screen name="inventory" options={{ title: 'Inventory', headerShown: true }} />
-      <Stack.Screen name="pos" options={{ title: 'POS', headerShown: true }} />
+      <Stack.Screen name="pos" options={{ title: 'POS preview', headerShown: true }} />
+      <Stack.Screen name="payments" options={{ title: 'MoMo payments', headerShown: true }} />
     </Stack>
   );
 }

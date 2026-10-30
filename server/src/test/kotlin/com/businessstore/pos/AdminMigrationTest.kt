@@ -4,8 +4,6 @@ import com.businessstore.pos.db.Database
 import com.businessstore.pos.db.Schema
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import java.nio.file.Files
-import java.nio.file.Path
 import java.sql.Connection
 import java.sql.SQLException
 import java.time.OffsetDateTime
@@ -30,7 +28,7 @@ class AdminMigrationTest {
     @BeforeEach
     fun reset() {
         Schema.apply(db)
-        Migrations.ensure(db)
+        SupabaseMigrations.ensure(db)
         db.transaction { conn ->
             conn.createStatement().use {
                 it.execute("TRUNCATE profiles, auth.users, sale_items, sales, products, users CASCADE")
@@ -470,59 +468,3 @@ class AdminMigrationTest {
     }
 }
 
-/**
- * Applies the Supabase migrations once per test JVM, after installing the small
- * slice of the Supabase environment they depend on (auth schema, JWT helper and
- * the three PostgREST roles).
- */
-private object Migrations {
-    @Volatile
-    private var applied = false
-
-    @Synchronized
-    fun ensure(db: Database) {
-        if (applied) return
-        db.read { conn -> installSupabaseShim(conn) }
-        // Canonical POS schema first — the migrations layer on top of it.
-        Schema.apply(db)
-        for (file in listOf("0001_admin_foundation.sql", "0002_product_management.sql",
-                            "0003_dashboard_aggregation_and_authz.sql",
-                            "0004_rpc_search_path_hardening.sql")) {
-            val sql = Files.readString(migrationsDir().resolve(file))
-            db.read { conn -> conn.createStatement().use { it.execute(sql) } }
-        }
-        applied = true
-    }
-
-    private fun migrationsDir(): Path {
-        val candidates = listOf(
-            Path.of("..", "supabase", "migrations"),
-            Path.of("supabase", "migrations"),
-        )
-        return candidates.firstOrNull { Files.isDirectory(it) }
-            ?: error("supabase/migrations not found from ${Path.of("").toAbsolutePath()}")
-    }
-
-    private fun installSupabaseShim(conn: Connection) {
-        conn.createStatement().use { st ->
-            for (role in listOf("anon", "authenticated", "service_role")) {
-                st.execute(
-                    "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$role') " +
-                        "THEN CREATE ROLE $role NOLOGIN; END IF; END \$\$",
-                )
-            }
-            st.execute("CREATE SCHEMA IF NOT EXISTS auth")
-            st.execute("CREATE TABLE IF NOT EXISTS auth.users (id uuid PRIMARY KEY)")
-            st.execute(
-                """
-                CREATE OR REPLACE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$
-                  SELECT NULLIF(current_setting('request.jwt.claim.sub', true), '')::uuid
-                $$;
-                """.trimIndent(),
-            )
-            st.execute("GRANT USAGE ON SCHEMA public TO authenticated, anon, service_role")
-            // Supabase's default privileges: RLS decides rows, grants only decide reachability.
-            st.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO authenticated")
-        }
-    }
-}

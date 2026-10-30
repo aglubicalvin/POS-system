@@ -53,6 +53,18 @@ export default function Dashboard() {
           <TouchableOpacity onPress={() => router.push('/(admin)/products')}>
             <Text style={styles.signOut}>Products</Text>
           </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.push('/(admin)/customers')}>
+            <Text style={styles.signOut}>Customers</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.push('/(admin)/hire-purchase')}>
+            <Text style={styles.signOut}>Hire purchase</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.push('/(admin)/inventory')}>
+            <Text style={styles.signOut}>Inventory</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={() => router.push('/(admin)/pos')}>
+            <Text style={styles.signOut}>POS (preview)</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={signOut}>
             <Text style={styles.signOut}>Sign out</Text>
           </TouchableOpacity>

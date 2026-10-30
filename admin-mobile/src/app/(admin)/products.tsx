@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+import { Image } from 'expo-image';
 import {
   applyCategory,
   applyPriceChange,
@@ -17,6 +18,7 @@ import {
   fetchCatalog,
   type CatalogProduct,
 } from '@/lib/admin-products';
+import { updateProductMedia } from '@/lib/phase43';
 import {
   formatPeso,
 } from '@/lib/summary';
@@ -121,6 +123,9 @@ function ProductRow({ product, onEdit }: { product: CatalogProduct; onEdit: () =
   const low = product.quantity !== null && product.quantity <= product.low_stock_threshold;
   return (
     <View style={styles.row}>
+      {product.thumbnail_url || product.image_url ? (
+        <Image source={{ uri: product.thumbnail_url ?? product.image_url ?? undefined }} style={styles.productImage} contentFit="cover" />
+      ) : null}
       <View style={styles.rowLeft}>
         <Text style={styles.name} numberOfLines={1}>
           {product.name}
@@ -152,6 +157,9 @@ function EditModal({
   const [priceText, setPriceText] = useState((product.unit_price / 100).toFixed(2));
   const [category, setCategory] = useState(product.category ?? '');
   const [reason, setReason] = useState('');
+  const [description, setDescription] = useState(product.description ?? '');
+  const [imageUrl, setImageUrl] = useState(product.image_url ?? '');
+  const [thumbnailUrl, setThumbnailUrl] = useState(product.thumbnail_url ?? '');
   const [busy, setBusy] = useState(false);
   const [errors, setErrors] = useState<EditValidation | null>(null);
 
@@ -168,6 +176,9 @@ function EditModal({
       }
       if (v.category && v.category !== (product.category ?? '')) {
         await applyCategory(product.product_id, v.category);
+      }
+      if (description !== (product.description ?? '') || imageUrl !== (product.image_url ?? '') || thumbnailUrl !== (product.thumbnail_url ?? '')) {
+        await updateProductMedia({ productId: product.product_id, description: description.trim(), imageUrl: imageUrl.trim(), thumbnailUrl: thumbnailUrl.trim() });
       }
       await onSaved();
     } catch (e) {
@@ -208,6 +219,13 @@ function EditModal({
             maxLength={64}
           />
           {errors?.categoryError ? <Text style={styles.error}>{errors.categoryError}</Text> : null}
+
+          <Text style={styles.label}>Description</Text>
+          <TextInput style={styles.input} value={description} onChangeText={setDescription} placeholder="Product description" placeholderTextColor="#888" multiline />
+          <Text style={styles.label}>Product image URL (HTTPS)</Text>
+          <TextInput style={styles.input} value={imageUrl} onChangeText={setImageUrl} placeholder="https://…" placeholderTextColor="#888" autoCapitalize="none" keyboardType="url" />
+          <Text style={styles.label}>Thumbnail URL (optional, HTTPS)</Text>
+          <TextInput style={styles.input} value={thumbnailUrl} onChangeText={setThumbnailUrl} placeholder="https://…" placeholderTextColor="#888" autoCapitalize="none" keyboardType="url" />
 
           <Text style={styles.label}>Reason (required)</Text>
           <TextInput
@@ -259,6 +277,7 @@ const styles = StyleSheet.create({
   chipActive: { backgroundColor: '#208AEF' },
   chipText: { color: '#33597a', fontSize: 13 },
   chipTextActive: { color: '#fff' },
+  productImage: { width: 48, height: 48, borderRadius: 8, marginRight: 10 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',

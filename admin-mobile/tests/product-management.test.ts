@@ -33,16 +33,17 @@ describe('validateProductEdit', () => {
     expect(v.priceTextError).toBeDefined();
   });
 
-  it('passes through an unchanged price (empty text) with only the category set', () => {
-    const v = validateProductEdit({ priceText: '', category: ' Cables ', reason: 'regrouping' });
+  it('allows category-only changes without a price-change reason', () => {
+    const v = validateProductEdit({ priceText: '', category: ' Cables ', reason: '' });
     expect(v.ok).toBe(true);
     expect(v.newPrice).toBeNull();
     expect(v.category).toBe('Cables');
+    expect(v.reason).toBeUndefined();
   });
 
   it('parses and clamps the category to 64 characters', () => {
     const long = 'x'.repeat(80);
-    const v = validateProductEdit({ priceText: '', category: long, reason: 'typo fix' });
+    const v = validateProductEdit({ priceText: '', category: long, reason: '' });
     expect(v.category?.length).toBe(64);
   });
 });

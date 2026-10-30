@@ -17,6 +17,9 @@ export interface CatalogProduct {
   is_active: boolean;
   category: string | null;
   quantity: number | null;
+  description: string | null;
+  image_url: string | null;
+  thumbnail_url: string | null;
 }
 
 export async function fetchCatalog(): Promise<CatalogProduct[]> {

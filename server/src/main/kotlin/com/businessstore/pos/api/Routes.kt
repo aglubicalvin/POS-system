@@ -10,6 +10,12 @@ import com.businessstore.pos.domain.StockLevelDto
 import com.businessstore.pos.domain.PullResponse
 import com.businessstore.pos.domain.SyncBatchRequest
 import com.businessstore.pos.domain.SyncBatchResponse
+import com.businessstore.pos.payments.InvalidSignatureException
+import com.businessstore.pos.payments.MobileMoneyInitiateRequest
+import com.businessstore.pos.payments.MobileMoneyService
+import com.businessstore.pos.payments.PaymentConflictException
+import com.businessstore.pos.payments.PaymentNotFoundException
+import com.businessstore.pos.payments.WebhookNotConfiguredException
 import com.businessstore.pos.reports.Reports
 import com.businessstore.pos.security.DeviceService
 import com.businessstore.pos.sync.EventApplier
@@ -26,6 +32,7 @@ import io.ktor.server.application.log
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -55,6 +62,7 @@ fun Application.posModule(
     devices: DeviceService = DeviceService(db),
     reports: Reports = Reports(db),
     pulls: EventPull = EventPull(db),
+    payments: MobileMoneyService = MobileMoneyService(db, config.momoWebhookSecret, config.momoProvider),
 ) {
     install(ContentNegotiation) { json(PosJson) }
 
@@ -81,6 +89,19 @@ fun Application.posModule(
         }
         exception<IllegalArgumentException> { call, cause ->
             call.respond(HttpStatusCode.BadRequest, ErrorDto(cause.message ?: "bad request"))
+        }
+        exception<WebhookNotConfiguredException> { call, cause ->
+            // Refusing is safer than accepting an unsigned callback.
+            call.respond(HttpStatusCode.ServiceUnavailable, ErrorDto(cause.message ?: "webhook disabled"))
+        }
+        exception<InvalidSignatureException> { call, cause ->
+            call.respond(HttpStatusCode.Unauthorized, ErrorDto(cause.message ?: "invalid signature"))
+        }
+        exception<PaymentConflictException> { call, cause ->
+            call.respond(HttpStatusCode.Conflict, ErrorDto(cause.message ?: "payment conflict"))
+        }
+        exception<PaymentNotFoundException> { call, cause ->
+            call.respond(HttpStatusCode.NotFound, ErrorDto(cause.message ?: "payment not found"))
         }
         exception<Throwable> { call, cause ->
             call.application.log.error("unhandled error", cause)
@@ -173,6 +194,33 @@ fun Application.posModule(
         get("/reports/discrepancies") {
             call.authenticate(devices)
             call.respond(reports.priceDiscrepancies())
+        }
+
+        // ---- Mobile money -------------------------------------------------
+        // Initiation and status are till-facing (device bearer token). The
+        // webhook is provider-facing: it has no device token and is authenticated
+        // by the HMAC signature over the exact request body instead.
+
+        post("/payments/mobile-money/initiate") {
+            call.authenticate(devices)
+            val request = call.receive<MobileMoneyInitiateRequest>()
+            val response = payments.initiate(request)
+            call.respond(
+                if (response.created) HttpStatusCode.Created else HttpStatusCode.OK,
+                response,
+            )
+        }
+
+        post("/payments/mobile-money/webhook") {
+            val signature = call.request.headers["X-Momo-Signature"]
+            call.respond(payments.handleWebhook(call.receiveText(), signature))
+        }
+
+        get("/payments/mobile-money/{paymentId}") {
+            call.authenticate(devices)
+            val paymentId = call.parameters["paymentId"]
+                ?: throw IllegalArgumentException("paymentId is required")
+            call.respond(payments.status(paymentId))
         }
     }
 }
