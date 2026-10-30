@@ -10,7 +10,8 @@
     "test:watch": "vitest",
     "demo": "node scripts/demo.ts",
     "till": "node scripts/till.ts",
-    "contract:emit": "node scripts/emit-contract.ts"
+    "contract:emit": "node scripts/emit-contract.ts",
+    "e2e:supabase": "node scripts/e2e-supabase.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.4",

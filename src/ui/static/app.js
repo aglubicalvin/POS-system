@@ -182,8 +182,51 @@ async function checkout() {
     showReceipt(receipt);
     refreshProducts();
     refreshShift();
+    // Mobile money is confirmed by the provider, not by the cashier: show the
+    // pending attempt and hand it to the provider, then follow its verdict.
+    if (receipt.paymentStatus === 'pending' && receipt.paymentId) {
+      await followUpMobileMoney(receipt.paymentId);
+    }
   } catch (error) {
     $('checkout-error').textContent = error.message;
+  }
+}
+
+/* ------------------------------------------------------------------- momo */
+
+const MOMO_POLL_INTERVAL_MS = 2000;
+const MOMO_POLL_MAX_ATTEMPTS = 5;
+
+async function followUpMobileMoney(paymentId) {
+  const status = $('payment-status');
+  try {
+    const initiated = await api('/api/payments/mobile-money/initiate', {
+      method: 'POST',
+      body: JSON.stringify({ paymentId }),
+    });
+    status.textContent = initiated.instructions
+      ? `MoMo: awaiting approval — ${initiated.instructions}`
+      : 'MoMo: awaiting provider confirmation…';
+    // The payment stays pending until the PROVIDER's verdict arrives; polling
+    // re-checks it, and a later sale cycle can always poll again.
+    for (let attempt = 1; attempt <= MOMO_POLL_MAX_ATTEMPTS; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, MOMO_POLL_INTERVAL_MS));
+      const payment = await api(`/api/payments/${encodeURIComponent(paymentId)}`);
+      if (payment.status === 'confirmed') {
+        status.textContent = `MoMo payment confirmed${payment.providerRef ? ` — ref ${payment.providerRef}` : ''}`;
+        return;
+      }
+      if (payment.status === 'failed') {
+        status.textContent = `MoMo payment failed: ${payment.failureReason ?? 'provider reported failure'}`;
+        $('checkout-error').textContent = 'Take another form of payment or retry mobile money.';
+        return;
+      }
+      if (payment.status === 'pending') status.textContent = `MoMo: still awaiting confirmation (check ${attempt}/${MOMO_POLL_MAX_ATTEMPTS})…`;
+    }
+    status.textContent = 'MoMo: still pending — the provider will confirm it; check again from this receipt.';
+  } catch (error) {
+    status.textContent = '';
+    $('checkout-error').textContent = `Mobile money initiation failed: ${error.message}`;
   }
 }
 

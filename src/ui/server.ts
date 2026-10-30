@@ -6,6 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { get, run, type Db } from '../db/db.ts';
 import { CheckoutError, checkout } from '../domain/checkout.ts';
 import { createPayment, confirmPayment, type PaymentMethod } from '../domain/payments.ts';
+import {
+  findPaymentRow,
+  initiateMobileMoneyPayment,
+  MomoError,
+  paymentStatusView,
+  verifyMobileMoneyPayment,
+  type MomoProvider,
+} from '../domain/momo.ts';
 import { listProducts, ProductError, type ProductRow } from '../domain/products.ts';
 import { openShift, openShiftForDevice } from '../domain/shifts.ts';
 import { PermissionError, type Role } from '../domain/permissions.ts';
@@ -26,11 +34,18 @@ import { verifyPin } from '../domain/users.ts';
  *   POST /api/shift            — open a shift for the logged-in user 
  *   GET  /api/reports/sales  — sales report with optional from/to/cashier filters 
  *   POST /api/checkout         — atomic checkout; auto-attaches the device's open 
- *                                shift; a cash payment is confirmed in one flow 
- * 
- * Not in this slice yet (see docs/roadmap.md): voids/refunds, receipt printing, 
- * mobile-money payments, manager overrides on price/discount approvals (beyond
- * what the role matrix permits), the Capacitor shell and an Android SQLite binding. 
+ *                                shift; a cash/card payment is confirmed in one
+ *                                flow, a mobile-money attempt stays PENDING until
+ *                                the provider verdict arrives
+ *   POST /api/payments/mobile-money/initiate — hand a pending MoMo attempt to the
+ *                                configured provider (idempotent; 503 without one)
+ *   GET  /api/payments/:id     — cashier's status poll; verifying a pending MoMo
+ *                                attempt against the provider's verdict
+ *
+ * Not in this slice yet (see docs/roadmap.md): voids/refunds, receipt printing,
+ * push webhooks on the till host (the Kotlin server is the webhook endpoint),
+ * manager overrides on price/discount approvals (beyond what the role matrix
+ * permits), the Capacitor shell and an Android SQLite binding.
  */
 
 export interface TillUiOptions {
@@ -39,6 +54,12 @@ export interface TillUiOptions {
   host?: string;
   /** This till's registered device id, when known. Login falls back to the body if absent. */
   deviceId?: string;
+  /**
+   * The till's mobile-money vendor adapter. Absent on a till that must not
+   * initiate MoMo: initiation then fails closed (HTTP 503) and pending
+   * attempts stay pending until a provider is attached.
+   */
+  momoProvider?: MomoProvider;
 }
 
 export interface TillUiHandle {
@@ -68,7 +89,7 @@ export function startTillUi(db: Db, options: TillUiOptions = {}): Promise<TillUi
   const sessions = new Map<string, Session>();
 
   const server = createServer((req, res) => {
-    route(db, sessions, options.deviceId, req, res).catch((error) => {
+    route(db, sessions, options.deviceId, options.momoProvider, req, res).catch((error) => {
       respondJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
     });
   });
@@ -93,6 +114,7 @@ async function route(
   db: Db,
   sessions: Map<string, Session>,
   tillDeviceId: string | undefined,
+  momoProvider: MomoProvider | undefined,
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
@@ -291,14 +313,25 @@ async function route(
       return handleDomainError(res, error);
     }
     let paymentId: string | null = null;
+    let paymentStatus: 'confirmed' | 'pending' | null = null;
     const amount = result.sale.total;
+    const paymentMethod = body.paymentMethod as PaymentMethod ?? 'cash';
     if (amount > 0) {
-      const paymentMethod = body.paymentMethod as PaymentMethod ?? 'cash';
       const payment = createPayment(db, { saleId: result.sale.sale_id, method: paymentMethod, amount });
-      confirmPayment(db, payment.payment_id);
-      paymentId = payment.payment_id;
+      // Mobile money is the one ASYNCHRONOUS method: the provider confirms it,
+      // not the cashier, so the row stays pending until verifyMobileMoneyPayment
+      // sees the provider's verdict. Everything else is settled at the till.
+      if (paymentMethod === 'mobile_money') {
+        paymentId = payment.payment_id;
+        paymentStatus = 'pending';
+      } else {
+        confirmPayment(db, payment.payment_id);
+        paymentId = payment.payment_id;
+        paymentStatus = 'confirmed';
+      }
     }
     return respondJson(res, 201, {
+      paymentStatus,
       receiptNumber: result.receiptNumber,
       saleId: result.sale.sale_id,
       paymentId,
@@ -319,7 +352,54 @@ async function route(
     });
   }
 
+  // ---- Mobile money ---------------------------------------------------
+  // A cashier hands an attempt to the configured provider (idempotently) and
+  // polls its status; verification is pull-based here because the provider's
+  // push webhook lives on the Kotlin server (HMAC-verified), not on this LAN.
+
+  if (method === 'POST' && url === '/api/payments/mobile-money/initiate') {
+    const body = await readJson(req);
+    const paymentId = String(body.paymentId ?? '');
+    if (paymentId === '') return respondJson(res, 400, { error: 'paymentId is required' });
+    if (!momoProvider) return respondJson(res, 503, { error: 'no mobile-money provider is configured on this till' });
+    let result;
+    try {
+      result = await initiateMobileMoneyPayment(db, paymentId, momoProvider);
+    } catch (error) {
+      return handleMomoDomainError(res, error);
+    }
+    return respondJson(res, result.initiated ? 201 : 200, {
+      ...paymentStatusView(db, result.payment),
+      initiated: result.initiated,
+      ...(result.instructions ? { instructions: result.instructions } : {}),
+    });
+  }
+
+  if (method === 'GET' && url.startsWith('/api/payments/') && url !== '/api/payments/mobile-money/initiate') {
+    const paymentId = decodeURIComponent(url.slice('/api/payments/'.length));
+    let payment = findPaymentRow(db, paymentId);
+    if (!payment) return respondJson(res, 404, { error: 'payment not found' });
+    // Polling a pending attempt IS the verification hook: the provider's
+    // verdict (when one arrived) transitions the row exactly once.
+    if (momoProvider && payment.method === 'mobile_money' && payment.status === 'pending') {
+      try {
+        payment = await verifyMobileMoneyPayment(db, paymentId, momoProvider);
+      } catch (error) {
+        return handleMomoDomainError(res, error);
+      }
+    }
+    return respondJson(res, 200, paymentStatusView(db, payment));
+  }
+
   respondJson(res, 404, { error: 'not found' });
+}
+
+function handleMomoDomainError(res: ServerResponse, error: unknown): void {
+  if (error instanceof MomoError) return respondJson(res, 409, { error: error.message });
+  if (error instanceof Error) {
+    return respondJson(res, /not found/.test(error.message) ? 404 : 409, { error: error.message });
+  }
+  throw error;
 }
 
 function handleDomainError(res: ServerResponse, error: unknown): void {
