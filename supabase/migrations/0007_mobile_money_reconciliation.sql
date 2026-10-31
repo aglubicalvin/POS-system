@@ -51,4 +51,4 @@ end;
 $$;
 
 revoke execute on function public.admin_reconcile_mobile_money_payment(text, text, bigint) from public, anon;
-grant execute on function public.admin_reconcile_mobile_money_payment(text, text, bigint) to authenticated;
+grant execute on function public.admin_reconcile_mobile_money_payment(text, text, bigint) to authenticated, service_role;

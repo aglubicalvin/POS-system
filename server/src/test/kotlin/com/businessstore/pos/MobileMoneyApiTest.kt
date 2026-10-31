@@ -122,10 +122,22 @@ class MobileMoneyApiTest {
         setBody(PosJson.encodeToString(MobileMoneyInitiateRequest.serializer(), request))
     }
 
-    private fun webhookBody(paymentId: String, amount: Long, status: String, ref: String = "MM-1") =
+    private fun webhookBody(
+        paymentId: String,
+        amount: Long,
+        status: String,
+        ref: String = "MM-1",
+        failureReason: String? = null,
+    ) =
         PosJson.encodeToString(
             MobileMoneyWebhookRequest.serializer(),
-            MobileMoneyWebhookRequest(paymentId = paymentId, providerRef = ref, amount = amount, status = status),
+            MobileMoneyWebhookRequest(
+                paymentId = paymentId,
+                providerRef = ref,
+                amount = amount,
+                status = status,
+                failureReason = failureReason,
+            ),
         )
 
     @Test
@@ -333,7 +345,13 @@ class MobileMoneyApiTest {
             client.initiate(token, MobileMoneyInitiateRequest(saleId, 5000, "0244000000", "momo-key-0008")).bodyAsText(),
         )
 
-        val failureBody = webhookBody(initiated.paymentId, 5000, "failed", ref = "MM-FAIL-1")
+        val failureBody = webhookBody(
+            initiated.paymentId,
+            5000,
+            "failed",
+            ref = "MM-FAIL-1",
+            failureReason = "expired",
+        )
         val failure = client.post("/payments/mobile-money/webhook") {
             contentType(ContentType.Application.Json)
             header("X-Momo-Signature", signature(failureBody, secret))
