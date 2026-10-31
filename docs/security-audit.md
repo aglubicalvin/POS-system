@@ -20,6 +20,55 @@ automated check named in Evidence, not by code reading alone.
 | Device enrollment | `POS_ENROLLMENT_SECRET` gates device registration; unset secret prints a startup WARNING and is the documented operational responsibility | `Application.kt`; Kotlin test suites exercise both paths |
 | Migration safety | 0005–0007 apply in order over the canonical schema; canonical POS tables only GAIN columns (never lose constraints); admin objects tested against the migrations that create them, not assumptions | `AdminMigrationTest` (5 tests, embedded Postgres + Supabase shim), `Phase43WorkflowTest > migrations 0005 to 0007 create every object they advertise`, `> migrations only add columns to the canonical POS tables`, `tests/schema.test.ts` |
 
+## Policy role alignment — migration 0008 (applied and tested on the dev project)
+
+Audit date: 2026-10-31. Status: **applied to the development/test project**
+(`uemdrtrzlvhdtonccczt`, verified from `pg_policies` before and after) and
+**drafted for production, not applied**. The production deployment boundary is
+lower in this document.
+
+**What changed.** 15 RLS policies that gate on `is_admin()` were written with
+the implicit `TO public` role list, but `is_admin()` EXECUTE is revoked from
+`anon`/`public` (migrations 0003/0004). Anonymous callers therefore hit
+`42501 permission denied for function is_admin` instead of a clean RLS
+denial — fail-closed either way, but the error channel was inconsistent with
+the function's grant surface. Migration `0008_authorize_admin_policies.sql`
+retargets all 15 policies `TO authenticated`:
+
+- 0001: `profiles_admin_read`, `sales_admin_read`, `sale_items_read`,
+  `payments_read`, `products_read`, `stock_on_hand_admin_read`,
+  `approvals_read`, `audit_admin_read`
+- 0002: `categories_read_all`, `categories_admin_all`, `price_audit_admin_read`
+- 0005: `customers_admin_all`, `payroll_deductions_admin_all`,
+  `hp_contracts_admin_all`, `hp_payments_admin_all`
+
+**What did NOT change.** Every `USING` / `WITH CHECK` expression is preserved
+verbatim (`alter policy ... to` only rewrites the role list). `is_admin()`
+itself is untouched: SECURITY DEFINER, empty `search_path`, EXECUTE still
+limited to `authenticated` + `service_role`.
+
+**Anonymous access.** Still denied. The function grant unchanged plus the
+retarget means anon requests now fail on the policy role match rather than on
+function privileges — the denial direction is identical. Evidence: the E2E
+anonymous probes (`{anon: true}` REST reads on `payments`, the forge attempt
+with a cashier JWT) returned permission denials / zero rows before and after
+the retarget, and the run exits 0.
+
+**Exception (intentionally excluded).** `profiles_self_read` on `profiles`
+(`USING (auth.uid() = id)`, no `is_admin()` call) keeps `TO public` so any
+signed-in user can still read exactly their own row. Verified from
+`pg_policies` after the apply: `{public}`.
+
+**Rollback.** `0008_authorize_admin_policies.rollback.sql` restores all 15
+policies to `TO public` with one `ALTER POLICY` per policy. Because 0008 did
+not touch expressions, nothing else needs restating.
+
+**E2E verification of 0008** (`npm run e2e:supabase`, exit 0): admin sign-in,
+service-role seeding, reconciliation (refuse wrong reference / match /
+idempotent / refuse amount mismatch), payment-forgery refusal — all pass.
+At the time of the 0008 run the fault-lifecycle block reported SKIP; that gap
+is closed by migration 0009 (next section).
+
 ## Test evidence
 
 - Kotlin: `gradlew check` — 62 tests, 0 failures (`AdminMigrationTest` 5,
@@ -31,7 +80,104 @@ automated check named in Evidence, not by code reading alone.
 - Live project (optional, env-gated): `npm run e2e:supabase` — runs the same
   authz + reconciliation lifecycle over real Supabase REST, then deletes
   everything it created. Refuses to run without explicitly set credentials so
-  production is never touched by accident.
+  production is never touched by accident. Latest run (after 0008 + 0009 on
+  the dev project): 35 checks, all pass, exit 0; no SKIP.
+- `npm run typecheck` and `npm run test` after the 0009 apply: typecheck exit 0;
+  vitest 109 passed / 1 skipped (15 files), exit 0.
+- Kotlin (`gradlew check`) and admin-mobile suites were **not re-run** for
+  0008/0009; the figures above for those suites predate both migrations.
+
+## Phase 4.7 faults — migration 0009 (applied and tested on the dev project)
+
+Audit date: 2026-10-31. Status: **applied to the development/test project**
+(`uemdrtrzlvhdtonccczt`) and **not applied to production**. Files:
+`supabase/migrations/0009_phase47_faults.sql` and
+`0009_phase47_faults.rollback.sql`.
+
+**Design source.** The schema was derived from the contract already encoded
+in the E2E fault-lifecycle block (fields, statuses, side effects,
+permissions), not invented. That audit also found four missing prerequisites,
+all added by 0009: the `faults` table, the `approval_queues` table, the
+`payments.blocked` column, and a supervisor concept (both E2E actors carry
+`profiles.role = 'admin'`, and the role CHECK only allows
+`cashier|manager|admin`, so a separate flag was required).
+
+| Area | Decision | Enforced by |
+| --- | --- | --- |
+| Supervisor authorization | `profiles.is_supervisor` (default `false`, no RLS write path — set only via privileged SQL / service connection, like `role`); `public.is_supervisor()` is SECURITY DEFINER, `search_path = ''`, true only for an active `admin` with the flag; EXECUTE revoked from `public`/`anon`, granted to `authenticated`, `service_role` | migration `0009`; E2E supervisor-vs-plain-admin checks |
+| Fault management | `faults` (text PK `fault_id`; FKs to `sales` (cascade), `payments` (set null), `auth.users`; `issue_summary` 1–500 chars; `priority` ∈ low/medium/high; `status` ∈ reported/with_approvals/posted/denied/closed; indexes on status, sale_id, payment_id) | migration `0009` |
+| Lifecycle / transition guard | BEFORE INSERT/UPDATE trigger `faults_guard_transition`: inserts start as `reported` (or `posted`); allowed moves are reported→with_approvals\|posted, with_approvals→posted\|denied, denied→closed, closed→reported; anything else raises `illegal fault transition`; `denied` requires a non-empty `denial_reason` | migration `0009`; E2E lifecycle checks |
+| Payment protection | BEFORE INSERT/UPDATE trigger `faults_sync_payment_block` computes `payment_blocked` (true `posted` + `is_defect`, always false for `denied`) and mirrors it to `payments.blocked`. SECURITY DEFINER, `search_path = ''`: payments have no authenticated write path, so this trigger is the only sanctioned mover of `blocked` | migration `0009`; E2E `payment flips back to not-blocked after fault denial`, `linked payment is blocked while the fault is posted` |
+| Approval workflow | Escalation to `with_approvals` inserts an `approval_queues` row for `reported_by_user_id` (AFTER UPDATE trigger, runs as invoker). `process_approval_queues(p_user_id)` is SECURITY DEFINER, `search_path = ''`, and raises unless `p_user_id = auth.uid()` — a caller can only process their own queue; EXECUTE revoked from `public`/`anon` | migration `0009`; E2E `supervisor can trigger the approval-queue processor`, `supervisor sees their approval queue entry` |
+| RLS | `faults_admin_read` (SELECT, `is_admin()`), `faults_supervisor_all` (ALL, `is_supervisor()` in USING and WITH CHECK), `approval_queues_admin_read` (SELECT, `is_admin()`), `approval_queues_supervisor_insert` (INSERT, `is_supervisor() and user_id = auth.uid()`). **All four explicitly `TO authenticated`**, consistent with 0008 | migration `0009`; live `pg_policies` check on the dev project |
+
+**Security findings (verified by the E2E run unless noted).**
+
+1. **Ordinary administrators cannot perform supervisor-only operations.** A
+   plain admin's fault POST is refused, and plain-admin escalate/deny PATCHes
+   change nothing (PostgREST returns an error or an empty result set because
+   RLS filters the row — both are accepted as fail-closed by the checks).
+2. **Illegal lifecycle transitions are rejected** by the guard trigger. The
+   E2E run exercises the *legal* path end to end; a negative test that
+   attempts an illegal move (e.g. reported→closed) over REST does **not yet
+   exist** — the guarantee currently rests on the trigger code.
+3. **Denial requires a reason** — enforced by the guard trigger; the E2E deny
+   step supplies one. As with (2), no negative REST test for a reasonless
+   denial exists yet.
+4. **Payment blocking goes only through the sanctioned SECURITY DEFINER
+   trigger.** During dev testing the first version ran as invoker and the
+   payments UPDATE was silently filtered by RLS (no error, no effect); it was
+   corrected to SECURITY DEFINER and the block/unblock checks now pass.
+5. **Approval processing is restricted to the owning user** via the
+   `p_user_id = auth.uid()` check. E2E covers the positive case only.
+6. **Every RLS surface on the fault/approval/supervisor side is `TO authenticated`.**
+   The four new 0009 policies are all `TO authenticated`, matching the posture
+   migration 0008 already set for the 15 is_admin()-based policies. A single
+   fail-closed posture against `anon` covers the whole side, and the dev
+   project's `pg_policies` probe confirmed that before and after the apply.
+
+**Anonymous access.** Fail-closed on the whole reviewed surface: the two new
+0009 RPCs and `is_supervisor()` have EXECUTE revoked from `anon`, and every
+0009 RLS policy is `TO authenticated`. The E2E run currently tests anon denial
+only against the pre-existing tables; a dedicated anonymous probe against
+`faults` and `approval_queues` is a documented gap (not yet exercised), but
+the `TO authenticated` posture makes the denial a guarantee rather than a tested
+one.
+
+**Rollback.** `0009_phase47_faults.rollback.sql` drops, in reverse order, the
+three fault triggers and their functions, both fault policies, `faults`,
+`process_approval_queues`, the approval-queue policies and table,
+`is_supervisor()`, `profiles.is_supervisor` and `payments.blocked`. The
+rollback has **not been executed** against any project. Dropping
+`payments.blocked` discards block state, so rolling back with posted defects
+outstanding unblocks those payments.
+
+**E2E.** `npm run e2e:supabase`: 35 checks, all pass, exit 0. The previous
+`SKIP fault lifecycle` branch is no longer taken; the guard remains in the
+script so projects without 0009 still run cleanly.
+
+**How 0009 reached the dev project (relevant to production).** It was applied
+incrementally while testing: the initial file, then `payments.blocked`, then
+the `approval_queues_supervisor_insert` policy, then the `TO authenticated`
+policy restatement and the SECURITY DEFINER trigger fix. The committed file
+includes all of these, but **the final file has not been applied in one pass
+to a clean database**. That must happen on a fresh dev/test project before
+production.
+
+## Deployment status
+
+| Migration | Development (`uemdrtrzlvhdtonccczt`) | Production |
+| --- | --- | --- |
+| 0008_authorize_admin_policies | Applied and tested | **Not applied** |
+| 0009_phase47_faults | Applied (incrementally) and tested | **Not applied** |
+
+Neither migration is to be deployed to production until a consolidated
+production-readiness security review is complete, covering migrations
+0001–0009, every RLS policy, RPC EXECUTE grants, SECURITY DEFINER functions
+and triggers, and the rollback procedures. Open items for that review: a
+clean single-pass apply of 0009, an exercised rollback of 0008 and 0009, and
+negative E2E tests for illegal transitions, reasonless denial, cross-user
+queue processing and anonymous access to `faults`/`approval_queues`.
 
 ## Residual risks (accepted, documented)
 

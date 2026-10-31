@@ -7,11 +7,11 @@
  * with a how-to so plain `npm test` stays self-contained).
  *
  *   SUPABASE_URL               test project URL, e.g. https://xxxx.supabase.co
- *   SUPABASE_SERVICE_ROLE_KEY  service key — bypasses RLS, seeds and cleans rows
+ *   SUPABASE_SERVICE_ROLE_KEY  service key — bypasses RLS, seeds and cleans up
  *   SUPABASE_ANON_KEY          public key — must reach NOTHING protected
  *   SUPABASE_DB_URL            optional libpq connection string; when present
  *                              (and `psql` is on PATH) the script probes for
- *                              the 0001/0005-0007 objects and applies any
+ *                              the 0001/0005-0009 objects and applies any
  *                              missing migration files before the REST checks
  *
  * What it proves, end to end:
@@ -21,9 +21,16 @@
  *   3. reconciliation: admin_reconcile_mobile_money_payment matches a
  *      confirmed payment, is idempotent, and refuses a mismatch without
  *      touching the row
- *   4. fault lifecycle (Phase 4.7): supervisors post and advance faults through
+ *   4. supervisor authorization (Phase 4.7): a plain admin cannot post, escalate
+ *      or deny faults; only a profile with `is_supervisor` can, enforced by RLS
+ *   5. fault lifecycle (Phase 4.7): supervisors post and advance faults through
  *      reported -> with_approvals -> posted -> denied -> closed, and the linked
  *      payment flips to blocked and back to unblocked on denial
+ *
+ * NEVER run this against production. It creates and then deletes auth users,
+ * profiles, customers, sales, payments and (where present) approval-queue rows.
+ * It exits 0 with an explicit how-to unless the credentials are set, so pointing
+ * it at a test project is an explicit, deliberate act by the operator.
  */
 
 import { readFileSync } from "node:fs";
