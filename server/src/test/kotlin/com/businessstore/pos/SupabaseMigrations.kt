@@ -63,7 +63,12 @@ object SupabaseMigrations {
             ?: error("supabase/migrations not found from ${Path.of("").toAbsolutePath()}")
     }
 
-    private fun installSupabaseShim(conn: Connection) {
+    /**
+     * The slice of Supabase the migrations run against. Exposed because the
+     * clean-replay test builds its own throwaway database and must install the
+     * same shim before applying 0001-0009 in one pass.
+     */
+    fun installSupabaseShim(conn: Connection) {
         conn.createStatement().use { st ->
             for (role in listOf("anon", "authenticated", "service_role")) {
                 st.execute(

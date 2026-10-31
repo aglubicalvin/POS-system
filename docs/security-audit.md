@@ -71,8 +71,9 @@ is closed by migration 0009 (next section).
 
 ## Test evidence
 
-- Kotlin: `gradlew check` — 62 tests, 0 failures (`AdminMigrationTest` 5,
-  `Phase43WorkflowTest` 17, `MobileMoneyApiTest` 6, plus the pre-existing suites).
+- Kotlin: `gradlew check` — 72 tests, 0 failures (`CleanReplayMigrationTest` 6,
+  `AdminMigrationTest` 5, `Phase43WorkflowTest` 17, `MobileMoneyApiTest` 6, plus
+  the pre-existing suites), after the clean replay and rollback additions.
 - TypeScript till/mobile domain: `npx vitest run` — 108 passed, 1 skipped,
   including `tests/momo-till.test.ts` (7 new) and `tests/ui.test.ts`.
 - admin-mobile: `npx vitest run` — 29 passed, including the Phase 4.3 screens'
@@ -160,9 +161,10 @@ script so projects without 0009 still run cleanly.
 incrementally while testing: the initial file, then `payments.blocked`, then
 the `approval_queues_supervisor_insert` policy, then the `TO authenticated`
 policy restatement and the SECURITY DEFINER trigger fix. The committed file
-includes all of these, but **the final file has not been applied in one pass
-to a clean database**. That must happen on a fresh dev/test project before
-production.
+includes all of these. The final file **has now been applied in one pass to a
+clean database** — see "Clean replay and rollback" below. That replay ran on
+embedded PostgreSQL 18.6, not on a Supabase project; the fresh-project apply
+is still the last step before production.
 
 ## Deployment status
 
@@ -174,10 +176,46 @@ production.
 Neither migration is to be deployed to production until a consolidated
 production-readiness security review is complete, covering migrations
 0001–0009, every RLS policy, RPC EXECUTE grants, SECURITY DEFINER functions
-and triggers, and the rollback procedures. Open items for that review: a
-clean single-pass apply of 0009, an exercised rollback of 0008 and 0009, and
-negative E2E tests for illegal transitions, reasonless denial, cross-user
-queue processing and anonymous access to `faults`/`approval_queues`.
+and triggers, and the rollback procedures. The clean single-pass apply and the
+0008/0009 rollbacks are now covered by `CleanReplayMigrationTest` (next
+section); the open items are the fresh-Supabase-project replay and negative
+REST-level E2E tests for illegal transitions and cross-user queue processing
+(the SQL-level equivalents now exist).
+
+## Clean replay and rollback — `CleanReplayMigrationTest`
+
+Added 2026-10-31. Six tests in `server/src/test/kotlin/.../CleanReplayMigrationTest.kt`
+run against **embedded PostgreSQL 18.6**, which is disposable and local: no
+Supabase project is created, no credential is used, and neither the development
+project nor production is touched. Each test builds its own throwaway database
+inside the embedded cluster, installs only the Supabase shim
+(`anon`/`authenticated`/`service_role` roles, `auth.users`, `auth.uid()`), bootstraps
+the canonical POS schema, and then applies the committed files
+`0001_admin_foundation.sql` … `0009_phase47_faults.sql` in filename order — one
+`execute` per file, with no repair statements and no manual steps.
+
+What the replay asserts:
+
+| Claim | How it is checked |
+| --- | --- |
+| 0001–0009 apply in order, no intervention | every file executed as-is on the clean database |
+| All 15 admin policies target `authenticated` | `pg_policies.roles::text = '{authenticated}'` for each of the 15 named policies |
+| `profiles_self_read` still works | policy stays `{public}`; a signed-in cashier sees exactly their own row and not another's |
+| Supervisor authorization | `is_supervisor()` is true for a flagged admin, false for a plain admin, false for a flagged cashier (role still gates it) |
+| Fault lifecycle + approval queue | reported → with_approvals inserts one queue row; posted blocks the payment; clearing `is_defect` unblocks; denial requires a reason; illegal transitions raise; `process_approval_queues` processes the caller's queue |
+| Payment block/unblock | `payments.blocked` follows `posted && is_defect` and back |
+| Anonymous access | `anon` holds table DML grants (as on Supabase) yet reads zero rows from `payments`, `customers`, `faults`, `approval_queues`, `profiles`, `sales`; EXECUTE on `is_supervisor()` and `process_approval_queues()` is denied with `42501` |
+| 0009 rollback | `faults`, `approval_queues`, their triggers, `is_supervisor()`, `process_approval_queues()`, `profiles.is_supervisor` and `payments.blocked` are all gone |
+| 0008 rollback | all 15 policies are back to `{public}` |
+| Reapply | 0008 then 0009 re-applied; 15 policies authenticated again and the block/unblock path works |
+
+One harness note: after the rollbacks, re-applying 0009 recreates `faults`,
+which in Supabase would inherit the project's default privileges. The test
+replays that grant, otherwise it would fail on a missing GRANT rather than on
+migration behaviour.
+
+Run: `cd server && ./gradlew test --tests "com.businessstore.pos.CleanReplayMigrationTest"`
+— 6 tests, 0 failures. Full suite: `gradlew check` — 72 tests, 0 failures.
 
 ## Residual risks (accepted, documented)
 
