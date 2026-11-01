@@ -168,19 +168,25 @@ is still the last step before production.
 
 ## Deployment status
 
-| Migration | Development (`uemdrtrzlvhdtonccczt`) | Production |
-| --- | --- | --- |
-| 0008_authorize_admin_policies | Applied and tested | **Not applied** |
-| 0009_phase47_faults | Applied (incrementally) and tested | **Not applied** |
+| Migration | Verify project (`numwzjogaanfhlrfgrqk`, clean replay) | Dev project (`uemdrtrzlvhdtonccczt`) | Production |
+| --- | --- | --- | --- |
+| 0001–0009 | **Applied as one clean replay** (see below) | 0001–0005 only (stale — see below) | **Not applied** |
+
+Correction (2026-11-01): the earlier table recorded 0008/0009 as "applied and
+tested" on the development project. A direct catalog probe shows that project
+has **no `faults`, no `approval_queues` and no `payments.blocked`** — it stopped
+at 0005 (plus a manually retargeted `payments` policy). The 0008/0009 E2E runs
+cited earlier were actually executed against the verify project, which had all
+nine migrations from a prior session. Treat the dev project as out of sync with
+the migration set until it is re-migrated from the committed files.
 
 Neither migration is to be deployed to production until a consolidated
 production-readiness security review is complete, covering migrations
 0001–0009, every RLS policy, RPC EXECUTE grants, SECURITY DEFINER functions
-and triggers, and the rollback procedures. The clean single-pass apply and the
-0008/0009 rollbacks are now covered by `CleanReplayMigrationTest` (next
-section); the open items are the fresh-Supabase-project replay and negative
-REST-level E2E tests for illegal transitions and cross-user queue processing
-(the SQL-level equivalents now exist).
+and triggers, and the rollback procedures. The open items that remain closed
+below are the fresh-Supabase-project replay and negative REST-level E2E tests
+(both now done); the consolidated production-readiness review itself is still
+outstanding.
 
 ## Clean replay and rollback — `CleanReplayMigrationTest`
 
@@ -216,6 +222,64 @@ migration behaviour.
 
 Run: `cd server && ./gradlew test --tests "com.businessstore.pos.CleanReplayMigrationTest"`
 — 6 tests, 0 failures. Full suite: `gradlew check` — 72 tests, 0 failures.
+
+## Fresh Supabase replay — clean-clone verification (2026-11-01)
+
+Executed on the disposable project `business-store-verify-202610311400`
+(`numwzjogaanfhlrfgrqk`, London) via the Supabase CLI Management API
+(`supabase db query --linked`) — no database password was shared and **production
+and the dev project were never touched**. The project was first reset to a
+truly clean state: `drop schema public cascade`, `supabase_migrations` emptied,
+and the standard Supabase default privileges (DML for
+`anon`/`authenticated`/`service_role` on future tables/sequences/functions)
+re-issued so the replay environment matches a brand-new project.
+
+Replay result: the canonical `server/src/main/resources/db/schema.sql` baseline
+(recorded as `0000 baseline_schema` — 0001 legitimately depends on the POS
+tables), then the committed `0001_admin_foundation.sql` …
+`0009_phase47_faults.sql` in order, **all applied without manual intervention**.
+An intermediate aborted attempt (0001 run without the baseline) left **zero**
+partial objects — every migration is transaction-scoped, so a failed file
+rolls back whole.
+
+Post-replay structural verification (direct catalog queries):
+
+| Check | Result |
+| --- | --- |
+| Application objects | 30 tables, 6 views, 12 functions, 5 triggers |
+| Migration history | `0000 baseline_schema` + `0001`–`0009` names matching the repo, in order |
+| Policy roles | 20 policies: **19 → `authenticated`**; the only `{public}` policy is `profiles_self_read` (own-row only, intentional) |
+| `search_path` security | all 12 public functions pinned to `search_path = ""` (incl. `is_admin`, both admin RPCs, reconcile, `faults_*`, `is_supervisor`, `process_approval_queues`) |
+| Phase 4.7 objects | `faults`, `approval_queues`, `payments.blocked`, 5 triggers all present |
+| Grants | `authenticated` holds EXECUTE on `is_admin()` and `admin_reconcile_mobile_money_payment(text,text,bigint)`; `anon` is denied EXECUTE on the reconcile RPC; `anon` holds Supabase-standard table grants but RLS default-deny returns zero rows for every protected table |
+
+REST E2E against the clean replay (`scripts/e2e-supabase.ts`, real Supabase
+REST + GoTrue + PostgREST): **43/43 checks pass, exit 0**, including the
+previously-SKIPped fault lifecycle and every REST-level negative check:
+anonymous reads of `faults`/`approval_queues` denied; illegal transition
+rejected and left the fault untouched; denial without a reason rejected and
+the fault held at `with_approvals`; cross-user approval-queue processing
+rejected with the original queue left pending; a plain admin's escalation and
+denial attempts update **zero rows** (asserted via `Prefer:
+return=representation`); supervisor block/unblock flips observed on the linked
+payment through an authenticated read.
+
+Two script defects the clean project surfaced (both fixed in
+`scripts/e2e-supabase.ts`):
+
+1. **Unfiltered fault PATCHes** — PostgREST correctly refuses an `UPDATE`
+   without a WHERE clause (`21000`). All fault PATCHes now filter on
+   `fault_id=eq.<run-id>`.
+2. **Wrong observer for payment-flag checks and admin-refusal assertions** —
+   anon correctly gets zero payment rows under RLS, so the block/unblock flag
+   is read with the supervisor's session; a plain admin's refused PATCH returns
+   204 with zero updated rows (not an HTTP 4xx), so the assertion now demands
+   an empty representation instead of an error status.
+
+The verify project was left with **zero** application rows and **zero** auth
+users after cleanup (the first failed run's three orphan auth users were
+deleted via the admin API). Suites after the fix: vitest 109 passed / 1
+skipped (15 files), `tsc --noEmit` clean.
 
 ## Residual risks (accepted, documented)
 

@@ -598,7 +598,7 @@ async function main(): Promise<void> {
     show(pre).slice(0, 200),
   );
 
-  const escalate = await rest("/rest/v1/faults", {
+  const escalate = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: supervisorToken,
     anon: true,
@@ -651,7 +651,7 @@ async function main(): Promise<void> {
 
   // ---- denial flips payment back to unblocked ------------------------------
 
-  const deny = await rest("/rest/v1/faults", {
+  const deny = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: supervisorToken,
     anon: true,
@@ -682,7 +682,10 @@ async function main(): Promise<void> {
 
   const afterDenyPayment = await rest(
     `/rest/v1/payments?payment_id=eq.${encode(paymentId)}&select=status,blocked`,
-    { anon: true },
+    // Authenticated read: RLS hides payments from anon, so the flag flip can
+    // only be observed through an admin session (the anon denial is asserted
+    // by the dedicated negative checks below).
+    { token: supervisorToken, anon: true },
   );
   const unblocked = rowsOf(afterDenyPayment.body)[0] as JsonRecord | undefined;
   check(
@@ -693,7 +696,7 @@ async function main(): Promise<void> {
 
   // ---- close the denied fault ----------------------------------------------
 
-  const close = await rest("/rest/v1/faults", {
+  const close = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: supervisorToken,
     anon: true,
@@ -718,33 +721,36 @@ async function main(): Promise<void> {
 
   // ---- non-supervisor denial is refused ------------------------------------
 
-  const nonSupervisorEscalate = await rest("/rest/v1/faults", {
+  const nonSupervisorEscalate = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: adminToken,
     anon: true,
+    prefer: "return=representation",
     body: { is_defect: true, status: "with_approvals" },
   });
   check(
     "plain admin cannot escalate a fault",
-    nonSupervisorEscalate.status >= 400,
-    show(nonSupervisorEscalate.body).slice(0, 160),
+    nonSupervisorEscalate.status >= 400 ||
+      rowsOf(nonSupervisorEscalate.body).length === 0,
+    `status=${nonSupervisorEscalate.status} ${show(nonSupervisorEscalate.body).slice(0, 160)}`,
   );
 
-  const nonSupervisorDeny = await rest("/rest/v1/faults", {
+  const nonSupervisorDeny = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: adminToken,
     anon: true,
+    prefer: "return=representation",
     body: { is_defect: false, status: "denied" },
   });
   check(
     "plain admin cannot deny a fault",
-    nonSupervisorDeny.status >= 400,
-    show(nonSupervisorDeny.body).slice(0, 160),
+    nonSupervisorDeny.status >= 400 || rowsOf(nonSupervisorDeny.body).length === 0,
+    `status=${nonSupervisorDeny.status} ${show(nonSupervisorDeny.body).slice(0, 160)}`,
   );
 
   // ---- reopen + repost to prove payment blocking again ---------------------
 
-  const reopen = await rest("/rest/v1/faults", {
+  const reopen = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: supervisorToken,
     anon: true,
@@ -756,7 +762,7 @@ async function main(): Promise<void> {
     show(reopen.body).slice(0, 200),
   );
 
-  const repost = await rest("/rest/v1/faults", {
+  const repost = await rest(`/rest/v1/faults?fault_id=eq.${encode(`${baseRun}-fault`)}`, {
     method: "PATCH",
     token: supervisorToken,
     anon: true,
@@ -783,7 +789,7 @@ async function main(): Promise<void> {
 
   const repostedPayment = await rest(
     `/rest/v1/payments?payment_id=eq.${encode(paymentId)}&select=status,blocked`,
-    { anon: true },
+    { token: supervisorToken, anon: true },
   );
   const repostedPaymentRow = rowsOf(repostedPayment.body)[0] as JsonRecord | undefined;
   check(
