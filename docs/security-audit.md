@@ -180,6 +180,10 @@ cited earlier were actually executed against the verify project, which had all
 nine migrations from a prior session. Treat the dev project as out of sync with
 the migration set until it is re-migrated from the committed files.
 
+The consolidated production-readiness review — release checklist, environment
+parity, security findings, deployment/rollback plan and GO/NO-GO — lives in
+`docs/production-readiness.md` (current verdict: **NO-GO**).
+
 Neither migration is to be deployed to production until a consolidated
 production-readiness security review is complete, covering migrations
 0001–0009, every RLS policy, RPC EXECUTE grants, SECURITY DEFINER functions
