@@ -199,6 +199,30 @@ makes the `security_invoker` flag worth verifying.
 Ongoing requirement: any future view must set `security_invoker = true`, revoke
 `anon`, and be added to this table with a REST negative test.
 
+## 5a. Development reconstruction validation (2026-11-01)
+
+Closing checks on the rebuilt dev project, run read-only:
+
+| Check | Result |
+| --- | --- |
+| Sequences | **0** — every key is client-supplied text or `gen_random_uuid()`; nothing to reset |
+| Foreign keys | 60, **0 unvalidated** |
+| Tables without a primary key | **0** |
+| Orphan rows (`profiles`→`auth.users`, `sales.cashier_id`, `payments.sale_id`) | **0 / 0 / 0** |
+| MD5 checksums, live vs `dev_backup` (customers, sales, profiles, payments) | **match** |
+| CHECK / UNIQUE constraints | 111 / 68 |
+| Fingerprint | 30 tables, 6 views, 20 policies, 12 functions, 5 triggers |
+
+**Recovery drill blocker (honest status).** A production-style physical backup was
+attempted with `supabase db dump --db-url`; it shells out to `pg_dump` inside a
+container and failed because the Docker daemon is not running
+(`npipe:////./pipe/dockerDesktopLinuxEngine`). No dump was produced, so **no
+durations, database size or RTO/RPO are claimed**. What is demonstrated is the
+logical restore: full table copies, schema rebuild from the committed migrations,
+and a verified restore with matching counts and checksums (dev scale). The
+production-sized drill remains a release blocker; it needs either Docker running
+or a restore-capable target project.
+
 ## 6. Deployment, rollback and recovery plan
 
 Preconditions:
