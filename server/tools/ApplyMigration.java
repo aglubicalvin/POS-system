@@ -16,6 +16,27 @@ public class ApplyMigration {
         String file = args[0], version = args[1], name = args[2];
         String sql = Files.readString(Path.of(file));
 
+        // Semantics-neutral normalization only. The migration SQL is sent to
+        // PostgreSQL exactly as written — no quote escaping, no dollar-quote
+        // rewriting. A previous tool run corrupted the migration files by
+        // doubling every apostrophe and stripping $$ delimiters; the guard
+        // below makes that failure mode loud at replay time instead of
+        // silently breaking the apply.
+        if (sql.startsWith("\uFEFF")) {
+            sql = sql.substring(1);
+        }
+        sql = sql.replace("\r\n", "\n").replace('\r', '\n');
+
+        if (sql.contains("''''")) {
+            System.err.println("REFUSED: " + file + " looks quote-corrupted (quadrupled apostrophes).");
+            for (String line : sql.split("\n", -1)) {
+                if (line.contains("''''")) {
+                    System.err.println("  offending line: " + line.trim());
+                }
+            }
+            System.exit(3);
+        }
+
         String url = System.getenv().getOrDefault("CHECK_URL",
             "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres");
         String user = System.getenv("CHECK_USER");

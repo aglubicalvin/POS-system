@@ -38,7 +38,16 @@ object SupabaseMigrations {
         // Canonical POS schema first — the migrations layer on top of it.
         Schema.apply(db)
         for (file in FILES) {
-            val sql = Files.readString(migrationsDir().resolve(file))
+            var sql = Files.readString(migrationsDir().resolve(file))
+            // The SQL is executed exactly as written — no escaping, no rewriting.
+            // Quadrupled apostrophes mean the file was corrupted by a
+            // quote-doubling pass; fail here with the offending lines rather
+            // than surfacing opaque PostgreSQL syntax errors from the suite.
+            if (sql.contains("''''")) {
+                val offenders = sql.lines().filter { it.contains("''''") }
+                error("$file looks quote-corrupted; offending lines: " + offenders.joinToString("; ") { it.trim() })
+            }
+            sql = sql.replace("\r\n", "\n").replace('\r', '\n')
             db.read { conn -> conn.createStatement().use { it.execute(sql) } }
         }
         // Supabase's default privileges grant `authenticated` DML on every new table

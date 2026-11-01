@@ -86,6 +86,15 @@ interface JsonRecord {
   [key: string]: unknown;
 }
 
+/** Null-safe detail formatter: `JSON.stringify(undefined)` has no `.slice`. */
+function show(value: unknown, max = 200): string {
+  try {
+    return (JSON.stringify(value) ?? "undefined").slice(0, max);
+  } catch {
+    return String(value).slice(0, max);
+  }
+}
+
 function rowsOf(body: unknown): JsonRecord[] {
   return Array.isArray(body) ? (body as JsonRecord[]) : [];
 }
@@ -104,11 +113,16 @@ async function rest(
     prefer?: string;
   } = {},
 ): Promise<{ status: number; body: unknown }> {
+  // PostgREST picks the database role from the Authorization bearer, not from
+  // `apikey`. Without the bearer a "service" request would run as `anon`, and
+  // RLS refuses the seeding — which is exactly what happens on a real project
+  // if only the key header is sent.
+  const key = options.anon ? SUPABASE_ANON_KEY! : SUPABASE_SERVICE_ROLE_KEY!;
   const headers: Record<string, string> = {
-    apikey: options.anon ? SUPABASE_ANON_KEY! : SUPABASE_SERVICE_ROLE_KEY!,
+    apikey: key,
+    authorization: `Bearer ${options.token ?? key}`,
     "content-type": "application/json",
   };
-  if (options.token) headers.authorization = `Bearer ${options.token}`;
   if (options.prefer) headers.prefer = options.prefer;
 
   const response = await fetch(`${base}${path}`, {
@@ -283,7 +297,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
   check(
     "service seeds a customer",
     customer.status === 201,
-    JSON.stringify(customer.body).slice(0, 200),
+    show(customer.body).slice(0, 200),
   );
   const customerId =
     rowsOf(customer.body)[0]?.customer_id as string | undefined;
@@ -306,7 +320,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
     check(
       `profiles row (${role}) for verification`,
       profile.status >= 200 && profile.status < 300,
-      JSON.stringify(profile.body).slice(0, 200),
+      show(profile.body).slice(0, 200),
     );
   }
 
@@ -334,7 +348,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
   check(
     "service seeds the stand-in cashier",
     seedCashier.status >= 200 && seedCashier.status < 300,
-    JSON.stringify(seedCashier.body).slice(0, 160),
+    show(seedCashier.body).slice(0, 160),
   );
   const seedSale = await rest("/rest/v1/sales", {
     method: "POST",
@@ -352,7 +366,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
   check(
     "service seeds the anchor sale",
     seedSale.status >= 200 && seedSale.status < 300,
-    JSON.stringify(seedSale.body).slice(0, 160),
+    show(seedSale.body).slice(0, 160),
   );
   const seedPayment = await rest("/rest/v1/payments", {
     method: "POST",
@@ -371,7 +385,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
   check(
     "service seeds the anchor payment",
     seedPayment.status >= 200 && seedPayment.status < 300,
-    JSON.stringify(seedPayment.body).slice(0, 160),
+    show(seedPayment.body).slice(0, 160),
   );
 
   // ---- service-role stand-ins for the background systems the app integrates
@@ -396,7 +410,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
   check(
     "authenticated non-admin cannot forge payment rows",
     cashierWrite.status >= 400,
-    JSON.stringify(cashierWrite.body).slice(0, 160),
+    show(cashierWrite.body).slice(0, 160),
   );
 
   const confirm = await rest(
@@ -409,7 +423,7 @@ async function createAuthFixtures(baseRun: string): Promise<AuthFixture> {
   check(
     "service-role confirms payment state (webhook stand-in)",
     confirm.status >= 200 && confirm.status < 300,
-    JSON.stringify(confirm.body).slice(0, 160),
+    show(confirm.body).slice(0, 160),
   );
 
   return {
@@ -488,12 +502,17 @@ async function main(): Promise<void> {
   const supervisorId = await createAuthUser(supervisorEmail, fixture.password);
   const supervisorProfile = await rest("/rest/v1/profiles", {
     method: "POST",
-    body: { id: supervisorId, full_name: "E2E Supervisor", role: "admin" },
+    body: {
+      id: supervisorId,
+      full_name: "E2E Supervisor",
+      role: "admin",
+      is_supervisor: true,
+    },
   });
   check(
     "service role can seed a supervisor profile",
     supervisorProfile.status >= 200 && supervisorProfile.status < 300,
-    JSON.stringify(supervisorProfile.body).slice(0, 160),
+    show(supervisorProfile.body).slice(0, 160),
   );
   const supervisorToken = await pleaseSignInAs(
     supervisorId,
@@ -511,8 +530,14 @@ async function main(): Promise<void> {
     console.log("  SKIP fault lifecycle: no `faults` table in this project (migration for Phase 4.7 not applied)");
   } else {
 
+  // Every fault PATCH below is filtered by this id. PostgREST refuses an
+  // unfiltered UPDATE (21000) and, more importantly, an unfiltered UPDATE would
+  // touch every fault the caller can see.
+  const faultFilter = `fault_id=eq.${encode(`${baseRun}-fault`)}`;
+
   const postedFault = await rest("/rest/v1/faults", {
     method: "POST",
+    prefer: "return=representation",
     token: supervisorToken,
     anon: true,
     body: {
@@ -529,7 +554,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can post a fault against the reconciled sale",
     postedFault.status >= 200 && postedFault.status < 300,
-    JSON.stringify(postedFault.body).slice(0, 200),
+    show(postedFault.body).slice(0, 200),
   );
 
   const nonSupervisorPost = await rest("/rest/v1/faults", {
@@ -550,14 +575,14 @@ async function main(): Promise<void> {
   check(
     "plain admin cannot post faults",
     nonSupervisorPost.status >= 400,
-    JSON.stringify(nonSupervisorPost.body).slice(0, 160),
+    show(nonSupervisorPost.body).slice(0, 160),
   );
 
   const postedFaultRow = postedFault.status >= 200 ? rowsOf(postedFault.body)[0] : null;
   check(
     "posted fault carries fault_id",
     postedFaultRow?.fault_id === `${baseRun}-fault`,
-    JSON.stringify(postedFaultRow).slice(0, 160),
+    show(postedFaultRow).slice(0, 160),
   );
 
   const preDefect = await rest(
@@ -570,7 +595,7 @@ async function main(): Promise<void> {
     pre?.status === "reported" &&
       pre?.is_defect === false &&
       pre?.payment_blocked === false,
-    JSON.stringify(pre).slice(0, 200),
+    show(pre).slice(0, 200),
   );
 
   const escalate = await rest("/rest/v1/faults", {
@@ -582,7 +607,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can escalate a posted fault to with_approvals",
     escalate.status >= 200 && escalate.status < 300,
-    JSON.stringify(escalate.body).slice(0, 200),
+    show(escalate.body).slice(0, 200),
   );
 
   const escalated = await rest(
@@ -593,7 +618,7 @@ async function main(): Promise<void> {
   check(
     "fault rows as defect after supervisor escalation",
     esc?.is_defect === true && esc?.status === "with_approvals",
-    JSON.stringify(esc).slice(0, 160),
+    show(esc).slice(0, 160),
   );
 
   // ---- approval queues (Phase 4.7 side effect) ----------------------------
@@ -608,7 +633,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can trigger the approval-queue processor",
     processApprovals.status >= 200 && processApprovals.status < 300,
-    JSON.stringify(processApprovals.body).slice(0, 200),
+    show(processApprovals.body).slice(0, 200),
   );
 
   const approvalQueue = await rest(
@@ -621,7 +646,7 @@ async function main(): Promise<void> {
       approvalQueue.status < 300 &&
       Array.isArray(approvalQueue.body) &&
       approvalQueue.body.length >= 1,
-    JSON.stringify(approvalQueue.body).slice(0, 200),
+    show(approvalQueue.body).slice(0, 200),
   );
 
   // ---- denial flips payment back to unblocked ------------------------------
@@ -639,7 +664,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can deny a previously-escalated fault",
     deny.status >= 200 && deny.status < 300,
-    JSON.stringify(deny.body).slice(0, 200),
+    show(deny.body).slice(0, 200),
   );
 
   const deniedRead = await rest(
@@ -652,7 +677,7 @@ async function main(): Promise<void> {
     denied?.status === "denied" &&
       denied?.is_defect === false &&
       denied?.payment_blocked === false,
-    JSON.stringify(denied).slice(0, 200),
+    show(denied).slice(0, 200),
   );
 
   const afterDenyPayment = await rest(
@@ -663,7 +688,7 @@ async function main(): Promise<void> {
   check(
     "payment flips back to not-blocked after fault denial",
     unblocked?.status === "confirmed" && unblocked?.blocked === false,
-    JSON.stringify(unblocked).slice(0, 200),
+    show(unblocked).slice(0, 200),
   );
 
   // ---- close the denied fault ----------------------------------------------
@@ -677,7 +702,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can close a denied fault",
     close.status >= 200 && close.status < 300,
-    JSON.stringify(close.body).slice(0, 200),
+    show(close.body).slice(0, 200),
   );
 
   const closedRead = await rest(
@@ -688,7 +713,7 @@ async function main(): Promise<void> {
   check(
     "fault lifecycle ends in closed status",
     closed?.status === "closed",
-    JSON.stringify(closed).slice(0, 160),
+    show(closed).slice(0, 160),
   );
 
   // ---- non-supervisor denial is refused ------------------------------------
@@ -702,7 +727,7 @@ async function main(): Promise<void> {
   check(
     "plain admin cannot escalate a fault",
     nonSupervisorEscalate.status >= 400,
-    JSON.stringify(nonSupervisorEscalate.body).slice(0, 160),
+    show(nonSupervisorEscalate.body).slice(0, 160),
   );
 
   const nonSupervisorDeny = await rest("/rest/v1/faults", {
@@ -714,7 +739,7 @@ async function main(): Promise<void> {
   check(
     "plain admin cannot deny a fault",
     nonSupervisorDeny.status >= 400,
-    JSON.stringify(nonSupervisorDeny.body).slice(0, 160),
+    show(nonSupervisorDeny.body).slice(0, 160),
   );
 
   // ---- reopen + repost to prove payment blocking again ---------------------
@@ -728,7 +753,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can reopen a closed fault",
     reopen.status >= 200 && reopen.status < 300,
-    JSON.stringify(reopen.body).slice(0, 200),
+    show(reopen.body).slice(0, 200),
   );
 
   const repost = await rest("/rest/v1/faults", {
@@ -740,7 +765,7 @@ async function main(): Promise<void> {
   check(
     "supervisor can post an escalated fault (payment blocked)",
     repost.status >= 200 && repost.status < 300,
-    JSON.stringify(repost.body).slice(0, 200),
+    show(repost.body).slice(0, 200),
   );
 
   const repostedRead = await rest(
@@ -753,7 +778,7 @@ async function main(): Promise<void> {
     reposted?.status === "posted" &&
       reposted?.is_defect === true &&
       reposted?.payment_blocked === true,
-    JSON.stringify(reposted).slice(0, 200),
+    show(reposted).slice(0, 200),
   );
 
   const repostedPayment = await rest(
@@ -764,8 +789,135 @@ async function main(): Promise<void> {
   check(
     "linked payment is blocked while the fault is posted",
     repostedPaymentRow?.status === "confirmed" && repostedPaymentRow?.blocked === true,
-    JSON.stringify(repostedPaymentRow).slice(0, 200),
+    show(repostedPaymentRow).slice(0, 200),
   );
+
+  // ---- negative checks: the PostgREST authorization path -------------------
+  // These assert refusals, not successes. Each one is a claim the SQL-level
+  // tests make, re-proven here through PostgREST + RLS + the guard triggers,
+  // which is the path the admin app actually uses.
+
+  // 1. Anonymous access to faults is refused (RLS or a hard denial — either is
+  //    fail-closed). No row may come back, whatever the status code.
+  const anonFaults = await rest(`/rest/v1/faults?select=fault_id,status`, { anon: true });
+  check(
+    "anonymous reads of faults are denied",
+    rowsOf(anonFaults.body).length === 0 &&
+      (anonFaults.status === 200 || anonFaults.status >= 400),
+    `status=${anonFaults.status} ${show(anonFaults.body).slice(0, 160)}`,
+  );
+
+  const anonQueue = await rest(`/rest/v1/approval_queues?select=queue_id`, { anon: true });
+  check(
+    "anonymous reads of approval_queues are denied",
+    rowsOf(anonQueue.body).length === 0,
+    `status=${anonQueue.status} ${show(anonQueue.body).slice(0, 160)}`,
+  );
+
+  // 2. An illegal transition is rejected: the fault is posted, and posted is
+  //    terminal, so it cannot go back to reported.
+  const illegalMove = await rest(`/rest/v1/faults?${faultFilter}`, {
+    method: "PATCH",
+    token: supervisorToken,
+    anon: true,
+    body: { status: "reported" },
+  });
+  check(
+    "an illegal fault transition is rejected over REST",
+    illegalMove.status >= 400,
+    `status=${illegalMove.status} ${show(illegalMove.body).slice(0, 200)}`,
+  );
+
+  const stillPosted = await rest(`/rest/v1/faults?${faultFilter}&select=status`, {
+    token: supervisorToken,
+    anon: true,
+  });
+  check(
+    "the rejected transition left the fault untouched",
+    rowsOf(stillPosted.body)[0]?.status === "posted",
+    show(rowsOf(stillPosted.body)[0]).slice(0, 160),
+  );
+
+  // 3. A denial without a reason is rejected. A second fault walks the legal
+  //    path to with_approvals, where denial is allowed — only the missing
+  //    denial_reason can be the reason for the refusal.
+  const noReasonId = `${baseRun}-fault-noreason`;
+  const noReasonPost = await rest("/rest/v1/faults", {
+    method: "POST",
+    prefer: "return=representation",
+    token: supervisorToken,
+    anon: true,
+    body: {
+      fault_id: noReasonId,
+      sale_id: reconcileSeedId,
+      payment_id: paymentId,
+      reported_by_user_id: supervisorId,
+      issue_summary: "e2e reasonless denial probe",
+      priority: "low",
+      status: "reported",
+    },
+  });
+  check(
+    "supervisor can post the probe fault",
+    noReasonPost.status >= 200 && noReasonPost.status < 300,
+    show(noReasonPost.body).slice(0, 160),
+  );
+
+  const noReasonEscalate = await rest(
+    `/rest/v1/faults?fault_id=eq.${encode(noReasonId)}`,
+    {
+      method: "PATCH",
+      token: supervisorToken,
+      anon: true,
+      body: { status: "with_approvals" },
+    },
+  );
+  check(
+    "probe fault reaches with_approvals",
+    noReasonEscalate.status >= 200 && noReasonEscalate.status < 300,
+    show(noReasonEscalate.body).slice(0, 160),
+  );
+
+  const reasonlessDeny = await rest(
+    `/rest/v1/faults?fault_id=eq.${encode(noReasonId)}`,
+    {
+      method: "PATCH",
+      token: supervisorToken,
+      anon: true,
+      body: { status: "denied", is_defect: false },
+    },
+  );
+  check(
+    "a denial without a reason is rejected over REST",
+    reasonlessDeny.status >= 400,
+    `status=${reasonlessDeny.status} ${show(reasonlessDeny.body).slice(0, 200)}`,
+  );
+
+  const probeAfterDeny = await rest(
+    `/rest/v1/faults?fault_id=eq.${encode(noReasonId)}&select=status`,
+    { token: supervisorToken, anon: true },
+  );
+  check(
+    "the reasonless denial left the fault at with_approvals",
+    rowsOf(probeAfterDeny.body)[0]?.status === "with_approvals",
+    show(rowsOf(probeAfterDeny.body)[0]).slice(0, 160),
+  );
+
+  // 4. Cross-user queue processing is rejected: the supervisor may only drain
+  //    their own queue, so asking for the admin's must fail.
+  const crossQueue = await rest("/rest/v1/rpc/process_approval_queues", {
+    method: "POST",
+    token: supervisorToken,
+    anon: true,
+    body: { p_user_id: adminId },
+  });
+  check(
+    "cross-user approval-queue processing is rejected",
+    crossQueue.status >= 400,
+    `status=${crossQueue.status} ${show(crossQueue.body).slice(0, 200)}`,
+  );
+
+  // The probe fault is left behind for the sale-cascade cleanup below.
 
   } // end of faults-present block
 
