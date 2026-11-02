@@ -89,17 +89,26 @@ public class ProbeState {
             q(c, "select 'tables_with_rls=' || count(*) from pg_class c " +
                  "join pg_namespace n on n.oid=c.relnamespace " +
                  "where n.nspname='public' and c.relkind='r' and c.relrowsecurity");
-            q(c, "select 'migration_rows=' || coalesce((select count(version) from " +
-                 "supabase_migrations.schema_migrations), 0)");
+            // Migration-history existence check (read-only, catalog-based).
+            // The supabase_migrations schema is provisioned by the baseline
+            // migration; on a brand-new or unprovisioned project the table does
+            // not exist yet. ProbeState is read-only: it never creates schema,
+            // tables, or migration rows.
+            q(c, "select 'supabase_migrations_exists=' || (case when exists (" +
+                 "select 1 from information_schema.tables where table_schema='supabase_migrations' " +
+                 "and table_name='schema_migrations') then 'true' else 'false' end)");
+
+            System.out.println("-- migration history --");
+            q(c, "select 'migration_history=' || (case when exists (" +
+                 "select 1 from information_schema.tables where table_schema='supabase_migrations' " +
+                 "and table_name='schema_migrations') then (" +
+                 "select count(version) || ' rows from supabase_migrations.schema_migrations') " +
+                 "else 'not_initialized' end)");
 
             System.out.println("-- public tables --");
             q(c, "select c.relname from pg_class c " +
                  "join pg_namespace n on n.oid=c.relnamespace " +
                  "where n.nspname='public' and c.relkind='r' order by 1");
-
-            System.out.println("-- migration history --");
-            q(c, "select version || ' ' || name from " +
-                 "supabase_migrations.schema_migrations order by version");
 
             System.out.println("-- policies not scoped to authenticated --");
             q(c, "select p.tablename || '.' || p.policyname || ' -> ' || array_to_string(p.roles, ',') " +
@@ -107,6 +116,8 @@ public class ProbeState {
                  "and not exists (select 1 from unnest(p.roles) r where r='authenticated') " +
                  "order by 1");
 
+            // Preserve existing dirty working-tree changes: ProbeState never
+            // writes to the database; closing a read-only session is harmless.
             try {
                 c.rollback();
             } catch (SQLException ignored) {

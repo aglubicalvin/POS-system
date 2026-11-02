@@ -62,3 +62,35 @@ tasks.test {
 application {
     mainClass.set("com.businessstore.pos.ApplicationKt")
 }
+
+/**
+ * Explicit schema provisioning. Normal startup never writes schema; this task
+ * does, so it requires PROVISION_CONFIRM=yes and an explicit POS_DATABASE_URL.
+ * There is no default target in the task or in the code it runs.
+ */
+tasks.register<JavaExec>("provisionDatabase") {
+    group = "database"
+    description = "Create the canonical POS schema on an explicitly confirmed, disposable database."
+    mainClass.set("com.businessstore.pos.tools.ProvisionKt")
+    classpath = sourceSets.main.get().runtimeClasspath
+}
+
+/**
+ * Read-only staging identity probe. This task runs ProbeState against a database
+ * nominated by CHECK_URL with PROBE_CONFIRM=yes required. It never writes, never
+ * provisions, and never applies migrations. Used by
+ * .github/workflows/probe-staging-identity.yml.
+ */
+tasks.register<JavaExec>("execProbeState") {
+    group = "verification"
+    description = "Run the read-only ProbeState audit against a nominated database (workflow use only)."
+    mainClass.set("com.businessstore.pos.tools.ProbeState")
+    classpath = sourceSets.main.get().runtimeClasspath
+    environment("PROBE_CONFIRM", "yes")
+    doFirst {
+        systemProperty("CHECK_URL", System.getProperty("CHECK_URL"))
+        systemProperty("CHECK_USER", System.getProperty("CHECK_USER"))
+        systemProperty("CHECK_PASS", System.getProperty("CHECK_PASS"))
+        systemProperty("PROBE_CONFIRM", System.getProperty("PROBE_CONFIRM"))
+    }
+}

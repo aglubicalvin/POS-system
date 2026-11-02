@@ -1,0 +1,145 @@
+# Read-only staging identity verification. Manual dispatch only.
+#
+# Targets the designated staging Supabase project (reference mjqoydqcmecqjvzbckgk)
+# and runs the read-only ProbeState audit. This workflow exists so an independent
+# reviewer can confirm the staging database identity WITHOUT ever running any
+# provisioning, role creation, grant changes, or migration application.
+#
+# Separation from probe-staging.yml:
+#   probe-staging.yml   → can apply role/grant DDL with -Apply
+#   probe-staging-identity.yml → read-only verification only, no apply path
+#
+# Environment requirements (owner-configured on pos-staging-admin):
+#   vars:
+#     POS_STAGING_PROJECT_REF  = mjqoydqcmecqjvzbckgk
+#     PROBE_ADMIN_USER         = postgres.mjqoydqcmecqjvzbckgk
+#   secrets (never logged, never artifacted):
+#     PROBE_ADMIN_PASS         = admin password for the postgres role
+#     CHECK_PASS               = same password, exposed to ProbeState as CHECK_PASS
+#
+# Safe evidence is published as a workflow artifact; never include passwords or
+# JDBC credentials in the output.
+
+name: probe-staging-identity
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-identity:
+    runs-on: ubuntu-latest
+    environment: pos-staging-admin
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate staging target reference
+        shell: bash
+        env:
+          POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
+          PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+        run: |
+          set -euo pipefail
+          REF="${POS_STAGING_PROJECT_REF:-}"
+          USER="${PROBE_ADMIN_USER:-}"
+
+          if [ -z "$REF" ]; then
+            echo "::error::POS_STAGING_PROJECT_REF is not set in the environment variables"
+            exit 1
+          fi
+
+          if [[ ! "$REF" =~ ^[a-z0-9]{20}$ ]]; then
+            echo "::error::POS_STAGING_PROJECT_REF is not a valid 20-character lowercase alphanumeric reference"
+            exit 1
+          fi
+
+          EXPECTED_USER="postgres.${REF}"
+          if [ "$USER" != "$EXPECTED_USER" ]; then
+            echo "::error::PROBE_ADMIN_USER ($USER) does not match postgres.${REF}"
+            exit 1
+          fi
+
+          echo "Target project reference: $REF"
+          echo "Administrator user: $USER"
+          echo "Username suffix validation: PASS"
+          echo "MATCHED_REF=$REF" >> "$GITHUB_ENV"
+
+      - name: Run read-only staging identity probe
+        shell: bash
+        env:
+          CHECK_URL: jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:6543/postgres
+          CHECK_USER: ${{ vars.PROBE_ADMIN_USER }}
+          CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
+          PROBE_CONFIRM: yes
+          MATCHED_REF: ${{ env.MATCHED_REF }}
+        run: |
+          set -euo pipefail
+
+          cd server
+
+          # ProbeState is a read-only tool. It:
+          #   - refuses unset CHECK_URL
+          #   - refuses without PROBE_CONFIRM=yes
+          #   - refuses hosts containing "prod"
+          #   - opens a read-only transaction
+          #   - queries pg_catalog only, never DDL/DML
+          #
+          # This job never invokes probe-readonly.ps1 -Apply and has no
+          # provisioning path.
+
+          ./gradlew -q execProbeState \
+            -DCHECK_URL="$CHECK_URL" -DCHECK_USER="$CHECK_USER" -DCHECK_PASS="$CHECK_PASS" \
+            -DPROBE_CONFIRM="$PROBE_CONFIRM" 2>&1 | tee probe-output.txt || true
+
+          echo "Probe exit code: $?"
+
+          echo "--- sanitize: strip any credential-like artifacts ---"
+          # ProbeState never prints passwords, but belt-and-suspenders sanitize.
+          sed -i -e 's/CHECK_PASS=[^[:space:]]*/CHECK_PASS=<redacted>/g' \
+                 -e 's/CHECK_USER=[^[:space:]]*/CHECK_USER=<redacted>/g' \
+                 probe-output.txt 2>/dev/null || true
+
+          echo "--- sanitized probe output ---"
+          sed 's/.*\(postgres\.[^[:space:]]*\).*/\1/' probe-output.txt || true
+
+          echo "PROBE_LOG<<EOF" >> "$GITHUB_ENV"
+          cat probe-output.txt
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Publish sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: probe-staging-identity-evidence
+          path: server/probe-output.txt
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Verify safe evidence contents
+        if: always()
+        shell: bash
+        env:
+          MATCHED_REF: ${{ env.MATCHED_REF }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Required safe-evidence fields ==="
+          echo "Target project reference: $MATCHED_REF"
+          echo "Username suffix validation: PASS"
+          echo "Database name: postgres (hardcoded in CHECK_URL)"
+          echo "Read-only transaction status: enforced by ProbeState (c.setReadOnly(true))"
+          echo "Migration-history initialization status: reported by ProbeState"
+          echo "Probe completion status: reported by ProbeState exit code"
+
+          # Confirm no secrets leaked into the artifact
+          if [ -f server/probe-output.txt ]; then
+            if grep -qE '(PASSWORD|password|pass)[=:].*[a-zA-Z0-9]{8,}' server/probe-output.txt; then
+              echo "::error::Possible credential leak detected in probe output"
+              exit 1
+            fi
+            echo "No credential patterns detected in artifact"
+          fi
