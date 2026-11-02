@@ -63,9 +63,12 @@ public class ProbeState {
 
             q(c, "select 'database=' || current_database()");
             q(c, "select 'current_user=' || current_user");
-            q(c, "select 'app_tables=' || count(*) from information_schema.tables " +
-                 "where table_schema='public' and table_type='BASE TABLE'");
-            q(c, "select 'views=' || count(*) from information_schema.views where table_schema='public'");
+            q(c, "select 'app_tables=' || count(*) from pg_class c " +
+                 "join pg_namespace n on n.oid=c.relnamespace " +
+                 "where n.nspname='public' and c.relkind='r'");
+            q(c, "select 'views=' || count(*) from pg_class c " +
+                 "join pg_namespace n on n.oid=c.relnamespace " +
+                 "where n.nspname='public' and c.relkind in ('v','m')");
             q(c, "select 'policies=' || count(*) from pg_policies where schemaname='public'");
             q(c, "select 'policies_to_authenticated=' || count(*) from pg_policies p " +
                  "where p.schemaname='public' and exists (select 1 from unnest(p.roles) r " +
@@ -73,22 +76,26 @@ public class ProbeState {
             q(c, "select 'policies_to_public=' || count(*) from pg_policies p " +
                  "where p.schemaname='public' and exists (select 1 from unnest(p.roles) r " +
                  "where r='public')");
-            q(c, "select 'functions=' || count(*) from information_schema.routines " +
-                 "where routine_schema='public' and routine_name not like 'pg\\_%'");
+            q(c, "select 'functions=' || count(*) from pg_proc p " +
+                 "join pg_namespace n on n.oid=p.pronamespace " +
+                 "where n.nspname='public' and p.proname not like 'pg\\_%'");
             q(c, "select 'functions_pinned_search_path=' || count(*) from pg_proc p " +
                  "join pg_namespace n on n.oid=p.pronamespace " +
                  "where n.nspname='public' and p.proconfig is not null");
-            q(c, "select 'triggers=' || count(*) from information_schema.triggers " +
-                 "where trigger_schema='public'");
+            q(c, "select 'triggers=' || count(*) from pg_trigger t " +
+                 "join pg_class c on c.oid=t.tgrelid " +
+                 "join pg_namespace n on n.oid=c.relnamespace " +
+                 "where n.nspname='public' and not t.tgisinternal");
             q(c, "select 'tables_with_rls=' || count(*) from pg_class c " +
                  "join pg_namespace n on n.oid=c.relnamespace " +
                  "where n.nspname='public' and c.relkind='r' and c.relrowsecurity");
-            q(c, "select 'migration_rows=' || coalesce((select count(*) from " +
+            q(c, "select 'migration_rows=' || coalesce((select count(version) from " +
                  "supabase_migrations.schema_migrations), 0)");
 
             System.out.println("-- public tables --");
-            q(c, "select table_name from information_schema.tables " +
-                 "where table_schema='public' and table_type='BASE TABLE' order by 1");
+            q(c, "select c.relname from pg_class c " +
+                 "join pg_namespace n on n.oid=c.relnamespace " +
+                 "where n.nspname='public' and c.relkind='r' order by 1");
 
             System.out.println("-- migration history --");
             q(c, "select version || ' ' || name from " +

@@ -1,0 +1,40 @@
+# Manual only. Creates/verifies pos_probe_readonly on the DEVELOPMENT project.
+# Runs behind the "pos-dev-admin" environment, which should require reviewer approval.
+name: probe-readonly-role
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (false = dry run)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: pos-dev-admin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dry run or apply
+        shell: pwsh
+        env:
+          PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+          PROBE_ADMIN_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
+          PROBE_PW: ${{ secrets.PROBE_PW }}
+        run: |
+          $apply = '${{ inputs.apply }}' -eq 'true'
+          if ($apply) { ./server/tools/probe-readonly.ps1 -Apply }
+          else { ./server/tools/probe-readonly.ps1 }
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-readonly-log
+          path: server/build/probe-readonly-*.log
+          if-no-files-found: warn
