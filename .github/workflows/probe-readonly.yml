@@ -18,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: pos-dev-admin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Dry run or apply
         shell: pwsh
@@ -33,8 +35,8 @@ jobs:
 
       - name: Upload log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: probe-readonly-log
           path: server/build/probe-readonly-*.log
-          if-no-files-found: warn
+          if-no-files-found: ignore
