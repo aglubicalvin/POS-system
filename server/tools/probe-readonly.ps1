@@ -1,23 +1,44 @@
-# Creates/verifies the pos_probe_readonly role on the DEVELOPMENT project only.
+# Creates/verifies the pos_probe_readonly role on the DESIGNATED STAGING project.
 # Dry run by default. Pass -Apply to execute. Nothing is run without it.
 #
+# There is no default target. The probe refuses to run until the project owner
+# designates the staging project through POS_STAGING_PROJECT_REF. The shared
+# pooler hostname is not project identity, so the only accepted evidence is the
+# administrator username suffix matching that reference exactly.
+#
 # Required environment (never put these in a file or in Git):
-#   PROBE_ADMIN_USER  e.g. postgres.<ref>   (admin user for the dev project)
-#   PROBE_ADMIN_PASS  admin password
-#   PROBE_PW          password to set for pos_probe_readonly
+#   POS_STAGING_PROJECT_REF  designated staging project reference (no default)
+#   PROBE_ADMIN_USER         e.g. postgres.<ref> (must match the reference)
+#   PROBE_ADMIN_PASS         admin password
+#   PROBE_PW                 password to set for pos_probe_readonly
 
 param([switch]$Apply)
 
 $ErrorActionPreference = 'Stop'
-$ApprovedRef = 'uemdrtrzlvhdtonccczt'
 $ServerDir = Split-Path -Parent $PSScriptRoot
 $Sql = Join-Path $PSScriptRoot 'pos_probe_readonly.sql'
 $Assert = Join-Path $PSScriptRoot 'pos_probe_readonly_assert.sql'
 $HostName = 'aws-0-eu-west-2.pooler.supabase.com'
 
-# Fail closed: the admin user must belong to the approved development project.
-if ($env:PROBE_ADMIN_USER -ne "postgres.$ApprovedRef") {
-    throw "Refusing to run: PROBE_ADMIN_USER must be exactly postgres.$ApprovedRef"
+# Fail closed: the staging project must be designated explicitly. Known
+# non-staging projects (the documented development project) are refused even if
+# they are named here, so a development database can never be probed as staging.
+$StagingRef = $env:POS_STAGING_PROJECT_REF
+if ([string]::IsNullOrWhiteSpace($StagingRef)) {
+    throw 'BLOCKED: POS_STAGING_PROJECT_REF has not been explicitly configured. The staging project must be designated by the project owner.'
+}
+$StagingRef = $StagingRef.Trim()
+if ($StagingRef -notmatch '^[a-z0-9]{20}$') {
+    throw 'BLOCKED: POS_STAGING_PROJECT_REF is not a valid Supabase project reference.'
+}
+# Known non-staging projects: development and the former verification project.
+# Neither may ever be designated as staging, even by name.
+$KnownNonStaging = @('uemdrtrzlvhdtonccczt', 'numwzjogaanfhlrfgrqk')
+if ($KnownNonStaging -contains $StagingRef) {
+    throw 'BLOCKED: POS_STAGING_PROJECT_REF names a known non-staging project. Set the dedicated staging reference.'
+}
+if ($env:PROBE_ADMIN_USER -ne "postgres.$StagingRef") {
+    throw 'BLOCKED: PROBE_ADMIN_USER does not belong to the designated staging project. Expected postgres.<POS_STAGING_PROJECT_REF>.'
 }
 if (-not $env:PROBE_ADMIN_PASS -or -not $env:PROBE_PW) {
     throw 'Refusing to run: PROBE_ADMIN_PASS and PROBE_PW must be set in the environment.'
@@ -26,12 +47,12 @@ if (-not $env:PROBE_ADMIN_PASS -or -not $env:PROBE_PW) {
 $Log = Join-Path $ServerDir "build/probe-readonly-$(Get-Date -Format yyyyMMdd-HHmmss).log"
 New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
 
-Write-Host "Target host: $HostName  admin user ends with: .$ApprovedRef  database: postgres"
+Write-Host "Target host: $HostName  staging project: $StagingRef  database: postgres"
 Write-Host "Scripts: $Sql , $Assert"
 Write-Host "Log: $Log"
 
 if (-not $Apply) {
-    Write-Host 'DRY RUN. Re-run with -Apply to execute against the development project.'
+    Write-Host 'DRY RUN. Re-run with -Apply to execute against the designated staging project.'
     exit 0
 }
 

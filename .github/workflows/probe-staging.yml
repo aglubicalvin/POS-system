@@ -1,0 +1,56 @@
+# Staging-only probe workflow. Manual dispatch only.
+#
+# This is deliberately a SEPARATE workflow from `probe-readonly.yml`:
+#   - probe-readonly.yml          → environment `pos-dev-admin`   (development, unchanged)
+#   - probe-staging.yml (here)    → environment `pos-staging-admin` (staging)
+#
+# The target is never hard-coded: the job fails closed unless the environment
+# supplies POS_STAGING_PROJECT_REF and the administrator username suffix matches
+# it exactly. The shared pooler hostname is not project identity.
+#
+# Environment requirements (owner must configure in GitHub; see
+# artifacts/pos-free-tier-staging-transition/e-github-owner-checklist.md):
+#   - required reviewers, with "Prevent self-review" enabled
+#   - deployment branch policy: main only
+#   - staging-only credentials (never shared with development/production)
+name: probe-staging-role
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Apply changes (false = dry run)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: pos-staging-admin
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Dry run or apply
+        shell: pwsh
+        env:
+          POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
+          PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+          PROBE_ADMIN_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
+          PROBE_PW: ${{ secrets.PROBE_PW }}
+        run: |
+          $apply = '${{ inputs.apply }}' -eq 'true'
+          if ($apply) { ./server/tools/probe-readonly.ps1 -Apply }
+          else { ./server/tools/probe-readonly.ps1 }
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: probe-staging-log
+          path: server/build/probe-readonly-*.log
+          if-no-files-found: ignore
