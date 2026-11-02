@@ -42,8 +42,9 @@ alter role pos_probe_readonly set statement_timeout = '60s';
 -- 3. May connect to the database.
 grant connect on database postgres to pos_probe_readonly;
 
--- 4. May see schema names. No table privileges are granted anywhere.
-grant usage on schema public to pos_probe_readonly;
+-- 4. Schema access: only supabase_migrations, which the probe queries by name.
+--    public is NOT granted. ProbeState reads pg_catalog, which needs no schema
+--    USAGE. No table privileges are granted anywhere.
 grant usage on schema supabase_migrations to pos_probe_readonly;
 
 -- 5. Migration history: only the two columns the probe prints.
@@ -54,6 +55,7 @@ grant select (version, name) on supabase_migrations.schema_migrations to pos_pro
 --    Run after steps 1-5 to confirm the role holds nothing it should not.
 select
   has_schema_privilege('pos_probe_readonly', 'auth', 'USAGE')                              as auth_schema_usage,
+  has_schema_privilege('pos_probe_readonly', 'public', 'USAGE')                           as public_schema_usage,
   has_table_privilege('pos_probe_readonly', 'auth.users', 'SELECT')                        as auth_users_select,
   has_table_privilege('pos_probe_readonly', 'auth.identities', 'SELECT')                   as auth_identities_select,
   has_table_privilege('pos_probe_readonly', 'public.profiles', 'SELECT')                   as profiles_select,

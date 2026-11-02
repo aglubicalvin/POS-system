@@ -35,20 +35,33 @@ if (-not $Apply) {
     exit 0
 }
 
-# Step 0 of the SQL prints the executing account. Password is passed as a psql
-# variable, not written into the SQL file.
+# psql's \password reads two lines from stdin and hashes client-side. Reject
+# line breaks so the two prompts cannot consume different values.
+if ($env:PROBE_PW -match '[\r\n\x00]') {
+    throw 'Refusing to run: PROBE_PW must not contain line breaks or NUL.'
+}
 $uri = "host=$HostName port=5432 dbname=postgres user=$($env:PROBE_ADMIN_USER) sslmode=require"
 $dockerArgs = @(
     'run', '--rm', '-i',
-    '-e', 'PGPASSWORD', '-e', 'PROBE_PW',
+    '-e', 'PGPASSWORD',
     '-v', "$PSScriptRoot`:/work:ro",
     'postgres:17',
-    'sh', '-c',
-    "psql '$uri' -v ON_ERROR_STOP=1 -v probe_pw=`"`$PROBE_PW`" -f /work/pos_probe_readonly.sql -f /work/pos_probe_readonly_password.sql -f /work/pos_probe_readonly_assert.sql"
+    'psql', $uri, '--single-transaction', '-v', 'ON_ERROR_STOP=1',
+    '-c', "SET password_encryption = 'scram-sha-256'",
+    '-f', '/work/pos_probe_readonly.sql',
+    '-f', '/work/pos_probe_readonly_password.sql',
+    '-f', '/work/pos_probe_readonly_assert.sql'
 )
 $env:PGPASSWORD = $env:PROBE_ADMIN_PASS
-& docker @dockerArgs 2>&1 | Tee-Object -FilePath $Log
-$code = $LASTEXITCODE
-Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+try {
+    # Windows PowerShell turns native stderr (including psql's prompts) into
+    # errors. Keep it non-terminating and check the native exit code explicitly.
+    $ErrorActionPreference = 'Continue'
+    @($env:PROBE_PW, $env:PROBE_PW) | & docker @dockerArgs 2>&1 | Tee-Object -FilePath $Log
+    $code = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = 'Stop'
+    Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+}
 if ($code -ne 0) { throw "psql failed with exit code $code. See $Log" }
 Write-Host "Completed. Log: $Log"

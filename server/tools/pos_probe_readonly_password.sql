@@ -1,4 +1,5 @@
--- Sets the probe role password from the psql variable probe_pw.
--- Run after pos_probe_readonly.sql. The password comes from the environment,
--- never from this file. Requires psql -v probe_pw=...
-alter role pos_probe_readonly password :'probe_pw';
+-- Sets the probe role password. \password is a psql meta-command: psql hashes the
+-- password on the client (scram-sha-256) and sends only the hash. The plaintext
+-- never appears in SQL text, argv, or the server log.
+-- Must be fed on stdin by the wrapper (psql reads the two prompts from stdin).
+\password pos_probe_readonly
