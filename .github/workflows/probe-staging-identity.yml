@@ -86,7 +86,7 @@ jobs:
       - name: Run read-only staging identity probe
         shell: bash
         env:
-          CHECK_URL: jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:6543/postgres
+          CHECK_URL: jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres
           CHECK_USER: ${{ vars.PROBE_ADMIN_USER }}
           CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
           PROBE_CONFIRM: "yes"
