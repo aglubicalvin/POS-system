@@ -490,7 +490,7 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       'error: invalid source release: 21',
       'sensitive runner path: /home/runner/work/private-project',
       'credential-like-value=must-never-appear-in-evidence',
-    ].join('\\n');
+    ].join('\n');
     const result = runStep(rawOutput, 1);
     try {
       expect(result.status).toBe(1);
