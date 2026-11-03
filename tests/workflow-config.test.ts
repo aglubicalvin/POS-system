@@ -247,8 +247,11 @@ describe('identity probe exit-status and evidence handling', () => {
   it('keeps the sanitized evidence field allowlist', () => {
     // Only these probe fields may be copied into the evidence file.
     expect(probeStep).toMatch(
-      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\|error_category\)='/,
+      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\)='/,
     );
+    // The error category is selected separately from a fixed safe token and
+    // emitted only after validation; it is not copied blindly by grep.
+    expect(probeStep).toContain('echo "error_category=${ERROR_CATEGORY}"');
     // The raw file is never copied or dumped into the evidence.
     expect(probeStep).not.toMatch(/cat probe-raw\.txt/);
     expect(probeStep).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
