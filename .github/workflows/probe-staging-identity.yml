@@ -26,6 +26,10 @@
 # Evidence policy: the probe's full output is database inventory and is treated as
 # sensitive. It is written to a scratch file that is NEVER uploaded. Only the
 # allowlisted summary below becomes the artifact and the workflow log.
+#
+# The summary is derived from the probe's own output wherever it describes the
+# probe: `read_only_transaction` is copied from the probe's server-side
+# confirmation line and falls back to `not_confirmed` when that line is absent.
 
 name: probe-staging-identity
 
@@ -121,6 +125,25 @@ jobs:
             COMPLETION=failed
           fi
 
+          # Read-only mode is a property of the probe SESSION, not of this
+          # workflow. ProbeState asks PostgreSQL itself
+          # (`SHOW transaction_read_only`) before any catalog query and prints
+          # `read_only_transaction=server_confirmed` only when the server says
+          # `on`, so the value is read back from the probe's own output: an
+          # exact match confirms the session, anything else (including a refused
+          # target, a failed connection, or a server that reported `off`) is
+          # recorded as not_confirmed. `enforced` is still accepted for the
+          # pre-server-check build, so a stale binary cannot silently downgrade
+          # a confirmed run. The value written to evidence is always
+          # `server_confirmed` (the tool's current vocabulary), regardless of
+          # which exact line was found. Asserting the field unconditionally
+          # would publish evidence that claims a protection never applied.
+          if grep -qxE '[[:space:]]*read_only_transaction=(server_confirmed|enforced)' probe-raw.txt; then
+            READ_ONLY=read_only_transaction=server_confirmed
+          else
+            READ_ONLY=read_only_transaction=not_confirmed
+          fi
+
           # --- allowlisted evidence only -------------------------------------
           # Written on BOTH outcomes: a failed probe must still leave sanitized
           # evidence rather than a bare exit code. A strict field allowlist: no
@@ -129,13 +152,15 @@ jobs:
           {
             echo "target_project_reference=${MATCHED_REF:-unset}"
             echo "username_suffix_validation=PASS"
-            echo "read_only_transaction=enforced"
+            echo "${READ_ONLY}"
             grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history|probe_status|error_category)=' probe-raw.txt \
               | sed -E 's/^[[:space:]]+//' || true
             echo "probe_completion=${COMPLETION}"
           } | tee probe-evidence.txt
 
           # The full probe output is inventory; it must never be published.
+          # Deleted BEFORE this step can exit, on both the success and the
+          # failure path below.
           rm -f probe-raw.txt
 
           # The step's exit status mirrors the probe's, so a failed connection

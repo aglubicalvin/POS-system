@@ -2,12 +2,17 @@
  * Staging identity check CLI.
  *
  * Verifies that the configured staging target is internally consistent, then
- * stops. It never opens a connection: there is nothing to connect to until the
- * project owner designates a staging project.
+ * stops. It never opens a connection: this check reads configuration only.
  *
  *   npm run staging:check
  *
- * Exit codes: 0 = identity verified locally, 1 = BLOCKED.
+ * Exit codes: 0 = local staging configuration validated, 1 = BLOCKED.
+ *
+ * This script validates configuration only. A pass means the local staging
+ * settings are internally consistent; it says nothing about which database the
+ * settings point at, because no connection is opened here. Remote identity is
+ * verified separately by the approved read-only workflow probe
+ * (.github/workflows/probe-staging-identity.yml).
  */
 import { describeStagingTarget, resolveStagingTarget, STAGING_REF_ENV } from '../src/config/staging-target.ts';
 
@@ -19,8 +24,11 @@ if (!resolution.ok) {
   process.exit(1);
 }
 
-console.log('Staging target identity is internally consistent:');
+console.log('Local staging configuration validation passed:');
 console.log(`  ${describeStagingTarget(resolution.target)}`);
 console.log('  host: resolved from the staging configuration at run time (not printed here)');
-console.log('Local identity check only. No database connection was attempted.');
-console.log('Remote identity verification remains BLOCKED until the staging project is designated and approved.');
+console.log('This validation script does not connect to a database.');
+console.log(
+  'Remote identity verification is performed separately by the approved workflow probe ' +
+    '(probe-staging-identity.yml), which runs the read-only ProbeState audit.',
+);

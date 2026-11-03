@@ -1,8 +1,10 @@
-import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { extractProbeStep, identityWorkflowText, parseEvidence } from './helpers/probe-step.ts';
 
 /**
  * Workflow configuration guard.
@@ -199,5 +201,294 @@ describe('identity probe exit-status and evidence handling', () => {
     // No place may assume success: the workflow must not swallow the gradle
     // exit with a bare `|| true` inside the probe step.
     expect(probeStep).not.toMatch(/\.\/gradlew[^\n]*\|\| true/);
+  });
+
+  // ---- read-only evidence must be derived, never asserted -----------------
+
+  it('never asserts read_only_transaction unconditionally', () => {
+    // Regression: the step used to `echo "read_only_transaction=enforced"`
+    // regardless of what the probe reported, so a refused target or a failed
+    // connection produced evidence claiming a protection it never applied.
+    expect(yml).not.toMatch(/^\s*echo "read_only_transaction=enforced"/m);
+    expect(probeStep).not.toContain('echo "read_only_transaction=');
+  });
+
+  it('extracts the confirmation from the probe output and defaults to not_confirmed', () => {
+    // The exact probe line is matched; anything else falls back explicitly. Both
+    // the server-confirmed line and the pre-server-check `enforced` line are
+    // accepted, so a binary built before the server-side check cannot silently
+    // downgrade a genuine confirmation.
+    expect(probeStep).toContain('grep -qxE');
+    expect(probeStep).toContain('read_only_transaction=(server_confirmed|enforced)');
+    // Whatever matched, the evidence uses the current vocabulary.
+    expect(probeStep).toContain('READ_ONLY=read_only_transaction=server_confirmed');
+    expect(probeStep).toContain('READ_ONLY=read_only_transaction=not_confirmed');
+    expect(probeStep).toContain('echo "${READ_ONLY}"');
+  });
+
+  it('deletes the raw output before the step exits', () => {
+    const deleteIdx = probeStep.indexOf('rm -f probe-raw.txt');
+    const failureExitIdx = probeStep.indexOf('exit "$STATUS"');
+    expect(deleteIdx).toBeGreaterThan(-1);
+    expect(failureExitIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeLessThan(failureExitIdx);
+  });
+
+  it('keeps the sanitized evidence field allowlist', () => {
+    // Only these probe fields may be copied into the evidence file.
+    expect(probeStep).toMatch(
+      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\|error_category\)='/,
+    );
+    // The raw file is never copied or dumped into the evidence.
+    expect(probeStep).not.toMatch(/cat probe-raw\.txt/);
+    expect(probeStep).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
+  });
+});
+
+/**
+ * Behavioural coverage of the probe step's evidence generation.
+ *
+ * The step's own shell body is executed by bash (with `-eo pipefail`, as
+ * Actions does) against a stub `./gradlew`, in a disposable temp directory.
+ * Nothing here contacts a database, a network or GitHub: the stub only prints
+ * text the real ProbeState would print.
+ */
+describe('probe step evidence generation (bash, stub probe)', () => {
+  const harness = extractProbeStep(identityWorkflowText(workflowsDir));
+  const bash = findBash();
+  const run = bash ? it : it.skip;
+
+  function findBash(): string | null {
+    const candidates = [
+      'C:\\Program Files\\Git\\bin\\bash.exe',
+      'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+      '/bin/bash',
+      '/usr/bin/bash',
+    ];
+    for (const candidate of candidates) {
+      if (!existsSync(candidate)) continue;
+      const probe = spawnSync(candidate, ['--version'], { encoding: 'utf8' });
+      if (probe.status === 0 && /bash/.test(probe.stdout)) return candidate;
+    }
+    return null;
+  }
+
+  interface StepRun {
+    status: number | null;
+    stdout: string;
+    evidence: Record<string, string> | null;
+    rawExists: boolean;
+    dir: string;
+  }
+
+  /** Execute the step body with a stub probe that prints `output` and exits `status`. */
+  function runStep(probeOutput: string, probeStatus: number): StepRun {
+    const dir = mkdtempSync(join(tmpdir(), 'probe-step-'));
+    const serverDir = join(dir, 'server');
+    // The step starts with `cd server`; this directory holds the stub gradlew.
+    mkdirSync(serverDir, { recursive: true });
+    // The stub reads its output from an absolute path: `$0` and `pwd` are not
+    // reliable under Git Bash's MSYS path translation on Windows.
+    writeFileSync(join(dir, 'probe-output.txt'), probeOutput, 'utf8');
+    writeFileSync(
+      join(serverDir, 'gradlew'),
+      stubScript(join(dir, 'probe-output.txt'), probeStatus),
+      'utf8',
+    );
+    const scriptPath = join(dir, 'step.sh');
+    writeFileSync(scriptPath, harness.script, 'utf8');
+
+    const executed = spawnSync(bash as string, ['-eo', 'pipefail', scriptPath], {
+      cwd: dir,
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+      // A wedged child must not hang the suite forever.
+      timeout: 60_000,
+    });
+
+    const evidencePath = join(serverDir, harness.evidenceFile);
+    const evidence = existsSync(evidencePath)
+      ? parseEvidence(readFileSync(evidencePath, 'utf8'))
+      : null;
+    return {
+      status: executed.status,
+      stdout: `${executed.stdout ?? ''}${executed.stderr ?? ''}`,
+      evidence,
+      rawExists: existsSync(join(serverDir, harness.rawFile)),
+      dir,
+    };
+  }
+
+  /** A stub `gradlew` that prints the output file and returns a status. */
+  function stubScript(outputFile: string, status: number): string {
+    return [
+      '#!/usr/bin/env bash',
+      `cat ${shellQuote(outputFile)}`,
+      `exit ${status}`,
+      '',
+    ].join('\n');
+  }
+
+  function shellQuote(text: string): string {
+    return `'${text.replace(/'/g, `'\\''`)}'`;
+  }
+
+  run('reports server_confirmed when the probe confirms a read-only session', () => {
+    const result = runStep(
+      [
+        '== read-only state probe ==',
+        '  target host: db.internal:5432/postgres',
+        '  read_only_transaction=server_confirmed',
+        '  database=postgres',
+        '  supabase_migrations_exists=true',
+        '  migration_history=9 rows from supabase_migrations.schema_migrations',
+        '-- public tables --',
+        '  internal_table_a',
+        '  internal_table_b',
+        '  probe_status=ok',
+      ].join('\n'),
+      0,
+    );
+    try {
+      expect(result.status, result.stdout).toBe(0);
+      const evidence = result.evidence;
+      expect(evidence).not.toBeNull();
+      expect(evidence!).toEqual({
+        target_project_reference: 'unset',
+        username_suffix_validation: 'PASS',
+        read_only_transaction: 'server_confirmed',
+        database: 'postgres',
+        supabase_migrations_exists: 'true',
+        migration_history: '9 rows from supabase_migrations.schema_migrations',
+        probe_status: 'ok',
+        probe_completion: 'ok',
+      });
+      // The inventory (table list, host) never reaches the published evidence.
+      expect(result.stdout).not.toContain('internal_table');
+      expect(result.stdout).not.toContain('db.internal');
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  run('reports not_confirmed when the probe never confirmed read-only mode', () => {
+    // A failed connection: the probe reports its sanitized failure and exits 5.
+    const result = runStep(
+      [
+        '== read-only state probe ==',
+        '  target host: db.internal:6543/postgres',
+        '  probe_status=error',
+        '  error_category=connection_failed',
+        '  error_detail=sqlstate=08001 message=Connection to <host> refused.',
+      ].join('\n'),
+      5,
+    );
+    try {
+      expect(result.status).toBe(5);
+      expect(result.evidence).not.toBeNull();
+      const evidence = result.evidence!;
+      expect(evidence.read_only_transaction).toBe('not_confirmed');
+      expect(evidence.probe_completion).toBe('failed');
+      expect(evidence.probe_status).toBe('error');
+      expect(evidence.error_category).toBe('connection_failed');
+      expect(result.stdout).toContain('::error::Read-only identity probe failed (exit 5)');
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  run('accepts the pre-server-check confirmation line too', () => {
+    // A workflow can run against a ProbeState binary compiled before the
+    // server-side check existed. That binary only prints `enforced`; treating it
+    // as a near-miss would under-report a genuine confirmation.
+    const result = runStep('== read-only state probe ==\n  read_only_transaction=enforced\n  probe_status=ok', 0);
+    try {
+      expect(result.status).toBe(0);
+      // Accepted as a confirmation, and normalised to the current value.
+      expect(result.evidence?.read_only_transaction).toBe('server_confirmed');
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  run('does not accept a near-miss confirmation line', () => {
+    // Only the exact line confirms; a prefix, a different value or a line with
+    // leading content must not be read as enforcement.
+    const result = runStep(
+      [
+        '== read-only state probe ==',
+        '  read_only_transaction=enforced_by_convention',
+        '  note: read_only_transaction=enforced',
+        '  database=postgres',
+        '  probe_status=ok',
+      ].join('\n'),
+      0,
+    );
+    try {
+      expect(result.status).toBe(0);
+      expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  run('deletes the raw output on success and on failure', () => {
+    for (const [out, status] of [
+      ['== read-only state probe ==\n  read_only_transaction=server_confirmed\n  probe_status=ok', 0],
+      ['== read-only state probe ==\n  probe_status=error\n  error_category=connection_failed', 7],
+    ] as const) {
+      const result = runStep(out, status);
+      try {
+        expect(result.status).toBe(status);
+        expect(result.rawExists, 'probe-raw.txt must be deleted before the step exits').toBe(false);
+        // The raw file is deleted; the stub's own inputs and the allowlisted
+        // summary are all that remain, and probe-raw.txt is not among them.
+        expect(readdirSync(join(result.dir, 'server')).sort()).toEqual([
+          'gradlew',
+          'probe-evidence.txt',
+        ]);
+        const evidence = result.evidence!;
+        expect(Object.keys(evidence).sort()).toEqual(
+          status === 0
+            ? ['probe_completion', 'probe_status', 'read_only_transaction', 'target_project_reference', 'username_suffix_validation']
+            : ['error_category', 'probe_completion', 'probe_status', 'read_only_transaction', 'target_project_reference', 'username_suffix_validation'],
+        );
+      } finally {
+        rmSync(result.dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  run('produces sanitized evidence even when the probe printed nothing', () => {
+    // Exit 126 (the historical gradlew-not-executable failure) still leaves an
+    // artifact behind, so evidence never depends on the probe having run.
+    const result = runStep('', 126);
+    try {
+      expect(result.status).toBe(126);
+      expect(result.evidence?.probe_completion).toBe('failed');
+      expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.rawExists).toBe(false);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  run('preserves the probe exit code rather than collapsing it to 1', () => {
+    for (const status of [2, 3, 4, 5]) {
+      const result = runStep('  probe_status=error', status);
+      try {
+        expect(result.status).toBe(status);
+      } finally {
+        rmSync(result.dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  run('keeps errexit enabled and runs the probe before deleting anything', () => {
+    expect(harness.script).not.toMatch(/^\s*set \+e\b/m);
+    const probeIdx = harness.script.indexOf('execProbeState');
+    const deleteIdx = harness.script.indexOf('rm -f probe-raw.txt');
+    expect(probeIdx).toBeGreaterThan(-1);
+    expect(deleteIdx).toBeGreaterThan(probeIdx);
   });
 });

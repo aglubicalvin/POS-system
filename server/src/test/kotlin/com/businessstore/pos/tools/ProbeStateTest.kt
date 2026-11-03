@@ -112,6 +112,7 @@ class ProbeStateTest {
                 ?.trim()
 
         val database: String? get() = field("database")
+        val readOnlyTransaction: String? get() = field("read_only_transaction")
         val migrationHistory: String? get() = field("migration_history")
         val probeStatus: String? get() = field("probe_status")
         val errorCategory: String? get() = field("error_category")
@@ -124,6 +125,14 @@ class ProbeStateTest {
         val isSuccess: Boolean get() = exitCode == 0
         val isRefused: Boolean get() = combined.contains("REFUSED")
         val isReadOnlyBanner: Boolean get() = combined.contains("read-only state probe")
+
+        /** True only when the probe printed the exact server-side confirmation. */
+        val confirmsReadOnly: Boolean get() = readOnlyTransaction == "server_confirmed"
+
+        /** True when the probe stopped at the read-only check and inspected nothing. */
+        val ranNoInventory: Boolean
+            get() = database == null && !combined.contains("-- migration history --") &&
+                !combined.contains("-- public tables --")
 
         /** True when no credential material appears anywhere in the output. */
         val leaksNoSecret: Boolean
@@ -141,6 +150,16 @@ class ProbeStateTest {
         assertNotNull(result.host, "probe must report the target host")
         assertTrue(result.isReadOnlyBanner, "probe must announce its read-only mode")
         assertEquals("ok", result.probeStatus, "probe must report completion")
+        assertEquals(
+            "server_confirmed",
+            result.readOnlyTransaction,
+            "read-only mode must be confirmed by PostgreSQL, not by the JDBC setter",
+        )
+        assertEquals(
+            1,
+            result.lines.count { it.trim() == "read_only_transaction=server_confirmed" },
+            "the read-only confirmation must be emitted once, not repeated:\n${result.combined}",
+        )
         assertEquals(
             "not_initialized",
             result.migrationHistory,
@@ -241,6 +260,12 @@ class ProbeStateTest {
         assertEquals(5, result.exitCode, "a connection failure must exit 5")
         assertEquals("error", result.probeStatus, "probe must report a failure status")
         assertEquals("connection_failed", result.errorCategory, "probe must report a sanitized category")
+        // No session was ever opened, so no read-only mode could have been
+        // established: the probe must not claim one.
+        assertFalse(
+            result.combined.contains("read_only_transaction="),
+            "a failed connection must not claim read-only enforcement:\n${result.combined}",
+        )
         assertFalse(result.combined.contains(secret), "the password must never appear in output")
         assertFalse(
             result.combined.lines().any { it.trimStart().startsWith("at ") },
@@ -253,6 +278,121 @@ class ProbeStateTest {
     }
 
     // ---- read-only guarantees ---------------------------------------------
+
+    @Test
+    fun `read-only confirmation follows the transaction setup, not the banner`() {
+        // The confirmation must appear AFTER the transaction was configured, not
+        // before: a line printed before setAutoCommit/setReadOnly could survive a
+        // failure of the setup itself.
+        val result = runProbeState(jdbcUrl(), dbUser)
+
+        assertEquals(0, result.exitCode, "probe must succeed:\n${result.combined}")
+        val confirmation = result.lines.indexOfFirst { it.trim() == "read_only_transaction=server_confirmed" }
+        assertTrue(confirmation >= 0, "the confirmation must be present on a successful run")
+        // Server confirmation must precede every catalog query, so no inspection
+        // output can be published under an unverified read-only claim.
+        val firstCatalogLine = result.lines.indexOfFirst {
+            it.contains("-- migration history --") || it.trimStart().startsWith("app_tables=")
+        }
+        assertTrue(firstCatalogLine > confirmation, "the confirmation must come before any catalog query")
+        assertTrue(
+            confirmation > result.lines.indexOfFirst { it.contains("read-only state probe") },
+            "the confirmation must come after the probe header",
+        )
+    }
+
+    @Test
+    fun `refused targets never claim read-only enforcement`() {
+        // None of these paths opens a session, so none may assert read-only mode.
+        val refusals = listOf(
+            "refused without confirm" to runProbeState(jdbcUrl(), dbUser, confirm = ""),
+            "refused on a production host" to
+                runProbeState("jdbc:postgresql://prod-db.example.com:5432/postgres", "postgres"),
+            "refused without a url" to runProbeState("", dbUser),
+            "refused on a connection failure" to
+                runProbeState("jdbc:postgresql://127.0.0.1:1/postgres", dbUser, jdbcPass = "x"),
+        )
+        for ((label, result) in refusals) {
+            assertFalse(result.isSuccess, "$label must not succeed:\n${result.combined}")
+            assertFalse(
+                result.combined.contains("read_only_transaction="),
+                "$label must not claim read-only enforcement:\n${result.combined}",
+            )
+        }
+    }
+
+    // ---- server-confirmed transaction state --------------------------------
+
+    @Test
+    fun `postgres reports on inside the probe transaction`() {
+        // Independent of the probe: open a connection the same way it does and ask
+        // the server directly. This pins the behaviour the probe relies on, so a
+        // driver or server default that silently disables read-only shows up here.
+        java.sql.DriverManager.getConnection(jdbcUrl(), dbUser, "").use { conn ->
+            conn.autoCommit = false
+            conn.isReadOnly = true
+            val state = transactionReadOnly(conn)
+            conn.rollback()
+            assertEquals("on", state, "PostgreSQL must report transaction_read_only=on after setReadOnly(true)")
+        }
+    }
+
+    @Test
+    fun `a server-confirmed session refuses a write`() {
+        // The point of the confirmation is that writes are actually blocked.
+        executeOnTestDb("CREATE TABLE probe_ro_sentinel (id int PRIMARY KEY)")
+        java.sql.DriverManager.getConnection(jdbcUrl(), dbUser, "").use { conn ->
+            conn.autoCommit = false
+            conn.isReadOnly = true
+            assertEquals("on", transactionReadOnly(conn))
+            val error = runCatching {
+                conn.createStatement().use { it.execute("INSERT INTO probe_ro_sentinel (id) VALUES (1)") }
+            }.exceptionOrNull()
+            conn.rollback()
+            assertTrue(error is java.sql.SQLException, "a write in a read-only transaction must fail")
+            assertEquals(
+                "25006",
+                (error as java.sql.SQLException).sqlState,
+                "the server must refuse with read_only_sql_transaction",
+            )
+        }
+        assertEquals(emptyList<String>(), queryOnTestDb("SELECT id FROM probe_ro_sentinel"), "no row may be written")
+    }
+
+    @Test
+    fun `a connection configured to ignore read-only is rejected`() {
+        // readOnlyMode=ignore makes the driver accept setReadOnly(true) and do
+        // nothing. The setter succeeds, which is exactly why the probe must ask
+        // the server. This URL must be REFUSED, never reported as read-only.
+        val result = runProbeState(jdbcUrl() + "&readOnlyMode=ignore", dbUser)
+
+        assertFalse(result.isSuccess, "a read-only-ignoring connection must not succeed:\n${result.combined}")
+        assertFalse(
+            result.combined.contains("read_only_transaction="),
+            "a read-only-ignoring connection must never claim enforcement:\n${result.combined}",
+        )
+        assertFalse(result.confirmsReadOnly)
+        assertTrue(result.isRefused || result.probeStatus == "error", "the probe must report a refusal or error")
+    }
+
+    @Test
+    fun `no catalog inventory runs when read-only is not confirmed`() {
+        // Exit 6 is the probe's own unconfirmed-read-only path. Whatever produces
+        // it, not one inventory line may be emitted.
+        val result = runProbeState(jdbcUrl() + "&readOnlyMode=ignore", dbUser)
+
+        if (result.exitCode == 6) {
+            assertEquals("read_only_not_confirmed", result.errorCategory)
+        } else {
+            // The driver refused the URL outright; there was still no session.
+            assertFalse(result.isSuccess, "an unconfirmed connection must not succeed")
+        }
+        assertTrue(
+            result.ranNoInventory,
+            "no catalog query may run after the read-only check fails:\n${result.combined}",
+        )
+        assertFalse(result.combined.contains("app_tables="), "no counts may be published")
+    }
 
     @Test
     fun `probe does not create or alter roles`() {
@@ -298,6 +438,45 @@ class ProbeStateTest {
         )
         assertEquals(listOf("probe_sentinel"), tables, "probe must not create or drop tables")
     }
+
+    @Test
+    fun `probe leaves no session behind and rolls back`() {
+        // The child JVM exits, so its socket is closed; on the server side the
+        // backend must be gone shortly after and must have ended its transaction.
+        // A leaked idle transaction would hold a snapshot on staging.
+        val before = backendCountFor(dbName)
+        val result = runProbeState(jdbcUrl(), dbUser)
+        assertEquals(0, result.exitCode, "probe must succeed:\n${result.combined}")
+
+        var remaining = -1
+        repeat(30) {
+            remaining = backendCountFor(dbName)
+            if (remaining > before) Thread.sleep(200)
+        }
+        assertEquals(before, remaining, "the probe must not leave its session open")
+    }
+
+    /** Live, non-own backends on this test's throwaway database. */
+    private fun backendCountFor(database: String): Int =
+        java.sql.DriverManager.getConnection(jdbcUrl(), dbUser, "").use { conn ->
+            conn.createStatement().use { st ->
+                st.executeQuery(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = '$database' " +
+                        "AND pid <> pg_backend_pid() AND backend_type = 'client backend'",
+                ).use { rs ->
+                    rs.next()
+                    rs.getInt(1)
+                }
+            }
+        }
+
+    /** Ask PostgreSQL itself whether the current transaction is read-only. */
+    private fun transactionReadOnly(conn: java.sql.Connection): String? =
+        conn.createStatement().use { st ->
+            st.executeQuery("show transaction_read_only").use { rs ->
+                if (rs.next()) rs.getString(1) else null
+            }
+        }
 
     private fun roleNames(): List<String> =
         TestDb.dataSource.connection.use { conn ->

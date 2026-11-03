@@ -21,6 +21,13 @@ import java.util.List;
  *     userinfo component of the URL stripped.
  *  4. Deterministic output: every list query has an ORDER BY and counts are
  *     scalar, so two runs against the same database produce identical text.
+ *  5. Honest read-only evidence: the JDBC setters are only a request. Before
+ *     any catalog query the probe asks PostgreSQL itself
+ *     (`SHOW transaction_read_only`) and requires `on`. Only then does it print
+ *     `read_only_transaction=server_confirmed`; anything else prints a
+ *     sanitized `read_only_not_confirmed` category and exits 6 without running
+ *     a single inspection query. A refused target or a connection failure
+ *     never prints a confirmation either.
  *
  * Usage (production):
  *   CHECK_URL=jdbc:postgresql://host:5432/postgres CHECK_USER=... CHECK_PASS=...
@@ -75,12 +82,41 @@ public class ProbeState {
             return;
         }
 
+        int exitCode = 0;
         try (Connection c = opened) {
-            // Belt and braces: the driver issues SET TRANSACTION READ ONLY, so
-            // any write attempted in this session is refused by PostgreSQL.
+            // Ask the driver for a read-only session: it issues SET TRANSACTION
+            // READ ONLY, so any write attempted in this session is refused by
+            // PostgreSQL. These calls only REQUEST the mode; what matters is
+            // what the server actually has, which is verified below.
+            //
+            // A driver that refuses the request (e.g. a URL carrying
+            // readOnlyMode=ignore) throws here, reaches the sanitized catch at
+            // the bottom of this block, and no confirmation is ever printed.
             c.setAutoCommit(false);
             c.setReadOnly(true);
 
+            // Server-side verification, before ANY catalog query. A successful
+            // JDBC setter call is not proof: the driver may ignore it, and a
+            // pooler may hand back a session with a different default. Only
+            // PostgreSQL can say whether the current transaction is read-only,
+            // and if it cannot, nothing here is trustworthy enough to inspect.
+            String transactionReadOnly = readTransactionReadOnly(c);
+            if (!"on".equals(transactionReadOnly)) {
+                System.err.println("  probe_status=error");
+                System.err.println("  error_category=read_only_not_confirmed");
+                System.err.println(
+                    "  error_detail=transaction_read_only=" +
+                    (transactionReadOnly == null ? "unavailable" : sanitizeValue(transactionReadOnly)));
+                exitCode = 6;
+                return;
+            }
+
+            // Reached only after PostgreSQL confirmed the transaction is
+            // read-only, so the workflow can copy this exact line into evidence.
+            System.out.println("  read_only_transaction=server_confirmed");
+
+            // Every query from here on is a SELECT over catalogs/views; none
+            // is reached unless the check above passed.
             q(c, "select 'database=' || current_database()");
             q(c, "select 'current_user=' || current_user");
             q(c, "select 'app_tables=' || count(*) from pg_class c " +
@@ -153,7 +189,38 @@ public class ProbeState {
             }
 
             System.out.println("  probe_status=ok");
+        } catch (SQLException e) {
+            // Sanitized category only: the driver message can carry the host,
+            // port, database and role, and the workflow log is public.
+            System.err.println("  probe_status=error");
+            System.err.println("  error_category=probe_failed");
+            System.err.println("  error_detail=" + sanitize(e));
+            exitCode = 7;
         }
+
+        // The connection is closed by try-with-resources before this point. The
+        // exit status is set last so both the failure paths above and a clean
+        // run report truthfully; an unconfirmed read-only mode never exits 0.
+        if (exitCode != 0) System.exit(exitCode);
+    }
+
+    /**
+     * Ask PostgreSQL whether THIS transaction is read-only. Returns the server's
+     * own answer (`on` / `off`), or null when the server gave no answer.
+     */
+    static String readTransactionReadOnly(Connection c) {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery("show transaction_read_only")) {
+            return rs.next() ? rs.getString(1) : null;
+        } catch (SQLException e) {
+            return null;
+        }
+    }
+
+    /** A single server value reduced to a short, safe token for the evidence log. */
+    static String sanitizeValue(String value) {
+        String cleaned = value == null ? "" : value.replaceAll("[^A-Za-z0-9_]+", "_").trim();
+        if (cleaned.length() > 16) cleaned = cleaned.substring(0, 16);
+        return cleaned.isEmpty() ? "unknown" : cleaned;
     }
 
     /**

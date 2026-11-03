@@ -57,6 +57,13 @@ tasks.test {
         events("passed", "skipped", "failed")
         showStandardStreams = true
     }
+    // ProbeStateTest launches the REAL compiled ProbeState in a child JVM from
+    // build/classes/java/probeState. That class is produced by
+    // `compileProbeState`, not by `compileJava`/`compileTestKotlin`, so without
+    // this dependency a clean tree either fails the test or (worse) runs a
+    // stale class left over from an earlier build. Declared with the typed task
+    // reference below so the ordering holds on a fresh checkout.
+    dependsOn(tasks.named("compileProbeState"))
 }
 
 application {
