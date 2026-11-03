@@ -98,6 +98,16 @@ describe('staging identity workflow target validation', () => {
     expect(yml).not.toContain('environment: pos-dev-admin');
   });
 
+  it('installs Temurin JDK 21 before the Gradle identity probe', () => {
+    const yml = read(IDENTITY_WORKFLOW);
+    expect(yml).toContain('uses: actions/setup-java@v6.1.0');
+    expect(yml).toContain('distribution: temurin');
+    expect(yml).toMatch(/java-version:\s*'21'/);
+    expect(yml.indexOf('Set up JDK 21 for Gradle')).toBeLessThan(
+      yml.indexOf('execProbeState'),
+    );
+  });
+
   it('rejects known non-staging projects through the shared validator at run time', () => {
     const yml = read(IDENTITY_WORKFLOW);
     // The denylist lives in src/config/staging-target.ts. The workflow must invoke
@@ -237,8 +247,11 @@ describe('identity probe exit-status and evidence handling', () => {
   it('keeps the sanitized evidence field allowlist', () => {
     // Only these probe fields may be copied into the evidence file.
     expect(probeStep).toMatch(
-      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\|error_category\)='/,
+      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\)='/,
     );
+    // The error category is selected separately from a fixed safe token and
+    // emitted only after validation; it is not copied blindly by grep.
+    expect(probeStep).toContain('echo "error_category=${ERROR_CATEGORY}"');
     // The raw file is never copied or dumped into the evidence.
     expect(probeStep).not.toMatch(/cat probe-raw\.txt/);
     expect(probeStep).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
@@ -467,6 +480,28 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       expect(result.status).toBe(126);
       expect(result.evidence?.probe_completion).toBe('failed');
       expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.evidence?.error_category).toBe('execution_failed_without_probe_category');
+      expect(result.rawExists).toBe(false);
+    } finally {
+      rmSync(result.dir, { recursive: true, force: true });
+    }
+  });
+
+  run('classifies a Java 21 toolchain failure without publishing raw Gradle output', () => {
+    const rawOutput = [
+      '> Task :compileProbeState FAILED',
+      'error: invalid source release: 21',
+      'sensitive runner path: /home/runner/work/private-project',
+      'credential-like-value=must-never-appear-in-evidence',
+    ].join('\n');
+    const result = runStep(rawOutput, 1);
+    try {
+      expect(result.status).toBe(1);
+      expect(result.evidence?.error_category).toBe('java_toolchain_mismatch');
+      expect(result.evidence?.probe_completion).toBe('failed');
+      expect(result.stdout).not.toContain('invalid source release');
+      expect(result.stdout).not.toContain('/home/runner/work/private-project');
+      expect(result.stdout).not.toContain('must-never-appear-in-evidence');
       expect(result.rawExists).toBe(false);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
