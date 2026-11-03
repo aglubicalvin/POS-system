@@ -477,6 +477,7 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       expect(result.status).toBe(126);
       expect(result.evidence?.probe_completion).toBe('failed');
       expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.evidence?.error_category).toBe('execution_failed_without_probe_category');
       expect(result.rawExists).toBe(false);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
