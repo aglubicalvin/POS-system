@@ -1,7 +1,12 @@
 # Read-only staging identity verification. Manual dispatch only.
 #
-# Targets the designated staging Supabase project (reference mjqoydqcmecqjvzbckgk)
-# and runs the read-only ProbeState audit. This workflow exists so an independent
+# Targets the designated staging Supabase project and runs the read-only
+# ProbeState audit. The project reference is never written here: it is read from
+# the environment variable POS_STAGING_PROJECT_REF so this file cannot designate a
+# project by itself, and the shared staging-target validator rejects known
+# non-staging projects at run time.
+#
+# This workflow exists so an independent
 # reviewer can confirm the staging database identity WITHOUT ever running any
 # provisioning, role creation, grant changes, or migration application.
 #
@@ -11,11 +16,12 @@
 #
 # Environment requirements (owner-configured on pos-staging-admin):
 #   vars:
-#     POS_STAGING_PROJECT_REF  = mjqoydqcmecqjvzbckgk
-#     PROBE_ADMIN_USER         = postgres.mjqoydqcmecqjvzbckgk
+#     POS_STAGING_PROJECT_REF  = <designated staging project reference>
+#     PROBE_ADMIN_USER         = postgres.<same reference>
 #   secrets (never logged, never artifacted):
-#     PROBE_ADMIN_PASS         = admin password for the postgres role
-#     CHECK_PASS               = same password, exposed to ProbeState as CHECK_PASS
+#     PROBE_ADMIN_PASS         = admin password for that role; the workflow maps it
+#                                into ProbeState as CHECK_PASS, so no separate
+#                                CHECK_PASS secret is required
 #
 # Evidence policy: the probe's full output is database inventory and is treated as
 # sensitive. It is written to a scratch file that is NEVER uploaded. Only the
@@ -38,32 +44,37 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Node for the staging target validator
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
       - name: Validate staging target reference
         shell: bash
         env:
           POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
-          PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+          # The environment calls this PROBE_ADMIN_USER; the validator module reads
+          # POS_STAGING_ADMIN_USER. Map it rather than renaming the stored variable.
+          POS_STAGING_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
         run: |
           set -euo pipefail
-          REF="${POS_STAGING_PROJECT_REF:-}"
-          USER="${PROBE_ADMIN_USER:-}"
 
-          if [ -z "$REF" ]; then
-            echo "::error::POS_STAGING_PROJECT_REF is not set in the environment variables"
-            exit 1
-          fi
+          # The authoritative staging identity rules live in
+          # src/config/staging-target.ts: it rejects a missing or malformed
+          # reference, any reference on the known non-staging denylist
+          # (development and the former verification project), a missing or
+          # malformed administrator username, and a username whose project suffix
+          # disagrees with the designated reference.
+          #
+          # Running that module here — rather than re-implementing the checks in
+          # this file — means the Actions runtime path enforces exactly the rules
+          # the repository already tests, with no per-workflow copy to drift.
+          #
+          # Fail-closed: a non-zero exit stops the job before any connection is
+          # opened. Node runs the TypeScript directly via type stripping.
+          node scripts/check-staging-target.ts
 
-          if [[ ! "$REF" =~ ^[a-z0-9]{20}$ ]]; then
-            echo "::error::POS_STAGING_PROJECT_REF is not a valid 20-character lowercase alphanumeric reference"
-            exit 1
-          fi
-
-          EXPECTED_USER="postgres.${REF}"
-          if [ "$USER" != "$EXPECTED_USER" ]; then
-            echo "::error::PROBE_ADMIN_USER does not end with postgres.${REF}"
-            exit 1
-          fi
-
+          REF="${POS_STAGING_PROJECT_REF}"
           echo "Target project reference: $REF"
           echo "Username suffix validation: PASS"
           echo "MATCHED_REF=$REF" >> "$GITHUB_ENV"
@@ -76,8 +87,16 @@ jobs:
           CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
           PROBE_CONFIRM: "yes"
         run: |
-          # -e is deliberately omitted: the exit status is captured explicitly so a
-          # failed probe cannot be mistaken for success. -u and pipefail still apply.
+          # GitHub starts every bash `run:` with `bash --noprofile --norc -eo
+          # pipefail {0}`. `set -uo pipefail` below does NOT remove that -e, so a
+          # bare failing command would abort this step instantly — which is how
+          # run 41560464733 died on exit 126 before any evidence was written.
+          #
+          # Errexit therefore stays ENABLED (we do not weaken it with `set +e`).
+          # Instead the probe runs as the CONDITION of an if-statement, which
+          # errexit never triggers on, so its failure is captured into STATUS and
+          # the sanitized evidence can be generated before the step decides its
+          # own exit status.
           set -uo pipefail
 
           cd server
@@ -90,30 +109,41 @@ jobs:
           # PROBE_CONFIRM=yes, refuses hosts containing "prod", opens a read-only
           # transaction, and only ever issues SELECTs against catalogs and views.
           # It never invokes probe-readonly.ps1 and has no provisioning path.
-          ./gradlew -q execProbeState > probe-raw.txt 2>&1
-          STATUS=$?
+          if ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
+            STATUS=0
+          else
+            STATUS=$?
+          fi
+
+          if [ "$STATUS" -eq 0 ]; then
+            COMPLETION=ok
+          else
+            COMPLETION=failed
+          fi
 
           # --- allowlisted evidence only -------------------------------------
-          # A strict field allowlist: no table lists, no policy names, no role
-          # names, no counts, no JDBC URLs, no stack traces.
+          # Written on BOTH outcomes: a failed probe must still leave sanitized
+          # evidence rather than a bare exit code. A strict field allowlist: no
+          # table lists, no policy names, no role names, no counts, no JDBC
+          # URLs, no stack traces.
           {
             echo "target_project_reference=${MATCHED_REF:-unset}"
             echo "username_suffix_validation=PASS"
             echo "read_only_transaction=enforced"
             grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history|probe_status|error_category)=' probe-raw.txt \
               | sed -E 's/^[[:space:]]+//' || true
+            echo "probe_completion=${COMPLETION}"
           } | tee probe-evidence.txt
 
           # The full probe output is inventory; it must never be published.
           rm -f probe-raw.txt
 
+          # The step's exit status mirrors the probe's, so a failed connection
+          # can never be reported as a green workflow.
           if [ "$STATUS" -ne 0 ]; then
-            echo "probe_completion=failed"
-            echo "::error::Read-only identity probe failed (exit ${STATUS}). See the sanitized fields above."
+            echo "::error::Read-only identity probe failed (exit ${STATUS}). Sanitized evidence: server/probe-evidence.txt"
             exit "$STATUS"
           fi
-
-          echo "probe_completion=ok"
 
       - name: Publish sanitized evidence
         if: always()
