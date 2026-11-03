@@ -1,56 +1,46 @@
 package com.businessstore.pos.tools
 
 import com.businessstore.pos.TestDb
-import com.zaxxer.hikari.HikariConfig
-import com.zaxxer.hikari.HikariDataSource
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import java.sql.DriverManager
+import java.io.File
 import java.util.UUID
 
 /**
- * Synthetic tests for ProbeState. No real Supabase connection is used; every test
- * runs against a disposable embedded PostgreSQL database created by TestDb.
+ * Tests that exercise the ACTUAL ProbeState.java implementation.
  *
- * These tests verify:
- *  - valid staging identity probe output
- *  - development project reference rejection (username suffix mismatch)
- *  - verification project reference rejection
- *  - username mismatch blocking
- *  - missing project reference blocking
- *  - missing migration-history table reporting `migration_history=not_initialized`
- *  - connection failure handling
- *  - read-only operation (no role/grant changes)
- *  - no role or grant DDL applied
+ * Each test launches a separate JVM running the compiled
+ * `com.businessstore.pos.tools.ProbeState` class produced by the project's
+ * `compileProbeState` Gradle task, pointed at a disposable embedded PostgreSQL
+ * database. Nothing here simulates ProbeState's behaviour in Kotlin: the
+ * assertions read the real tool's stdout, stderr and exit code.
  *
- * All tests use the same embedded PostgreSQL instance that the rest of the server
- * test suite uses (TestDb), but each probe test uses its own throwaway database so
- * nothing leaks between cases.
+ * Credentials are passed only as environment variables, exactly as the
+ * production workflow does it. No Supabase connection is ever made.
  */
 class ProbeStateTest {
 
-    // A synthetic staging reference for tests. Never a real Supabase project.
-    private val stagingRef = "stgref0000000000000z"
+    // Synthetic references for tests. None is a real Supabase project.
     private val developmentRef = "uemdrtrzlvhdtonccczt"
     private val verificationRef = "numwzjogaanfhlrfgrqk"
     private val otherRef = "otherref00000000000z"
 
     private lateinit var dbName: String
-    private lateinit var baseUrl: String
     private lateinit var dbUser: String
+    private lateinit var baseUrl: String
 
     @BeforeEach
     fun setUp() {
         dbName = "probe_state_test_${UUID.randomUUID().toString().replace("-", "")}"
         TestDb.dataSource.connection.use { conn ->
             conn.createStatement().use { it.execute("CREATE DATABASE $dbName") }
-            val meta = conn.metaData
-            baseUrl = meta.url
-            dbUser = meta.userName
+            dbUser = conn.metaData.userName
+            baseUrl = conn.metaData.url
         }
     }
 
@@ -61,316 +51,277 @@ class ProbeStateTest {
         }
     }
 
+    /** JDBC URL pointing at this test's throwaway database. */
     private fun jdbcUrl(): String {
-        val withoutQuery = baseUrl.substringBefore('?')
+        val head = baseUrl.substringBefore('?')
         val tail = if (baseUrl.contains('?')) "?" + baseUrl.substringAfter('?') else ""
-        return "${withoutQuery.substringBeforeLast('/')}/$dbName$tail"
+        return "${head.substringBeforeLast('/')}/$dbName$tail"
     }
 
-    // ProbeState is a standalone Java tool; to test it without compilation churn
-    // we run it as a JavaExec against the classpath of the server module. In CI
-    // this is wired through a Gradle test task. Here we verify the behaviour via
-    // the same JDBC contract ProbeState exercises, so the test stays database-side
-    // and does not depend on the Gradle task layout of a particular CI runner.
-
-    @Test
-    fun `valid staging identity probe sees database and reports migration status`() {
-        // An empty database has no supabase_migrations.schema_migrations table,
-        // so ProbeState must report migration_history=not_initialized.
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = dbUser
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
-
-        val report = ProbeStateProbe.run()
-
-        assertTrue(report.host.contains("localhost") || report.host.contains("127.0.0.1"),
-            "probe should target the embedded database host, got: ${report.host}")
-        assertEquals(dbName, report.database, "probe reports the connected database name")
-        // The migration_history field reports 'not_initialized' when the table
-        // does not exist. ProbeState's actual query uses count(version) which
-        // fails on an empty table; the harness mirrors the contract but the real
-        // ProbeState.java fix uses information_schema.exists check.
-        assertEquals("not_initialized", report.migrationHistory,
-            "an empty database has no migration history table")
-        assertTrue(report.readOnly, "probe must run in a read-only transaction")
-        assertEquals("OK", report.status, "probe must complete successfully")
-        assertFalse(report.output.any { it.contains("password") || it.contains("PASS") },
-            "probe output must not contain credential material")
+    /**
+     * Classpath for the child JVM: the compiled ProbeState classes plus the test
+     * runtime classpath (which carries the PostgreSQL JDBC driver ProbeState
+     * needs). Without the driver the child would fail with NoClassDefFoundError
+     * instead of exercising the tool.
+     */
+    private fun probeClasspath(): String {
+        val classesDir = File(
+            System.getProperty("user.dir"),
+            "build/classes/java/probeState",
+        )
+        check(classesDir.isDirectory) {
+            "Compiled ProbeState classes not found at $classesDir. Run './gradlew compileProbeState' first."
+        }
+        val testRuntime = System.getProperty("java.class.path")
+        return listOf(classesDir.absolutePath, testRuntime).joinToString(File.pathSeparator)
     }
 
-    @Test
-    fun `development reference is rejected by username suffix`() {
-        // The workflow enforces this BEFORE the JDBC connection: if PROBE_ADMIN_USER
-        // does not end with the staging reference, the job fails. ProbeState's
-        // JDBC connection then also fails because the role does not exist locally.
-        // This test verifies the end-to-end effect: the probe must not proceed.
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = "postgres.$developmentRef"
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
-        ProbeStateProbe.stagingRef = stagingRef
+    /** Launch the real ProbeState in a child JVM and capture its output. */
+    private fun runProbeState(
+        jdbcUrl: String,
+        jdbcUser: String,
+        jdbcPass: String = "",
+        confirm: String = "yes",
+    ): ProbeResult {
+        val process = ProcessBuilder(
+            "java",
+            "-cp",
+            probeClasspath(),
+            "com.businessstore.pos.tools.ProbeState",
+        )
+            .apply {
+                environment()["CHECK_URL"] = jdbcUrl
+                environment()["CHECK_USER"] = jdbcUser
+                environment()["CHECK_PASS"] = jdbcPass
+                environment()["PROBE_CONFIRM"] = confirm
+                redirectErrorStream(true)
+            }
+            .start()
 
-        val report = ProbeStateProbe.run()
-
-        // The probe must not report OK; it must fail (connection refused or blocked)
-        assertFalse(report.status == "OK",
-            "a development-project username must not produce a successful probe")
-        assertTrue(report.status == "BLOCKED" || report.status == "ERROR",
-            "expected BLOCKED or ERROR, got ${report.status}")
+        val combined = process.inputStream.bufferedReader().readText()
+        val exitCode = process.waitFor()
+        return ProbeResult(exitCode, combined, jdbcPass)
     }
 
-    @Test
-    fun `verification reference is rejected by username suffix`() {
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = "postgres.$verificationRef"
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
-        ProbeStateProbe.stagingRef = stagingRef
+    data class ProbeResult(val exitCode: Int, val combined: String, val secret: String) {
+        val lines: List<String> get() = combined.lines()
 
-        val report = ProbeStateProbe.run()
+        private fun field(name: String): String? =
+            lines.firstOrNull { it.trimStart().startsWith("$name=") }
+                ?.substringAfter("=")
+                ?.trim()
 
-        assertFalse(report.status == "OK",
-            "a verification-project username must not produce a successful probe")
-        assertTrue(report.status == "BLOCKED" || report.status == "ERROR")
+        val database: String? get() = field("database")
+        val migrationHistory: String? get() = field("migration_history")
+        val probeStatus: String? get() = field("probe_status")
+        val errorCategory: String? get() = field("error_category")
+
+        val host: String?
+            get() = lines.firstOrNull { it.trimStart().startsWith("target host:") }
+                ?.substringAfter(":")
+                ?.trim()
+
+        val isSuccess: Boolean get() = exitCode == 0
+        val isRefused: Boolean get() = combined.contains("REFUSED")
+        val isReadOnlyBanner: Boolean get() = combined.contains("read-only state probe")
+
+        /** True when no credential material appears anywhere in the output. */
+        val leaksNoSecret: Boolean
+            get() = secret.isNotBlank() && !combined.contains(secret)
     }
 
-    @Test
-    fun `username mismatch blocks even with correct project reference`() {
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = "postgres.$otherRef"
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
-        ProbeStateProbe.stagingRef = stagingRef
-
-        val report = ProbeStateProbe.run()
-
-        assertFalse(report.status == "OK",
-            "a mismatched username must not produce a successful probe")
-        assertTrue(report.status == "BLOCKED" || report.status == "ERROR")
-    }
+    // ---- successful probe -------------------------------------------------
 
     @Test
-    fun `missing project reference blocks`() {
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = "postgres.$stagingRef"
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
-        ProbeStateProbe.stagingRef = ""
+    fun `probe connects, identifies the database and reports empty migration history`() {
+        val result = runProbeState(jdbcUrl(), dbUser)
 
-        val report = ProbeStateProbe.run()
-
-        assertFalse(report.status == "OK",
-            "a missing staging reference must not produce a successful probe")
-        assertTrue(report.status == "BLOCKED" || report.status == "ERROR")
+        assertEquals(0, result.exitCode, "probe must exit 0:\n${result.combined}")
+        assertEquals(dbName, result.database, "probe must report the connected database")
+        assertNotNull(result.host, "probe must report the target host")
+        assertTrue(result.isReadOnlyBanner, "probe must announce its read-only mode")
+        assertEquals("ok", result.probeStatus, "probe must report completion")
+        assertEquals(
+            "not_initialized",
+            result.migrationHistory,
+            "an empty database has no supabase_migrations.schema_migrations table",
+        )
     }
 
     @Test
-    fun `missing migration-history table reports not_initialized`() {
-        // An empty database has no supabase_migrations.schema_migrations; the
-        // probe must report migration_history=not_initialized.
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = dbUser
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
+    fun `probe reports a populated migration history`() {
+        executeOnTestDb(
+            """
+            CREATE SCHEMA IF NOT EXISTS supabase_migrations;
+            CREATE TABLE supabase_migrations.schema_migrations (
+                version bigint PRIMARY KEY,
+                inserted_at timestamptz NOT NULL DEFAULT now()
+            );
+            INSERT INTO supabase_migrations.schema_migrations (version) VALUES (1);
+            """.trimIndent(),
+        )
 
-        val report = ProbeStateProbe.run()
+        val result = runProbeState(jdbcUrl(), dbUser)
 
-        assertEquals("OK", report.status, "probe on empty database must complete")
-        assertEquals("not_initialized", report.migrationHistory,
-            "empty database reports not_initialized")
+        assertEquals(0, result.exitCode, "probe must succeed:\n${result.combined}")
+        assertTrue(
+            result.migrationHistory?.startsWith("1 rows from supabase_migrations.schema_migrations") == true,
+            "expected the row count, got: ${result.migrationHistory}",
+        )
+    }
+
+    // ---- safety gates -----------------------------------------------------
+
+    @Test
+    fun `missing confirmation is refused before connecting`() {
+        val result = runProbeState(jdbcUrl(), dbUser, confirm = "")
+
+        assertEquals(3, result.exitCode, "probe must exit 3 without PROBE_CONFIRM=yes")
+        assertTrue(result.isRefused, "probe must refuse:\n${result.combined}")
+        assertTrue(result.combined.contains("PROBE_CONFIRM"), "the refusal must name the missing guard")
     }
 
     @Test
-    fun `connection failure is reported without credential leakage`() {
-        ProbeStateProbe.jdbUrl = "jdbc:postgresql://127.0.0.1:54321/nonexistent"
-        ProbeStateProbe.jdbcUser = "postgres"
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
+    fun `production host is refused even with confirmation`() {
+        val result = runProbeState("jdbc:postgresql://prod-db.example.com:5432/postgres", "postgres")
 
-        val report = ProbeStateProbe.run()
-
-        assertEquals("ERROR", report.status)
-        assertTrue(report.output.any { it.contains("REFUSED") || it.contains("could not connect") || it.contains("refused") })
-        assertFalse(report.output.any { it.contains("password") || it.contains("PASS") },
-            "connection failure output must not leak credentials")
+        assertEquals(4, result.exitCode, "probe must exit 4 on a production host")
+        assertTrue(result.isRefused, "probe must refuse:\n${result.combined}")
+        assertTrue(
+            result.combined.contains("production", ignoreCase = true),
+            "the refusal must explain why",
+        )
     }
 
     @Test
-    fun `read-only operation prevents writes`() {
-        // Verify that the read-only transaction enforced by ProbeState actually
-        // blocks a write attempt. We do this by running the probe against a fresh
-        // database and confirming the probe itself never issues DDL.
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = dbUser
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
+    fun `missing url is refused`() {
+        val result = runProbeState("", dbUser)
 
-        val report = ProbeStateProbe.run()
+        assertEquals(2, result.exitCode, "probe must exit 2 with no CHECK_URL")
+        assertTrue(result.isRefused, "probe must refuse:\n${result.combined}")
+    }
 
-        assertEquals("OK", report.status, "probe must complete successfully")
-        assertTrue(report.readOnly, "probe must run read-only")
-        // ProbeState never touches pg_hba, roles, or grants. The database after
-        // the probe must be identical to before.
-        val afterProbe = ProbeStateProbe.connectionState(jdbcUrl(), dbUser, "")
-        assertEquals(dbName, afterProbe.database, "database name unchanged after probe")
-        assertEquals(dbUser, afterProbe.user)
+    // ---- username / reference rejection -----------------------------------
+
+    @Test
+    fun `development project username is rejected`() {
+        val result = runProbeState(jdbcUrl(), "postgres.$developmentRef")
+
+        assertFalse(result.isSuccess, "a development-project role must not produce a successful probe")
+        assertTrue(result.isRefused || result.exitCode != 0, "expected a non-zero exit")
     }
 
     @Test
-    fun `no role or grant changes after probe`() {
-        // Direct proof that the probe did not create or alter any role or grant.
-        ProbeStateProbe.jdbUrl = jdbcUrl()
-        ProbeStateProbe.jdbcUser = dbUser
-        ProbeStateProbe.jdbcPass = ""
-        ProbeStateProbe.confirm = "yes"
+    fun `verification project username is rejected`() {
+        val result = runProbeState(jdbcUrl(), "postgres.$verificationRef")
 
-        val before = roleAndGrantSnapshot(jdbcUrl(), dbUser, "")
-        ProbeStateProbe.run()
-        val after = roleAndGrantSnapshot(jdbcUrl(), dbUser, "")
-
-        assertEquals(before, after, "probe must not change any role or grant")
+        assertFalse(result.isSuccess, "a verification-project role must not produce a successful probe")
+        assertTrue(result.isRefused || result.exitCode != 0, "expected a non-zero exit")
     }
 
-    private fun roleAndGrantSnapshot(jdbcUrl: String, user: String, pass: String): Map<String, List<String>> {
-        DriverManager.getConnection(jdbcUrl, user, pass).use { conn ->
-            conn.prepareStatement(
-                "select rolname from pg_roles order by 1"
-            ).use { st ->
-                val roles = st.executeQuery().use { rs ->
-                    val list = mutableListOf<String>()
-                    while (rs.next()) list.add(rs.getString(1))
-                    list
+    @Test
+    fun `mismatched username is rejected`() {
+        val result = runProbeState(jdbcUrl(), "postgres.$otherRef")
+
+        assertFalse(result.isSuccess, "a mismatched role must not produce a successful probe")
+        assertTrue(result.isRefused || result.exitCode != 0, "expected a non-zero exit")
+    }
+
+    // ---- failure handling -------------------------------------------------
+
+    @Test
+    fun `connection failure is sanitized and never leaks the password`() {
+        val secret = "sup3rs3cr3t-probe-pass"
+        val result = runProbeState(
+            "jdbc:postgresql://127.0.0.1:1/postgres",
+            "postgres.mjqoydqcmecqjvzbckgk",
+            jdbcPass = secret,
+        )
+
+        assertEquals(5, result.exitCode, "a connection failure must exit 5")
+        assertEquals("error", result.probeStatus, "probe must report a failure status")
+        assertEquals("connection_failed", result.errorCategory, "probe must report a sanitized category")
+        assertFalse(result.combined.contains(secret), "the password must never appear in output")
+        assertFalse(
+            result.combined.lines().any { it.trimStart().startsWith("at ") },
+            "no raw driver stack trace may be emitted",
+        )
+        assertFalse(
+            result.combined.contains("mjqoydqcmecqjvzbckgk"),
+            "the role reference must be scrubbed from failure output",
+        )
+    }
+
+    // ---- read-only guarantees ---------------------------------------------
+
+    @Test
+    fun `probe does not create or alter roles`() {
+        val before = roleNames()
+        runProbeState(jdbcUrl(), dbUser)
+        val after = roleNames()
+
+        assertEquals(before, after, "probe must not create, alter or drop any role")
+    }
+
+    @Test
+    fun `probe leaves existing rows untouched`() {
+        // Seed a sentinel table in the throwaway database, run the probe, and prove
+        // the rows are byte-for-byte unchanged. The probe only issues SELECTs.
+        executeOnTestDb(
+            """
+            CREATE TABLE probe_sentinel (id int PRIMARY KEY, note text NOT NULL);
+            INSERT INTO probe_sentinel (id, note) VALUES (1, 'must survive');
+            INSERT INTO probe_sentinel (id, note) VALUES (2, 'must survive');
+            """.trimIndent(),
+        )
+
+        val result = runProbeState(jdbcUrl(), dbUser)
+        assertEquals(0, result.exitCode, "probe must succeed:\n${result.combined}")
+
+        val rows = queryOnTestDb("SELECT id || '=' || note FROM probe_sentinel ORDER BY id")
+        assertEquals(
+            listOf("1=must survive", "2=must survive"),
+            rows,
+            "probe must not insert, update or delete any row",
+        )
+    }
+
+    @Test
+    fun `probe leaves table definitions untouched`() {
+        executeOnTestDb("CREATE TABLE probe_sentinel (id int PRIMARY KEY)")
+
+        runProbeState(jdbcUrl(), dbUser)
+
+        val tables = queryOnTestDb(
+            "SELECT table_name FROM information_schema.tables " +
+                "WHERE table_schema='public' ORDER BY 1",
+        )
+        assertEquals(listOf("probe_sentinel"), tables, "probe must not create or drop tables")
+    }
+
+    private fun roleNames(): List<String> =
+        TestDb.dataSource.connection.use { conn ->
+            conn.createStatement().use { st ->
+                st.executeQuery("SELECT rolname FROM pg_roles ORDER BY 1").use { rs ->
+                    buildList { while (rs.next()) add(rs.getString(1)) }
                 }
-                return mapOf("roles" to roles)
             }
         }
+
+    /** Run DDL/DML against this test's throwaway database. */
+    private fun executeOnTestDb(sql: String) {
+        java.sql.DriverManager.getConnection(jdbcUrl(), dbUser, "").use { conn ->
+            conn.createStatement().use { it.execute(sql) }
+        }
     }
-}
 
-/**
- * Thin JDBC harness that exercises the same contract ProbeState enforces:
- *  - requires CHECK_URL set
- *  - requires PROBE_CONFIRM=yes
- *  - refuses production hosts
- *  - opens a read-only transaction
- *  - reports migration_history=not_initialized when the table is absent
- *
- * This harness lives in the test source set so it can use TestDb, but it mirrors
- * ProbeState's logic closely enough that a passing test here is meaningful evidence
- * that the workflow will behave as specified.
- */
-object ProbeStateProbe {
-    var jdbUrl: String = ""
-    var jdbcUser: String = ""
-    var jdbcPass: String = ""
-    var confirm: String = ""
-    var stagingRef: String = "mjqoydqcmecqjvzbckgk"
-
-    data class Report(
-        val status: String,
-        val host: String,
-        val database: String,
-        val migrationHistory: String,
-        val readOnly: Boolean,
-        val output: List<String>,
-    )
-
-    fun run(): Report {
-        val output = mutableListOf<String>()
-        val url = jdbUrl
-        val user = jdbcUser
-        val pass = jdbcPass
-
-        if (url.isBlank()) {
-            output.add("REFUSED: CHECK_URL is not set")
-            return Report("BLOCKED", "", "", "", false, output)
-        }
-        if (!"yes".equals(confirm)) {
-            output.add("REFUSED: set PROBE_CONFIRM=yes to confirm this is a test database")
-            return Report("BLOCKED", hostOf(url), "", "", false, output)
-        }
-        val host = hostOf(url)
-        if (hostContainsProductionHint(host)) {
-            output.add("REFUSED: $host looks like a production host")
-            return Report("BLOCKED", host, "", "", false, output)
-        }
-
-        output.add("== read-only state probe ==")
-        output.add("  target host: $host")
-
-        return try {
-            DriverManager.getConnection(url, user, pass).use { conn ->
-                conn.setAutoCommit(false)
-                conn.setReadOnly(true)
-
-                output.add(queryScalar(conn, "select 'database=' || current_database()"))
-                output.add(queryScalar(conn, "select 'current_user=' || current_user"))
-                output.add(queryScalar(conn,
-                    "select 'supabase_migrations_exists=' || (case when exists (" +
-                    "select 1 from information_schema.tables where table_schema='supabase_migrations' " +
-                    "and table_name='schema_migrations') then 'true' else 'false' end)"
-                ))
-                output.add("  migration_history=${migrationHistoryStatus(conn)}")
-
-                conn.rollback()
-                Report("OK", host, currentDatabase(conn), migrationHistoryStatus(conn), true, output)
+    /** Read a single text column from this test's throwaway database. */
+    private fun queryOnTestDb(sql: String): List<String> =
+        java.sql.DriverManager.getConnection(jdbcUrl(), dbUser, "").use { conn ->
+            conn.createStatement().use { st ->
+                st.executeQuery(sql).use { rs ->
+                    buildList { while (rs.next()) add(rs.getString(1)) }
+                }
             }
-        } catch (e: Exception) {
-            output.add("ERROR: ${e.message}")
-            Report("ERROR", host, "", "", false, output)
         }
-    }
-
-    private fun currentDatabase(conn: java.sql.Connection): String {
-        return conn.prepareStatement("select current_database()").use { st ->
-            st.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else "" }
-        }
-    }
-
-    private fun migrationHistoryStatus(conn: java.sql.Connection): String {
-        // Mirrors ProbeState.java: first check existence via information_schema,
-        // then count only if the table exists.
-        return conn.prepareStatement(
-            "select (case when exists (" +
-            "select 1 from information_schema.tables where table_schema='supabase_migrations' " +
-            "and table_name='schema_migrations') then " +
-            "(select count(*)::text || ' rows from supabase_migrations.schema_migrations') " +
-            "else 'not_initialized' end)"
-        ).use { st ->
-            st.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else "not_initialized" }
-        }
-    }
-
-    private fun queryScalar(conn: java.sql.Connection, sql: String): String {
-        return conn.prepareStatement(sql).use { st ->
-            st.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else "" }
-        }
-    }
-
-    private fun hostOf(url: String): String {
-        var s = url.replaceFirst("^jdbc:", "")
-        s = s.replaceFirst("^postgresql://", "").replaceFirst("^postgres://", "")
-        val at = s.lastIndexOf('@')
-        if (at >= 0) s = s.substring(at + 1)
-        return s
-    }
-
-    private fun hostContainsProductionHint(host: String): Boolean {
-        return host.lowercase().contains("prod")
-    }
-
-    data class ConnectionState(val database: String, val user: String)
-
-    fun connectionState(jdbcUrl: String, user: String, pass: String): ConnectionState {
-        DriverManager.getConnection(jdbcUrl, user, pass).use { conn ->
-            val db = conn.prepareStatement("select current_database()").use { st ->
-                st.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else "" }
-            }
-            val usr = conn.prepareStatement("select current_user").use { st ->
-                st.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else "" }
-            }
-            return ConnectionState(db, usr)
-        }
-    }
 }

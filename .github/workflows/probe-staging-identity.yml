@@ -6,7 +6,7 @@
 # provisioning, role creation, grant changes, or migration application.
 #
 # Separation from probe-staging.yml:
-#   probe-staging.yml   → can apply role/grant DDL with -Apply
+#   probe-staging.yml          → can apply role/grant DDL with -Apply
 #   probe-staging-identity.yml → read-only verification only, no apply path
 #
 # Environment requirements (owner-configured on pos-staging-admin):
@@ -17,8 +17,9 @@
 #     PROBE_ADMIN_PASS         = admin password for the postgres role
 #     CHECK_PASS               = same password, exposed to ProbeState as CHECK_PASS
 #
-# Safe evidence is published as a workflow artifact; never include passwords or
-# JDBC credentials in the output.
+# Evidence policy: the probe's full output is database inventory and is treated as
+# sensitive. It is written to a scratch file that is NEVER uploaded. Only the
+# allowlisted summary below becomes the artifact and the workflow log.
 
 name: probe-staging-identity
 
@@ -59,12 +60,11 @@ jobs:
 
           EXPECTED_USER="postgres.${REF}"
           if [ "$USER" != "$EXPECTED_USER" ]; then
-            echo "::error::PROBE_ADMIN_USER ($USER) does not match postgres.${REF}"
+            echo "::error::PROBE_ADMIN_USER does not end with postgres.${REF}"
             exit 1
           fi
 
           echo "Target project reference: $REF"
-          echo "Administrator user: $USER"
           echo "Username suffix validation: PASS"
           echo "MATCHED_REF=$REF" >> "$GITHUB_ENV"
 
@@ -74,72 +74,54 @@ jobs:
           CHECK_URL: jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:6543/postgres
           CHECK_USER: ${{ vars.PROBE_ADMIN_USER }}
           CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
-          PROBE_CONFIRM: yes
-          MATCHED_REF: ${{ env.MATCHED_REF }}
+          PROBE_CONFIRM: "yes"
         run: |
-          set -euo pipefail
+          # -e is deliberately omitted: the exit status is captured explicitly so a
+          # failed probe cannot be mistaken for success. -u and pipefail still apply.
+          set -uo pipefail
 
           cd server
 
-          # ProbeState is a read-only tool. It:
-          #   - refuses unset CHECK_URL
-          #   - refuses without PROBE_CONFIRM=yes
-          #   - refuses hosts containing "prod"
-          #   - opens a read-only transaction
-          #   - queries pg_catalog only, never DDL/DML
+          # ProbeState reads CHECK_URL / CHECK_USER / CHECK_PASS from the environment
+          # only. No credential is passed on the command line, so nothing secret
+          # appears in a process listing.
           #
-          # This job never invokes probe-readonly.ps1 -Apply and has no
-          # provisioning path.
+          # ProbeState is read-only: it refuses an unset CHECK_URL, refuses without
+          # PROBE_CONFIRM=yes, refuses hosts containing "prod", opens a read-only
+          # transaction, and only ever issues SELECTs against catalogs and views.
+          # It never invokes probe-readonly.ps1 and has no provisioning path.
+          ./gradlew -q execProbeState > probe-raw.txt 2>&1
+          STATUS=$?
 
-          ./gradlew -q execProbeState \
-            -DCHECK_URL="$CHECK_URL" -DCHECK_USER="$CHECK_USER" -DCHECK_PASS="$CHECK_PASS" \
-            -DPROBE_CONFIRM="$PROBE_CONFIRM" 2>&1 | tee probe-output.txt || true
+          # --- allowlisted evidence only -------------------------------------
+          # A strict field allowlist: no table lists, no policy names, no role
+          # names, no counts, no JDBC URLs, no stack traces.
+          {
+            echo "target_project_reference=${MATCHED_REF:-unset}"
+            echo "username_suffix_validation=PASS"
+            echo "read_only_transaction=enforced"
+            grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history|probe_status|error_category)=' probe-raw.txt \
+              | sed -E 's/^[[:space:]]+//' || true
+          } | tee probe-evidence.txt
 
-          echo "Probe exit code: $?"
+          # The full probe output is inventory; it must never be published.
+          rm -f probe-raw.txt
 
-          echo "--- sanitize: strip any credential-like artifacts ---"
-          # ProbeState never prints passwords, but belt-and-suspenders sanitize.
-          sed -i -e 's/CHECK_PASS=[^[:space:]]*/CHECK_PASS=<redacted>/g' \
-                 -e 's/CHECK_USER=[^[:space:]]*/CHECK_USER=<redacted>/g' \
-                 probe-output.txt 2>/dev/null || true
+          if [ "$STATUS" -ne 0 ]; then
+            echo "probe_completion=failed"
+            echo "::error::Read-only identity probe failed (exit ${STATUS}). See the sanitized fields above."
+            exit "$STATUS"
+          fi
 
-          echo "--- sanitized probe output ---"
-          sed 's/.*\(postgres\.[^[:space:]]*\).*/\1/' probe-output.txt || true
-
-          echo "PROBE_LOG<<EOF" >> "$GITHUB_ENV"
-          cat probe-output.txt
-          echo "EOF" >> "$GITHUB_ENV"
+          echo "probe_completion=ok"
 
       - name: Publish sanitized evidence
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
           name: probe-staging-identity-evidence
-          path: server/probe-output.txt
+          # Only the allowlisted summary is uploaded. The raw probe output is deleted
+          # in the previous step and is never an artifact.
+          path: server/probe-evidence.txt
           if-no-files-found: ignore
           retention-days: 5
-
-      - name: Verify safe evidence contents
-        if: always()
-        shell: bash
-        env:
-          MATCHED_REF: ${{ env.MATCHED_REF }}
-        run: |
-          set -euo pipefail
-
-          echo "=== Required safe-evidence fields ==="
-          echo "Target project reference: $MATCHED_REF"
-          echo "Username suffix validation: PASS"
-          echo "Database name: postgres (hardcoded in CHECK_URL)"
-          echo "Read-only transaction status: enforced by ProbeState (c.setReadOnly(true))"
-          echo "Migration-history initialization status: reported by ProbeState"
-          echo "Probe completion status: reported by ProbeState exit code"
-
-          # Confirm no secrets leaked into the artifact
-          if [ -f server/probe-output.txt ]; then
-            if grep -qE '(PASSWORD|password|pass)[=:].*[a-zA-Z0-9]{8,}' server/probe-output.txt; then
-              echo "::error::Possible credential leak detected in probe output"
-              exit 1
-            fi
-            echo "No credential patterns detected in artifact"
-          fi

@@ -64,6 +64,28 @@ application {
 }
 
 /**
+ * ProbeState is a standalone Java tool. It lives in `server/tools/` for
+ * traceability, outside the normal Java/Kotlin source sets, so it gets its own
+ * source set and compile task with an unambiguous package and classpath.
+ *
+ * Must be declared at project scope: Gradle forbids registering source sets or
+ * tasks from inside another task's configuration action.
+ */
+val probeStateSourceSet = sourceSets.create("probeState")
+probeStateSourceSet.java.srcDir("tools")
+
+val compileProbeState = tasks.register<JavaCompile>("compileProbeState") {
+    group = "verification"
+    description = "Compile the standalone read-only ProbeState audit tool."
+    source(probeStateSourceSet.java.srcDirs)
+    classpath = sourceSets.main.get().runtimeClasspath
+    destinationDirectory.set(layout.buildDirectory.dir("classes/java/probeState"))
+    sourceCompatibility = JavaVersion.VERSION_21.toString()
+    targetCompatibility = JavaVersion.VERSION_21.toString()
+    options.encoding = "UTF-8"
+}
+
+/**
  * Explicit schema provisioning. Normal startup never writes schema; this task
  * does, so it requires PROVISION_CONFIRM=yes and an explicit POS_DATABASE_URL.
  * There is no default target in the task or in the code it runs.
@@ -76,21 +98,23 @@ tasks.register<JavaExec>("provisionDatabase") {
 }
 
 /**
- * Read-only staging identity probe. This task runs ProbeState against a database
- * nominated by CHECK_URL with PROBE_CONFIRM=yes required. It never writes, never
+ * Read-only staging identity probe. Runs ProbeState against a database nominated
+ * by CHECK_URL with PROBE_CONFIRM=yes required. It never writes, never
  * provisions, and never applies migrations. Used by
  * .github/workflows/probe-staging-identity.yml.
+ *
+ * Credentials arrive through environment bindings only (CHECK_URL, CHECK_USER,
+ * CHECK_PASS); none are passed as JVM system properties, so no password appears
+ * in a process listing.
  */
 tasks.register<JavaExec>("execProbeState") {
     group = "verification"
     description = "Run the read-only ProbeState audit against a nominated database (workflow use only)."
     mainClass.set("com.businessstore.pos.tools.ProbeState")
-    classpath = sourceSets.main.get().runtimeClasspath
+
+    dependsOn(compileProbeState)
+    classpath = files(compileProbeState.map { it.outputs.files }) +
+        sourceSets.main.get().runtimeClasspath
+
     environment("PROBE_CONFIRM", "yes")
-    doFirst {
-        systemProperty("CHECK_URL", System.getProperty("CHECK_URL"))
-        systemProperty("CHECK_USER", System.getProperty("CHECK_USER"))
-        systemProperty("CHECK_PASS", System.getProperty("CHECK_PASS"))
-        systemProperty("PROBE_CONFIRM", System.getProperty("PROBE_CONFIRM"))
-    }
 }

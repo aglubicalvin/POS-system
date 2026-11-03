@@ -1,3 +1,5 @@
+package com.businessstore.pos.tools;
+
 import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
@@ -20,9 +22,13 @@ import java.util.List;
  *  4. Deterministic output: every list query has an ORDER BY and counts are
  *     scalar, so two runs against the same database produce identical text.
  *
- * Usage:
+ * Usage (production):
  *   CHECK_URL=jdbc:postgresql://host:5432/postgres CHECK_USER=... CHECK_PASS=...
- *   PROBE_CONFIRM=yes java -cp .:<postgresql.jar> ProbeState
+ *   PROBE_CONFIRM=yes java -cp ... com.businessstore.pos.tools.ProbeState
+ *
+ * Usage (local test against embedded PostgreSQL):
+ *   CHECK_URL=jdbc:postgresql://localhost:<port>/<db> CHECK_USER=... CHECK_PASS=...
+ *   PROBE_CONFIRM=yes java -cp ... com.businessstore.pos.tools.ProbeState
  */
 public class ProbeState {
     public static void main(String[] args) throws Exception {
@@ -55,7 +61,21 @@ public class ProbeState {
             url = url + (url.contains("?") ? "&" : "?") + "prepareThreshold=0";
         }
 
-        try (Connection c = DriverManager.getConnection(url, user, pass)) {
+        Connection opened;
+        try {
+            opened = DriverManager.getConnection(url, user, pass);
+        } catch (SQLException e) {
+            // Never emit the raw driver exception: it can carry the host, port,
+            // database, and role name, and the workflow log is public. Report a
+            // sanitized category only.
+            System.err.println("  probe_status=error");
+            System.err.println("  error_category=connection_failed");
+            System.err.println("  error_detail=" + sanitize(e));
+            System.exit(5);
+            return;
+        }
+
+        try (Connection c = opened) {
             // Belt and braces: the driver issues SET TRANSACTION READ ONLY, so
             // any write attempted in this session is refused by PostgreSQL.
             c.setAutoCommit(false);
@@ -94,16 +114,24 @@ public class ProbeState {
             // migration; on a brand-new or unprovisioned project the table does
             // not exist yet. ProbeState is read-only: it never creates schema,
             // tables, or migration rows.
-            q(c, "select 'supabase_migrations_exists=' || (case when exists (" +
-                 "select 1 from information_schema.tables where table_schema='supabase_migrations' " +
-                 "and table_name='schema_migrations') then 'true' else 'false' end)");
-
+            //
+            // The count MUST be a separate statement guarded in Java, not a CASE
+            // branch in the same query: PostgreSQL analyses every subquery in an
+            // expression before evaluating the CASE condition, so a reference to
+            // the missing table fails even when that branch would not be taken.
             System.out.println("-- migration history --");
-            q(c, "select 'migration_history=' || (case when exists (" +
-                 "select 1 from information_schema.tables where table_schema='supabase_migrations' " +
-                 "and table_name='schema_migrations') then (" +
-                 "select count(version) || ' rows from supabase_migrations.schema_migrations') " +
-                 "else 'not_initialized' end)");
+            boolean migrationTableExists = exists(c,
+                "select 1 from information_schema.tables " +
+                "where table_schema='supabase_migrations' and table_name='schema_migrations'");
+
+            System.out.println("  supabase_migrations_exists=" + migrationTableExists);
+            if (migrationTableExists) {
+                q(c, "select 'migration_history=' || count(version) || " +
+                     "' rows from supabase_migrations.schema_migrations' " +
+                     "from supabase_migrations.schema_migrations");
+            } else {
+                System.out.println("  migration_history=not_initialized");
+            }
 
             System.out.println("-- public tables --");
             q(c, "select c.relname from pg_class c " +
@@ -123,7 +151,24 @@ public class ProbeState {
             } catch (SQLException ignored) {
                 // Closing a read-only session must not fail the audit output.
             }
+
+            System.out.println("  probe_status=ok");
         }
+    }
+
+    /**
+     * A driver exception reduced to its SQLState and a short message, with the
+     * host, port, database and role scrubbed. Used for sanitized failure evidence.
+     */
+    static String sanitize(SQLException e) {
+        String state = e.getSQLState() == null ? "unknown" : e.getSQLState();
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        msg = msg.replaceAll("[\\w.-]+\\.(supabase\\.com|com|net|org)", "<host>");
+        msg = msg.replaceAll("\\b\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?", "<host>");
+        msg = msg.replaceAll("\\b(postgres|authenticator)\\.[a-z0-9]{20}\\b", "<role>");
+        msg = msg.replaceAll("\\s+", " ").trim();
+        if (msg.length() > 120) msg = msg.substring(0, 120) + "...";
+        return "sqlstate=" + state + " message=" + msg;
     }
 
     /** Host[:port]/database of a JDBC or libpq URL, with userinfo stripped. */
@@ -133,6 +178,13 @@ public class ProbeState {
         int at = s.lastIndexOf('@');
         if (at >= 0) s = s.substring(at + 1);
         return s;
+    }
+
+    /** True when the given SELECT returns at least one row. Read-only. */
+    static boolean exists(Connection c, String sql) throws Exception {
+        try (Statement st = c.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+            return rs.next();
+        }
     }
 
     static void q(Connection c, String sql) throws Exception {
