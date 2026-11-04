@@ -56,6 +56,16 @@ object ProvisionTarget {
     private val POOLER_USER = Regex("^postgres\\.([a-z0-9]{20})$")
     private val DATABASE = Regex("^[a-z0-9_]+$")
 
+    /**
+     * A fully validated remote target.
+     *
+     * [jdbcUrl] is the ORIGINAL input, kept only for logging-free reference; the
+     * connector is built from [host]/[port]/[database] and the explicit SSL
+     * settings, never by handing the raw URL to the driver. That is deliberate:
+     * pgJDBC's BaseDataSource.setUrl() copies every URL parameter into the
+     * property map, so a URL containing sslfactory=NonValidatingFactory would
+     * install a trust-all TrustManager and defeat sslmode=verify-full.
+     */
     data class Target(
         val jdbcUrl: String,
         val user: String,
@@ -63,6 +73,7 @@ object ProvisionTarget {
         val expected: String,
         val host: String,
         val port: Int,
+        val database: String,
         val rootCertificatePath: String,
     ) {
         /** Identity line safe for logs: no password, no full URL. */
@@ -192,9 +203,29 @@ object ProvisionTarget {
         //   sslmode=verify-full verifies the chain AND the hostname.
         // Remote provisioning sends an administrator credential, so only
         // verify-full is accepted. Anything else is rejected -- never downgraded.
-        val query = rawUrl.substringAfter('?', "")
-        val sslMode = Regex("(?:^|&)sslmode=([a-z-]+)", RegexOption.IGNORE_CASE)
-            .find(query)?.groupValues?.get(1)?.lowercase()
+        // Reject unsafe, unknown or duplicated query parameters BEFORE looking at
+        // sslmode. Checking only the first sslmode occurrence (as this code used
+        // to) let `sslmode=verify-full&sslmode=require` through, and passing the
+        // raw URL to the driver let sslfactory=NonValidatingFactory install a
+        // trust-all TrustManager.
+        val queryProblem = validateQuery(rawUrl)
+        if (queryProblem != null) {
+            return Outcome.Rejected(queryProblem.first, queryProblem.second)
+        }
+
+        // Exactly one sslmode, and it must be verify-full.
+        val sslModes = Regex("(?:^|&)sslmode=([^&]*)", RegexOption.IGNORE_CASE)
+            .findAll(rawUrl.substringAfter('?', ""))
+            .map { it.groupValues[1].trim().lowercase() }
+            .toList()
+        if (sslModes.size > 1) {
+            return Outcome.Rejected(
+                "duplicate-sslmode",
+                "Refusing to provision: $URL_ENV sets sslmode more than once; " +
+                    "exactly one value (verify-full) is required.",
+            )
+        }
+        val sslMode = sslModes.singleOrNull()
 
         if (sslMode != "verify-full") {
             val seen = sslMode ?: "unset"
@@ -218,10 +249,28 @@ object ProvisionTarget {
                     "Database Settings -> SSL Configuration) that the driver pins.",
             )
         }
-        if (!java.io.File(rootCert).isFile) {
+        val certFile = java.io.File(rootCert)
+        if (!certFile.isFile) {
             return Outcome.Rejected(
                 "missing-root-certificate",
-                "Refusing to provision: $ROOT_CERT_ENV does not name a readable file.",
+                "Refusing to provision: $ROOT_CERT_ENV does not name an existing file.",
+            )
+        }
+        // isFile alone says nothing about permissions: a root-owned 0600 file
+        // passes isFile on Windows but not necessarily on a POSIX host. Prove the
+        // process can actually read it before any connection is attempted.
+        val readable = try {
+            certFile.bufferedReader().use { it.readLine() }
+            true
+        } catch (error: java.io.IOException) {
+            false
+        } catch (error: SecurityException) {
+            false
+        }
+        if (!readable) {
+            return Outcome.Rejected(
+                "unreadable-root-certificate",
+                "Refusing to provision: $ROOT_CERT_ENV names a file this process cannot read.",
             )
         }
 
@@ -233,6 +282,7 @@ object ProvisionTarget {
                 expected = expected,
                 host = host,
                 port = port,
+                database = database,
                 rootCertificatePath = rootCert,
             ),
         )
@@ -266,6 +316,85 @@ object ProvisionTarget {
         val uri = runCatching { URI(raw.removePrefix("jdbc:")) }.getOrNull()
         if (uri == null || !uri.scheme.equals("postgresql", ignoreCase = true)) {
             return "malformed-url" to "Refusing to provision: $URL_ENV could not be parsed."
+        }
+        return null
+    }
+
+    /**
+     * Query parameters that are allowed to appear in POS_DATABASE_URL.
+     *
+     * The list is short on purpose. Every pgJDBC parameter that can replace the
+     * SSL factory, the hostname verifier or the trust root is REJECTED rather
+     * than stripped: silently removing one would leave the operator believing a
+     * setting took effect. sslmode is allowed here only so it can be required;
+     * its value is validated exactly and the driver is configured from the
+     * validated fields, not from the URL.
+     */
+    private val ALLOWED_QUERY_PARAMS = setOf("sslmode")
+
+    /**
+     * Parameters that can weaken certificate or hostname verification. Named
+     * explicitly so the rejection message can say why, instead of "unknown key".
+     */
+    private val FORBIDDEN_QUERY_PARAMS = setOf(
+        "sslfactory",
+        "sslfactoryarg",
+        "sslhostnameverifier",
+        "sslrootcert",
+        "sslcert",
+        "sslkey",
+        "sslpassword",
+        "sslcertmode",
+        "sslnegotiation",
+        "ssltunnel",
+        "sslresponse",
+        "sslresponsefile",
+        "ssl",          // alias that can imply a non-validating negotiation
+        "channelbinding",
+        "options",
+        "socketfactory",
+        "socketfactoryarg",
+        "loggerfile",
+        "loggerlevel",
+    )
+
+    /**
+     * Reject the whole configuration if any query parameter is unsafe, unknown or
+     * duplicated. Duplicates matter: `sslmode=verify-full&sslmode=require` would
+     * otherwise be judged on whichever occurrence the parser happened to read.
+     */
+    internal fun validateQuery(raw: String): Pair<String, String>? {
+        val query = raw.substringAfter('?', "")
+        if (query.isBlank()) return null
+
+        val seen = mutableMapOf<String, MutableList<String>>()
+        for (pair in query.split('&')) {
+            if (pair.isBlank()) continue
+            val key = pair.substringBefore('=').trim().lowercase()
+            val value = pair.substringAfter('=', "").trim()
+            if (key.isEmpty()) {
+                return "malformed-url" to "Refusing to provision: $URL_ENV has an empty query parameter name."
+            }
+            if (key in FORBIDDEN_QUERY_PARAMS) {
+                return "forbidden-ssl-parameter" to
+                    "Refusing to provision: $URL_ENV must not set the parameter '$key'. " +
+                    "SSL factories, hostname verifiers and trust roots are configured by this " +
+                    "provisioner (sslmode=verify-full plus $ROOT_CERT_ENV) and may not be " +
+                    "overridden through the URL."
+            }
+            if (key !in ALLOWED_QUERY_PARAMS) {
+                return "unknown-query-parameter" to
+                    "Refusing to provision: $URL_ENV contains the unsupported parameter '$key'. " +
+                    "Only 'sslmode' is accepted; connection settings are configured explicitly."
+            }
+            seen.getOrPut(key) { mutableListOf() }.add(value)
+        }
+
+        val sslModes = seen["sslmode"].orEmpty()
+        if (sslModes.size > 1) {
+            return "duplicate-sslmode" to
+                "Refusing to provision: $URL_ENV sets sslmode ${sslModes.size} times. " +
+                "Exactly one value is required, and it must be verify-full."
         }
         return null
     }

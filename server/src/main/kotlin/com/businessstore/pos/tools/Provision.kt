@@ -38,15 +38,17 @@ object Provision {
         println("== explicit baseline provisioning ==")
         println("  target: " + target.describe())
 
-        val dataSource = PGSimpleDataSource().apply {
-            setURL(target.jdbcUrl)
-            user = target.user
-            password = target.password
-            // Pin the provider's root CA. Without sslrootcert the driver falls
-            // back to the JVM trust store, and sslmode=verify-full then accepts
-            // any publicly-trusted certificate for this hostname.
-            setSslRootCert(target.rootCertificatePath)
-        }
+        // Build the connector from VALIDATED FIELDS, never from the raw URL.
+        //
+        // pgJDBC's BaseDataSource.setUrl() copies every URL parameter into the
+        // property map BEFORE our setter runs, and a property already present is
+        // not overwritten -- so `...?sslmode=verify-full&sslfactory=org.postgresql
+        // .ssl.NonValidatingFactory` would install a trust-all TrustManager and
+        // silently defeat verify-full. ProvisionTarget rejects such parameters,
+        // and this constructor removes the possibility entirely: no URL is handed
+        // to the driver, and every security-relevant setting is assigned here,
+        // after the host/port/database fields, in an order we control.
+        val dataSource = buildDataSource(target)
 
         val identity = runCatching { connectedIdentity(dataSource) }
         identity.exceptionOrNull()?.let { error ->
@@ -133,6 +135,31 @@ object Provision {
         println("  provision_status=" + if (created) "created" else "already_provisioned")
         println("  note=migrations 0001-0009 are NOT applied by this run")
     }
+
+    /**
+     * The only place a remote connector is configured.
+     *
+     * Every security-relevant property is set explicitly and AFTER the connection
+     * fields, so nothing can pre-empt it:
+     *   sslmode=verify-full      chain + hostname verification
+     *   sslrootcert=<file>       pin the provider CA instead of the JVM store
+     *   sslfactory               left at the driver default (LibPQFactory), which
+     *                            honours sslmode; never a non-validating factory
+     *   sslhostnameverifier      left at the driver default for verify-full
+     *
+     * Returns the configured PGSimpleDataSource for inspection by tests.
+     */
+    internal fun buildDataSource(target: ProvisionTarget.Target): PGSimpleDataSource =
+        PGSimpleDataSource().apply {
+            setServerNames(arrayOf(target.host))
+            setPortNumbers(intArrayOf(target.port))
+            setDatabaseName(target.database)
+            user = target.user
+            password = target.password
+            // Explicit TLS configuration; no value here can come from a URL.
+            setSslMode("verify-full")
+            setSslRootCert(target.rootCertificatePath)
+        }
 
     /** Facts about the CONNECTED session, read with a single read-only query. */
     internal data class ConnectedIdentity(

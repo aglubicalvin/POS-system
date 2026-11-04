@@ -71,6 +71,18 @@ object LocalProvisionTarget {
             )
         }
 
+        // No query parameters at all on this path. A local URL has nothing to
+        // configure through them, and accepting arbitrary keys would let a caller
+        // inject driver options (including SSL factories) just as the remote path
+        // could before that was closed off.
+        if (rawUrl.substringAfter('?', "").isNotBlank()) {
+            return Outcome.Rejected(
+                "unsupported-query-parameter",
+                "Refusing to provision a local database: $URL_ENV must not carry query " +
+                    "parameters. Only host, port and database name are used.",
+            )
+        }
+
         val rest = rawUrl.removePrefix("jdbc:postgresql://")
         val hostPort = rest.substringBefore('/').substringBefore('?')
         if (hostPort.isEmpty()) {

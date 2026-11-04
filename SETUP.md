@@ -132,6 +132,23 @@ chain but not the hostname. Only `verify-full` verifies both, and pinning
 `prod-ca-2021.crt` means the chain must come from Supabase rather than any
 publicly-trusted CA.
 
+The URL cannot be used to undo any of this. `POS_DATABASE_URL` accepts exactly
+one query parameter, `sslmode`, and it must be `verify-full`:
+
+- `sslfactory`, `sslfactoryarg`, `sslhostnameverifier`, `sslrootcert`, `sslcert`,
+  `sslkey`, `socketfactory` and similar keys are **rejected**, not stripped. In
+  particular `sslfactory=org.postgresql.ssl.NonValidatingFactory` would install a
+  trust-all TrustManager and silently defeat `verify-full`.
+- A second `sslmode` (for example `verify-full&sslmode=require`) is rejected;
+  checking only the first occurrence would let the weaker value reach the driver.
+- Any other query parameter is rejected rather than ignored.
+
+The provisioner does not pass the URL to the driver at all: it builds the
+connection from the validated host, port and database, then sets `sslmode` and
+`sslrootcert` explicitly, leaving pgJDBC's validating default SSL factory in
+place. The configured certificate must also be **readable** by the process, not
+merely present.
+
 Behind a shared pooler, `current_user` and `inet_server_addr()`/`inet_server_port()`
 are only partly informative: the pooler does not necessarily expose the original
 login, and `inet_server_port()` reports the port **the server accepted on**, not

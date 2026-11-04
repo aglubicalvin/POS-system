@@ -109,6 +109,12 @@ only task that writes to a remote database. `sslmode=require` and `verify-ca` ar
 rejected: they do not verify the server's identity, so they cannot establish that
 the credential is being sent to Supabase.
 
+The URL may set only `sslmode=verify-full`. SSL factories, hostname verifiers and
+URL-supplied root certificates (`sslfactory`, `sslhostnameverifier`,
+`sslrootcert`, ...) are rejected rather than stripped, duplicate `sslmode` values
+are rejected, and the connector is built from validated fields so no URL
+parameter can reach the driver.
+
 ```bash
 cd server
 PROVISION_CONFIRM=yes \

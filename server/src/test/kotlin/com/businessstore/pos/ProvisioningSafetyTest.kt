@@ -198,6 +198,7 @@ class ProvisioningSafetyTest {
         expected = expected,
         host = "aws-0-eu-west-2.pooler.supabase.com",
         port = port,
+        database = "postgres",
         rootCertificatePath = "/tmp/prod-ca-2021.crt",
     )
 
@@ -361,6 +362,127 @@ class ProvisioningSafetyTest {
         assertFalse(describe.contains("not-a-real-password"))
     }
 
+    // ---- TLS policy cannot be bypassed through the URL --------------------
+
+    @Test
+    fun `a non-validating SSL factory in the URL is rejected`() {
+        // pgJDBC documents NonValidatingFactory as disabling server certificate
+        // validation: it installs a trust-all TrustManager. Accepting it would
+        // make sslmode=verify-full meaningless.
+        val code = rejected(
+            remoteEnv(ssl = "?sslmode=verify-full&sslfactory=org.postgresql.ssl.NonValidatingFactory"),
+        ).code
+        assertEquals("forbidden-ssl-parameter", code)
+    }
+
+    @Test
+    fun `an arbitrary custom SSL factory is rejected`() {
+        val code = rejected(
+            remoteEnv(ssl = "?sslmode=verify-full&sslfactory=com.example.MyOwnSslFactory"),
+        ).code
+        assertEquals("forbidden-ssl-parameter", code)
+    }
+
+    @Test
+    fun `a custom hostname verifier is rejected`() {
+        val code = rejected(
+            remoteEnv(ssl = "?sslmode=verify-full&sslhostnameverifier=com.example.AnyHostVerifier"),
+        ).code
+        assertEquals("forbidden-ssl-parameter", code)
+    }
+
+    @Test
+    fun `a URL-supplied root certificate is rejected`() {
+        // The trust root must come from POS_DATABASE_ROOT_CERT, which is validated
+        // as a readable file; a second, unvalidated path to it is not allowed.
+        val code = rejected(remoteEnv(ssl = "?sslmode=verify-full&sslrootcert=/tmp/other.crt")).code
+        assertEquals("forbidden-ssl-parameter", code)
+    }
+
+    @Test
+    fun `duplicate sslmode is rejected even when the first value is valid`() {
+        // The previous check read only the FIRST sslmode occurrence, so this URL
+        // passed while the driver saw a weaker mode.
+        assertEquals(
+            "duplicate-sslmode",
+            rejected(remoteEnv(ssl = "?sslmode=verify-full&sslmode=require")).code,
+        )
+        assertEquals(
+            "duplicate-sslmode",
+            rejected(remoteEnv(ssl = "?sslmode=verify-full&sslmode=disable")).code,
+        )
+        assertEquals(
+            "duplicate-sslmode",
+            rejected(remoteEnv(ssl = "?sslmode=verify-full&sslmode=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `unknown query parameters are rejected rather than ignored`() {
+        assertEquals(
+            "unknown-query-parameter",
+            rejected(remoteEnv(ssl = "?sslmode=verify-full&prepareThreshold=0")).code,
+        )
+    }
+
+    @Test
+    fun `malformed query parameters are rejected`() {
+        assertEquals("malformed-url", rejected(remoteEnv(ssl = "?sslmode=verify-full&=x")).code)
+    }
+
+    @Test
+    fun `the connector is built from validated fields with verifying TLS`() {
+        // Configuration-level proof using the real pinned pgJDBC dependency: the
+        // DataSource is constructed from validated components, not from the URL,
+        // and carries verify-full plus the pinned root.
+        val env = remoteEnv()
+        val outcome = ProvisionTarget.resolve(env)
+        assertTrue(outcome is ProvisionTarget.Outcome.Ok, "expected acceptance, got $outcome")
+        val target = (outcome as ProvisionTarget.Outcome.Ok).target
+
+        val ds = Provision.buildDataSource(target)
+        assertEquals("verify-full", ds.sslMode)
+        assertEquals(env[ProvisionTarget.ROOT_CERT_ENV], ds.sslRootCert)
+        assertEquals("postgres", ds.databaseName)
+        assertEquals("aws-0-eu-west-2.pooler.supabase.com", ds.serverNames.single())
+        assertEquals(5432, ds.portNumbers.single())
+
+        // Inspect the driver's own view of the connection settings: this is what
+        // pgJDBC applies when the connection is opened. No SSL factory and no
+        // hostname-verifier override may be configured: with both null the driver
+        // uses its validating LibPQFactory, which honours sslmode=verify-full.
+        // The driver reports its DEFAULT factory (LibPQFactory) when none is
+        // overridden. That class honours sslmode, so it is the validating value --
+        // what must never appear here is NonValidatingFactory or any custom class.
+        assertEquals(
+            "org.postgresql.ssl.LibPQFactory",
+            ds.getSslfactory(),
+            "the driver must use its validating default SSL factory",
+        )
+        assertNull(ds.sslHostnameVerifier, "no hostname verifier override may be configured")
+    }
+
+    @Test
+    fun `an injected SSL factory cannot survive into the built connector`() {
+        // Even if a URL carried sslfactory, resolve() rejects it before a Target
+        // exists; and the builder never reads the URL, so the property cannot be
+        // reintroduced here.
+        val env = remoteEnv(ssl = "?sslmode=verify-full&sslfactory=org.postgresql.ssl.NonValidatingFactory")
+        assertTrue(ProvisionTarget.resolve(env) is ProvisionTarget.Outcome.Rejected)
+
+        // With a clean environment the resulting connector is still the
+        // validating one, regardless of anything an operator put in the URL.
+        val clean = ProvisionTarget.resolve(remoteEnv()) as ProvisionTarget.Outcome.Ok
+        val ds = Provision.buildDataSource(clean.target)
+        assertEquals("verify-full", ds.sslMode)
+        assertEquals(
+            "org.postgresql.ssl.LibPQFactory",
+            ds.getSslfactory(),
+            "the connector must use the validating default SSL factory",
+        )
+        assertNull(ds.sslHostnameVerifier)
+    }
+
     // ---- local provisioning path ------------------------------------------
 
     private fun localEnv(
@@ -411,6 +533,32 @@ class ProvisioningSafetyTest {
             localEnv(url = "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres"),
         ).code
         assertEquals("non-loopback-host", code)
+    }
+
+    @Test
+    fun `local provisioning rejects query parameters`() {
+        // The local path builds its connector from the raw URL, so a query string
+        // would be handed to the driver verbatim -- the same injection class that
+        // was closed on the remote path.
+        assertEquals(
+            "unsupported-query-parameter",
+            localRejected(
+                localEnv(url = "jdbc:postgresql://localhost:5432/business_store?sslfactory=org.postgresql.ssl.NonValidatingFactory"),
+            ).code,
+        )
+    }
+
+    @Test
+    fun `local provisioning rejects query parameters`() {
+        // The local path builds its connector from the raw URL, so a query string
+        // would be handed to the driver verbatim -- the same injection class that
+        // was closed on the remote path.
+        assertEquals(
+            "unsupported-query-parameter",
+            localRejected(
+                localEnv(url = "jdbc:postgresql://localhost:5432/business_store?sslfactory=org.postgresql.ssl.NonValidatingFactory"),
+            ).code,
+        )
     }
 
     @Test
