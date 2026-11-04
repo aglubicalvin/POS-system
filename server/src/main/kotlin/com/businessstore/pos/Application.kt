@@ -35,7 +35,7 @@ fun main() {
     }
 
     if (config.enrollmentSecret == null) {
-        println("WARNING: POS_ENROLLMENT_SECRET is not set â€” device registration is unauthenticated.")
+        println("WARNING: POS_ENROLLMENT_SECRET is not set — device registration is unauthenticated.")
     }
     println("Business Store POS server listening on :${config.port}")
 

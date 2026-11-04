@@ -74,18 +74,51 @@ Public values only. The service-role key must never appear here.
 
 ## 6. Database setup
 
-Local PostgreSQL:
+There are two **separate** provisioning paths. Both create the canonical baseline
+and record version `0000`; neither applies migrations `0001`-`0009`. Normal server
+startup never creates schema — it only verifies the baseline exists and refuses to
+start without it, so `psql ... -f schema.sql` on its own is no longer enough
+(the tables appear but `0000` is never recorded).
+
+### Local PostgreSQL (loopback only)
 
 ```bash
 createdb business_store
-psql business_store -f server/src/main/resources/db/schema.sql   # canonical (0000)
+cd server
+LOCAL_PROVISION_CONFIRM=yes \
+POS_LOCAL_DATABASE_URL='jdbc:postgresql://localhost:5432/business_store' \
+POS_LOCAL_DATABASE_USER='business_store' \
+POS_LOCAL_DATABASE_PASS='' \
+./gradlew provisionLocalDatabase
 ```
 
-Supabase project (dev/verify):
+`provisionLocalDatabase` requires `LOCAL_PROVISION_CONFIRM=yes` (exactly), accepts
+only a loopback host (`localhost`, `127.0.0.1`, `::1`) and refuses a remote host
+before opening a connection. An empty password is allowed for local trust/peer
+auth. It does **not** require a Supabase project reference.
+
+### Supabase project (staging/dev) — separate path
+
+```bash
+cd server
+PROVISION_CONFIRM=yes \
+POS_DATABASE_URL='jdbc:postgresql://aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require' \
+POS_DATABASE_USER='postgres.<project-ref>' \
+POS_DATABASE_PASS='<secret, never logged>' \
+POS_EXPECTED_TARGET='<same 20-char project-ref>' \
+./gradlew provisionDatabase
+```
+
+`provisionDatabase` requires `PROVISION_CONFIRM=yes`, a **Supabase pooler** host
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, `sslmode=require`,
+and a pooler login `postgres.<project-ref>` matching `POS_EXPECTED_TARGET`. After
+connecting it re-reads the session's own `current_user`, `current_database()` and
+`inet_server_addr()/port`, and only then reports `database_identity=confirmed`.
+
+To apply migrations `0001`-`0009` afterwards (deliberate, separate step):
 
 ```bash
 supabase projects list
-supabase db query --project-ref <ref> --linked --file server/src/main/resources/db/schema.sql
 for f in 0001_admin_foundation 0002_product_management 0003_dashboard_aggregation_and_authz \
          0004_rpc_search_path_hardening 0005_customers_payroll_hirepurchase \
          0006_phase43_workflows 0007_mobile_money_reconciliation \

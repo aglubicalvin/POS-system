@@ -1,0 +1,110 @@
+# Pull-request verification for the POS server and the root TypeScript suites.
+#
+# The repository previously had no build/test workflow: the only check on PRs was
+# Supabase Preview, which does not compile or test this code. This workflow runs
+# the checks that actually guard the provisioning work.
+#
+# It never connects to Supabase and applies no migrations: the Kotlin tests use an
+# embedded PostgreSQL, and the provisioning smoke tests run with configuration
+# deliberately absent so they exit before any connection.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npx tsc --noEmit
+
+      - name: Root Vitest suite
+        run: npx vitest run
+
+      - name: Kotlin and Java compilation
+        working-directory: server
+        run: ./gradlew --no-parallel -Dorg.gradle.jvmargs=-Xmx900m compileKotlin compileJava compileTestKotlin compileProbeState
+
+      - name: Server tests (no build cache, all tests executed)
+        working-directory: server
+        run: ./gradlew --no-parallel -Dorg.gradle.jvmargs=-Xmx900m test --rerun-tasks --no-build-cache
+
+      - name: Provisioning smoke test - missing confirmation is rejected before connecting
+        working-directory: server
+        env:
+          # Every provisioning variable is deliberately empty: the task must reach
+          # its configuration validation, reject it, and exit 2 without a connection.
+          PROVISION_CONFIRM: ''
+          POS_DATABASE_URL: ''
+          POS_DATABASE_USER: ''
+          POS_EXPECTED_TARGET: ''
+        run: |
+          set -uo pipefail
+          # The probe runs as the condition of an if, so errexit does not abort
+          # before the status is inspected.
+          if ./gradlew --no-parallel --console=plain -q provisionDatabase; then
+            echo "::error::provisionDatabase succeeded without confirmation"
+            exit 1
+          else
+            STATUS=$?
+          fi
+          if [ "$STATUS" -ne 2 ]; then
+            echo "::error::expected exit 2 (configuration rejected), got $STATUS"
+            exit 1
+          fi
+          echo "provisionDatabase rejected missing confirmation (exit 2)"
+
+      - name: Local provisioning smoke test - missing confirmation is rejected
+        working-directory: server
+        env:
+          LOCAL_PROVISION_CONFIRM: ''
+          POS_LOCAL_DATABASE_URL: ''
+          POS_LOCAL_DATABASE_USER: ''
+        run: |
+          set -uo pipefail
+          if ./gradlew --no-parallel --console=plain -q provisionLocalDatabase; then
+            echo "::error::provisionLocalDatabase succeeded without confirmation"
+            exit 1
+          else
+            STATUS=$?
+          fi
+          if [ "$STATUS" -ne 2 ]; then
+            echo "::error::expected exit 2 (configuration rejected), got $STATUS"
+            exit 1
+          fi
+          echo "provisionLocalDatabase rejected missing confirmation (exit 2)"
+
+      - name: Whitespace check
+        run: git diff --check HEAD^ 2>/dev/null || git diff --check

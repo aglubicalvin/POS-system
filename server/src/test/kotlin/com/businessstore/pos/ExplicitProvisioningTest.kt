@@ -236,7 +236,7 @@ class ExplicitProvisioningTest {
 
     private val validEnv = mapOf(
         ProvisionTarget.CONFIRM_ENV to "yes",
-        ProvisionTarget.URL_ENV to "jdbc:postgresql://db.example.test:5432/postgres",
+        ProvisionTarget.URL_ENV to "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require",
         ProvisionTarget.USER_ENV to "postgres.abcdefghij0123456789",
         ProvisionTarget.PASS_ENV to "not-a-real-password",
         ProvisionTarget.EXPECTED_ENV to "abcdefghij0123456789",
@@ -321,7 +321,7 @@ class ExplicitProvisioningTest {
         val target = (outcome as ProvisionTarget.Outcome.Ok).target
         val described = target.describe()
         assertFalse(described.contains("not-a-real-password"), "describe() must not print the password")
-        assertFalse(described.contains("db.example.test"), "describe() must not print the host")
+        assertFalse(described.contains("pooler.supabase.com"), "describe() must not print the host")
         assertTrue(described.contains("database=postgres"))
     }
 
@@ -335,7 +335,7 @@ class ExplicitProvisioningTest {
         )
         for (message in messages) {
             assertFalse(message.contains("not-a-real-password"), "message leaked the password: $message")
-            assertFalse(message.contains("db.example.test"), "message leaked the host: $message")
+            assertFalse(message.contains("pooler.supabase.com"), "message leaked the host: $message")
         }
     }
 }

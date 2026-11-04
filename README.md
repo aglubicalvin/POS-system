@@ -95,11 +95,16 @@ read-only check (`SchemaVerifier.requireProvisioned`) for the
 `supabase_migrations` schema, the `schema_migrations` table and baseline version
 `0000`, and exits with `STARTUP_FAILED` if they are absent. It never creates a
 schema, creates a table, applies DDL, records migration history or runs a
-migration â€” starting the server cannot change the database.
+migration — starting the server cannot change the database.
 
-**Provisioning is explicit and separately confirmed.** The baseline (`0000
-baseline_schema`) is created only by this task, and only for an explicitly named
-target:
+**Provisioning is explicit and separately confirmed.** There are two strictly
+separate paths â€” a remote/Supabase one and a loopback-only local one â€” and both
+end in the same transactional baseline apply. The remote one is:
+
+**Remote / Supabase** (`provisionDatabase`) requires a Supabase pooler host
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, `sslmode=require`,
+and a pooler login whose project suffix matches `POS_EXPECTED_TARGET`. It is the
+only task that writes to a remote database.
 
 ```bash
 cd server
@@ -119,13 +124,34 @@ The run validates everything **before opening a connection**, then:
 3. requires `POS_EXPECTED_TARGET`, because a pooler hostname is shared by every
    project in a region and identifies nothing on its own;
 4. requires the pooler username `postgres.<project-ref>` to *match* that
-   expected target â€” the only per-project signal a JDBC URL carries;
+   expected target — the only per-project signal a JDBC URL carries;
 5. connects, confirms `current_database()` is `postgres`, applies the baseline
    and records version `0000` **in one transaction**, rolls back on any failure,
    and re-reads the baseline before reporting success.
 
 Re-running is safe: an already-provisioned database reports
 `already_provisioned` and nothing is duplicated.
+
+**Local PostgreSQL** (`provisionLocalDatabase`) is the developer-laptop path and
+never touches a remote database:
+
+```bash
+cd server
+LOCAL_PROVISION_CONFIRM=yes \
+POS_LOCAL_DATABASE_URL='jdbc:postgresql://localhost:5432/business_store' \
+POS_LOCAL_DATABASE_USER='business_store' \
+./gradlew provisionLocalDatabase
+```
+
+It requires `LOCAL_PROVISION_CONFIRM=yes` (exactly), accepts only loopback hosts
+(`localhost`, `127.0.0.1`, `::1`), refuses any remote host before opening a
+connection, and does not need a Supabase project reference. Two different
+confirmation variables keep the paths from being used interchangeably.
+
+After connecting, the remote path re-reads the **session's own**
+`current_user`, `current_database()` and `inet_server_addr()/port` and only then
+reports `database_identity=confirmed` â€” a matching username in the configuration
+is not treated as proof of the connected project.
 
 Verify the baseline exists:
 
@@ -136,14 +162,14 @@ select version, name from supabase_migrations.schema_migrations order by version
 Then start the server normally with `POS_DATABASE_URL` / `POS_DATABASE_USER` /
 `POS_DATABASE_PASSWORD`.
 
-### Applying migrations 0001â€“0009
+### Applying migrations 0001–0009
 
-The admin surface is migrations `0001`â€“`0009` and is a **separate, deliberate
+The admin surface is migrations `0001`–`0009` and is a **separate, deliberate
 step**. `provisionDatabase` never applies them:
 
 ```bash
 supabase db query --linked --file supabase/migrations/0001_admin_foundation.sql
-# â€¦ in filename order through 0009
+# … in filename order through 0009
 ```
 
 Verify with `server/tools/ProbeState.java` (read-only) and

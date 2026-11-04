@@ -37,18 +37,41 @@ object ProvisionTarget {
     /** The only value of PROVISION_CONFIRM that proceeds. */
     const val CONFIRM_VALUE = "yes"
 
+    /**
+     * The only hostname shape a remote (Supabase) provisioning run may use.
+     *
+     * A Supabase pooler host is shared by every project in a region, so the host
+     * identifies only the provider, never the project: it is necessary but not
+     * sufficient. Anything else (a raw cluster host, a self-hosted database, an
+     * IP literal) is refused rather than trusted.
+     */
+    private val SUPABASE_POOLER_HOST = Regex("^aws-[0-9]+-[a-z0-9-]+\\.pooler\\.supabase\\.com$")
+
+    /** Ports the pooler serves: session (5432) and transaction (6543). */
+    private val SUPABASE_POOLER_PORTS = setOf(5432, 6543)
+
     private val PROJECT_REF = Regex("^[a-z0-9]{20}$")
     private val POOLER_USER = Regex("^postgres\\.([a-z0-9]{20})$")
     private val DATABASE = Regex("^[a-z0-9_]+$")
 
-    data class Target(val jdbcUrl: String, val user: String, val password: String, val expected: String) {
+    data class Target(
+        val jdbcUrl: String,
+        val user: String,
+        val password: String,
+        val expected: String,
+        val host: String,
+        val port: Int,
+    ) {
         /** Identity line safe for logs: no password, no full URL. */
-        fun describe(): String = "database=${databaseName()} role=${redactedRole()}"
+        fun describe(): String = "database=${databaseName()} role=${redactedRole()} endpoint=supabase-pooler"
         fun databaseName(): String = jdbcUrl.substringBefore('?').substringAfterLast('/')
         fun redactedRole(): String {
             val ref = POOLER_USER.find(user)?.groupValues?.get(1)
             return if (ref == null) "<local-role>" else "postgres.<project-ref>"
         }
+
+        /** The project reference the CONFIGURATION claims. Not proof of anything. */
+        fun configuredRef(): String? = POOLER_USER.find(user)?.groupValues?.get(1)
     }
 
     sealed class Outcome {
@@ -132,12 +155,52 @@ object ProvisionTarget {
             )
         }
 
+        val endpoint = endpointOf(rawUrl)
+            ?: return Outcome.Rejected("malformed-url", "Refusing to provision: $URL_ENV has no host.")
+        val (host, port) = endpoint
+
+        // The host must be a Supabase pooler endpoint. A matching username and
+        // expected reference prove nothing if the endpoint is an arbitrary
+        // server that happens to accept those strings.
+        if (!SUPABASE_POOLER_HOST.matches(host)) {
+            return Outcome.Rejected(
+                "untrusted-endpoint",
+                "Refusing to provision: the target host is not a Supabase pooler endpoint " +
+                    "(expected aws-<n>-<region>.pooler.supabase.com). Remote provisioning never " +
+                    "trusts an arbitrary or IP-literal host. For a local database use " +
+                    "LOCAL_PROVISION_CONFIRM=yes with ./gradlew provisionLocalDatabase.",
+            )
+        }
+        if (port !in SUPABASE_POOLER_PORTS) {
+            return Outcome.Rejected(
+                "untrusted-endpoint",
+                "Refusing to provision: the target port is not a Supabase pooler port " +
+                    "(expected 5432 or 6543).",
+            )
+        }
+
+        // TLS is not optional for a remote target: without it the credential and
+        // the whole session cross the network in clear text. requireSsl makes the
+        // driver refuse a non-TLS connection outright.
+        val query = rawUrl.substringAfter('?', "").lowercase()
+        val sslRequired = listOf("sslmode=require", "sslmode=verify-ca", "sslmode=verify-full")
+            .any { query.contains(it) }
+        if (!sslRequired) {
+            return Outcome.Rejected(
+                "tls-required",
+                "Refusing to provision: $URL_ENV must set sslmode=require (or verify-ca/verify-full). " +
+                    "Remote provisioning is never performed over an unencrypted connection.",
+            )
+        }
+
         return Outcome.Ok(
             Target(
                 jdbcUrl = rawUrl,
                 user = user,
                 password = env[PASS_ENV] ?: "",
                 expected = expected,
+                host = host,
+                port = port,
             ),
         )
     }
@@ -172,5 +235,15 @@ object ProvisionTarget {
             return "malformed-url" to "Refusing to provision: $URL_ENV could not be parsed."
         }
         return null
+    }
+
+    /** host[:port] of the URL, empty when it cannot be parsed. */
+    private fun endpointOf(raw: String): Pair<String, Int>? {
+        val rest = raw.removePrefix("jdbc:postgresql://")
+        val hostPort = rest.substringBefore('/').substringBefore('?')
+        if (hostPort.isEmpty()) return null
+        val host = hostPort.substringBefore(':').lowercase()
+        val port = hostPort.substringAfter(':', "5432").toIntOrNull() ?: return null
+        return host to port
     }
 }

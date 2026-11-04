@@ -104,7 +104,9 @@ object Schema {
      */
     fun apply(dataSource: DataSource): Boolean {
         var created = false
-        dataSource.connection.use { conn ->
+        val conn = dataSource.connection
+        var safelyCompleted = false
+        try {
             val previousAutoCommit = conn.autoCommit
             conn.autoCommit = false
             try {
@@ -137,18 +139,40 @@ object Schema {
                     insert.executeUpdate() > 0
                 }
                 conn.commit()
+                // The transaction is complete: only now is autocommit safe to
+                // restore. Restoring it earlier would be a WRITE, see below.
+                safelyCompleted = true
+                conn.autoCommit = previousAutoCommit
             } catch (error: Throwable) {
+                // Roll back the provisioning statements. If this fails the
+                // connection's transactional state is UNKNOWN.
+                //
+                // JDBC specifies that setting autoCommit back to true commits any
+                // active transaction. Restoring it here after a failed rollback
+                // could therefore COMMIT the very work we are trying to undo, so
+                // autocommit is deliberately NOT restored on this path; the
+                // connection is invalidated and closed instead, which makes the
+                // server discard the session (and with it any open transaction).
                 try {
                     conn.rollback()
+                    safelyCompleted = true
                 } catch (rollbackError: Throwable) {
                     // Preserve the original failure; keep the rollback failure as
                     // suppressed context rather than masking the real cause.
                     error.addSuppressed(rollbackError)
                 }
                 throw error
-            } finally {
-                runCatching { conn.autoCommit = previousAutoCommit }
             }
+        } finally {
+            // A connection whose rollback failed must never return to a pool in
+            // an indeterminate transactional state.
+            if (!safelyCompleted) {
+                runCatching { conn.rollback() }
+                runCatching {
+                    if (!conn.isValid(1)) conn.abort { }
+                }
+            }
+            runCatching { conn.close() }
         }
         return created
     }

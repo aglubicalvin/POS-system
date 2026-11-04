@@ -85,7 +85,11 @@ val compileProbeState = tasks.register<JavaCompile>("compileProbeState") {
     group = "verification"
     description = "Compile the standalone read-only ProbeState audit tool."
     source(probeStateSourceSet.java.srcDirs)
-    classpath = sourceSets.main.get().runtimeClasspath
+    // The probe tools reference classes in the main source set (CheckSchema uses
+    // com.businessstore.pos.tools.CheckSchemaConfig), so the main output must be
+    // on the compile classpath, not only the runtime dependencies.
+    dependsOn(tasks.named("classes"))
+    classpath = files(sourceSets.main.get().output) + sourceSets.main.get().runtimeClasspath
     destinationDirectory.set(layout.buildDirectory.dir("classes/java/probeState"))
     sourceCompatibility = JavaVersion.VERSION_21.toString()
     targetCompatibility = JavaVersion.VERSION_21.toString()
@@ -114,11 +118,40 @@ val compileProbeState = tasks.register<JavaCompile>("compileProbeState") {
  */
 tasks.register<JavaExec>("provisionDatabase") {
     group = "database"
-    description = "Provision the baseline schema (version 0000) on an explicitly confirmed target."
-    mainClass.set("com.businessstore.pos.tools.ProvisionKt")
-    // Provision.kt lives in the main source set, so the task must depend on it
-    // explicitly: without this a clean tree runs a stale or missing class.
-    dependsOn(tasks.named("compileKotlin"))
+    description = "Provision the baseline schema (version 0000) on an explicitly confirmed remote/Supabase target."
+    // Entry point verified with `javap`: @JvmStatic main() inside `object Provision`
+    // compiles to com.businessstore.pos.tools.Provision with a static main(String[]).
+    // It does NOT generate ProvisionKt (that requires a top-level Kotlin function),
+    // so this class name is the real JVM entry point, not a guess.
+    mainClass.set("com.businessstore.pos.tools.Provision")
+    // `classes` pulls in compileJava/compileKotlin AND processResources, so
+    // /db/schema.sql is on the runtime classpath even from a clean checkout.
+    // Depending on compileKotlin alone left processResources unrun.
+    dependsOn(tasks.named("classes"))
+    classpath = sourceSets.main.get().runtimeClasspath
+}
+
+/**
+ * Explicit LOCAL baseline provisioning â€” the developer-laptop counterpart to
+ * `provisionDatabase`, kept strictly separate from it.
+ *
+ * The remote task requires a Supabase pooler login and a project reference, which
+ * a laptop does not have; the local task requires loopback and an explicit local
+ * confirmation, which a remote target can never satisfy. Both finish with the same
+ * transactional Schema.apply and neither applies migrations 0001-0009.
+ *
+ *   LOCAL_PROVISION_CONFIRM=yes     exact confirmation
+ *   POS_LOCAL_DATABASE_URL          jdbc:postgresql://localhost:5432/business_store
+ *   POS_LOCAL_DATABASE_USER         the local role (e.g. business_store)
+ *   POS_LOCAL_DATABASE_PASS         optional, never logged
+ */
+tasks.register<JavaExec>("provisionLocalDatabase") {
+    group = "database"
+    description = "Provision the baseline schema (version 0000) on an explicitly confirmed loopback database."
+    // Verified with javap: @JvmStatic main() in `object ProvisionLocal` compiles
+    // to the ProvisionLocal class, not ProvisionLocalKt.
+    mainClass.set("com.businessstore.pos.tools.ProvisionLocal")
+    dependsOn(tasks.named("classes"))
     classpath = sourceSets.main.get().runtimeClasspath
 }
 

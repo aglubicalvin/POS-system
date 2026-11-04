@@ -15,17 +15,43 @@ import java.sql.*;
  */
 public class CheckSchema {
     public static void main(String[] args) throws Exception {
-        String url = System.getenv("CHECK_URL");
-        if (url == null || url.isBlank()) {
-            System.err.println("REFUSED: CHECK_URL is not set. This tool has no default target.");
+        // All configuration is validated BEFORE a connection exists: an invalid
+        // configuration must never reach the network. See com.businessstore.pos.tools.CheckSchemaConfig.
+        com.businessstore.pos.tools.CheckSchemaConfig.Config config;
+        try {
+            config = com.businessstore.pos.tools.CheckSchemaConfig.resolve(System.getenv());
+        } catch (com.businessstore.pos.tools.CheckSchemaConfig.Rejected rejected) {
+            System.err.println("CHECK_REJECTED code=" + rejected.code);
+            System.err.println("  " + rejected.getMessage());
             System.exit(2);
+            return;
         }
-        String user = System.getenv("CHECK_USER");
-        String pass = System.getenv("CHECK_PASS");
 
-        try (Connection c = DriverManager.getConnection(url, user, pass)) {
+        try (Connection c = DriverManager.getConnection(config.url, config.user, config.password)) {
             c.setAutoCommit(false);
             c.setReadOnly(true);
+
+            // Verify the CONNECTED session, not merely the strings we supplied.
+            String actualUser;
+            String actualDatabase;
+            try (Statement st = c.createStatement();
+                 ResultSet id = st.executeQuery("select current_user, current_database()")) {
+                if (!id.next()) {
+                    System.err.println("CHECK_REJECTED code=identity-unavailable");
+                    System.exit(3);
+                    return;
+                }
+                actualUser = id.getString(1);
+                actualDatabase = id.getString(2);
+            }
+            try {
+                com.businessstore.pos.tools.CheckSchemaConfig.verifyIdentity(config, actualUser, actualDatabase);
+            } catch (com.businessstore.pos.tools.CheckSchemaConfig.Rejected rejected) {
+                System.err.println("CHECK_REJECTED code=" + rejected.code);
+                System.err.println("  " + rejected.getMessage());
+                System.exit(3);
+                return;
+            }
 
             ResultSet rs = c.createStatement().executeQuery(
                 "select table_name from information_schema.tables " +
