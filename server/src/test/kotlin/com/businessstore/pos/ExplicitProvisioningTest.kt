@@ -237,10 +237,10 @@ class ExplicitProvisioningTest {
     private val validEnv = mapOf(
         ProvisionTarget.CONFIRM_ENV to "yes",
         ProvisionTarget.URL_ENV to "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-full",
-        ProvisionTarget.ROOT_CERT_ENV to java.io.File.createTempFile("root", ".crt").apply {
-            deleteOnExit()
-            writeText("test certificate placeholder")
-        }.absolutePath,
+        // A real throwaway certificate and its digest: the trust root is pinned by
+        // fingerprint, so a placeholder file would be rejected as malformed.
+        ProvisionTarget.ROOT_CERT_ENV to TestCertificate.path,
+        ProvisionTarget.ROOT_CERT_SHA256_ENV to TestCertificate.sha256,
         ProvisionTarget.USER_ENV to "postgres.abcdefghij0123456789",
         ProvisionTarget.PASS_ENV to "not-a-real-password",
         ProvisionTarget.EXPECTED_ENV to "abcdefghij0123456789",

@@ -239,7 +239,8 @@ canonical `schema.sql` baseline (`0000`). The baseline is NOT applied by server
 startup: `Application.main` only *verifies* it is present and refuses to start
 otherwise. It is created by the explicit, separately confirmed
 `./gradlew provisionDatabase` task (`PROVISION_CONFIRM=yes`, `POS_DATABASE_URL`,
-`POS_DATABASE_USER`, `POS_DATABASE_PASS`, `POS_EXPECTED_TARGET`), which applies
+`POS_DATABASE_USER`, `POS_DATABASE_PASS`, `POS_EXPECTED_TARGET`,
+`POS_DATABASE_ROOT_CERT`, `POS_DATABASE_ROOT_CERT_SHA256`), which applies
 the baseline and records `0000` in one transaction. Order is
 not cosmetic: 0001 needs the POS tables, 0002 needs `is_admin()`, 0008 retargets
 policies created in 0001, and 0009 needs 0007's `payments` shape plus 0006's

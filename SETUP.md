@@ -107,16 +107,27 @@ POS_DATABASE_USER='postgres.<project-ref>' \
 POS_DATABASE_PASS='<secret, never logged>' \
 POS_EXPECTED_TARGET='<same 20-char project-ref>' \
 POS_DATABASE_ROOT_CERT='./prod-ca-2021.crt' \
+POS_DATABASE_ROOT_CERT_SHA256='<64-hex SHA-256 of that certificate>' \
 ./gradlew provisionDatabase
 ```
 
 Download `prod-ca-2021.crt` from the Dashboard (**Database Settings -> SSL
 Configuration**); it is the root the driver pins.
 
+`POS_DATABASE_ROOT_CERT_SHA256` is **required** and must be obtained from a source
+other than the file itself (the value published with the release notes, or
+recorded when the certificate was first downloaded). Checking only that the file
+exists and is readable would accept *any* CA the caller names, and `verify-full`
+would then merely prove the peer chains to that file. The provisioner computes
+the SHA-256 of the certificate's DER encoding and rejects a mismatch:
+`missing-root-certificate-fingerprint`, `malformed-root-certificate-fingerprint`,
+`malformed-root-certificate` or `root-certificate-mismatch`.
+
 `provisionDatabase` requires `PROVISION_CONFIRM=yes`, a **Supabase pooler** host
 (`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a readable
-`POS_DATABASE_ROOT_CERT`, a pooler login `postgres.<project-ref>` matching
-`POS_EXPECTED_TARGET`, and **`sslmode=verify-full`**.
+`POS_DATABASE_ROOT_CERT` matching `POS_DATABASE_ROOT_CERT_SHA256`, a pooler login
+`postgres.<project-ref>` matching `POS_EXPECTED_TARGET`, and
+**`sslmode=verify-full`**.
 
 ### What is actually verified
 

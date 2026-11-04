@@ -34,6 +34,15 @@ object ProvisionTarget {
     const val EXPECTED_ENV = "POS_EXPECTED_TARGET"
     /** Path to the Supabase root CA (prod-ca-2021.crt) the driver must pin. */
     const val ROOT_CERT_ENV = "POS_DATABASE_ROOT_CERT"
+
+    /**
+     * SHA-256 fingerprint the certificate file must match, supplied from a source
+     * OTHER than the file itself (the value published by Supabase in the Dashboard
+     * and recorded by the release owner). Validating only that the path is readable
+     * would accept any CA a caller names, so verify-full would prove only that the
+     * peer chains to whatever that file contains.
+     */
+    const val ROOT_CERT_SHA256_ENV = "POS_DATABASE_ROOT_CERT_SHA256"
     const val CONFIRM_ENV = "PROVISION_CONFIRM"
 
     /** The only value of PROVISION_CONFIRM that proceeds. */
@@ -274,6 +283,40 @@ object ProvisionTarget {
             )
         }
 
+        // A readable file is not a trusted CA. Without an independent expectation
+        // the operator (or anything that can set the environment) could point this
+        // at an attacker-chosen root whose key signs a certificate for the pooler
+        // hostname, and verify-full would accept the interception.
+        val expectedFingerprint = env[ROOT_CERT_SHA256_ENV]?.trim()?.replace(":", "")?.lowercase()
+        if (expectedFingerprint.isNullOrEmpty()) {
+            return Outcome.Rejected(
+                "missing-root-certificate-fingerprint",
+                "Refusing to provision: $ROOT_CERT_SHA256_ENV is not set. It must contain the " +
+                    "SHA-256 fingerprint of the Supabase root certificate, taken from an " +
+                    "independent source, so the file cannot be swapped for another CA.",
+            )
+        }
+        if (!expectedFingerprint.matches(Regex("^[a-f0-9]{64}$"))) {
+            return Outcome.Rejected(
+                "malformed-root-certificate-fingerprint",
+                "Refusing to provision: $ROOT_CERT_SHA256_ENV must be a 64-character hex SHA-256 digest.",
+            )
+        }
+        val actualFingerprint = sha256OfCertificateFile(certFile)
+        if (actualFingerprint == null) {
+            return Outcome.Rejected(
+                "malformed-root-certificate",
+                "Refusing to provision: $ROOT_CERT_ENV is not a readable PEM certificate.",
+            )
+        }
+        if (actualFingerprint != expectedFingerprint) {
+            return Outcome.Rejected(
+                "root-certificate-mismatch",
+                "Refusing to provision: the certificate in $ROOT_CERT_ENV does not match " +
+                    "$ROOT_CERT_SHA256_ENV. The trust root is not the expected one.",
+            )
+        }
+
         return Outcome.Ok(
             Target(
                 jdbcUrl = rawUrl,
@@ -412,6 +455,27 @@ object ProvisionTarget {
                 "Exactly one value is required, and it must be verify-full."
         }
         return null
+    }
+
+    /**
+     * SHA-256 of the DER encoding of the FIRST certificate in a PEM file, or null
+     * when the file is not a parseable X.509 certificate.
+     *
+     * The JDK's CertificateFactory parses the PEM, so the digest covers the
+     * certificate itself rather than the file's whitespace or line endings.
+     */
+    internal fun sha256OfCertificateFile(file: java.io.File): String? = try {
+        val certificate = file.inputStream().use { input ->
+            java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificate(input)
+        } ?: return null
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(certificate.encoded)
+            .joinToString("") { "%02x".format(it) }
+    } catch (error: java.security.cert.CertificateException) {
+        null
+    } catch (error: java.io.IOException) {
+        null
     }
 
     /** host[:port] of the URL, empty when it cannot be parsed. */

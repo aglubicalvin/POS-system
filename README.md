@@ -102,8 +102,9 @@ separate paths â€” a remote/Supabase one and a loopback-only local one â�
 end in the same transactional baseline apply. The remote one is:
 
 **Remote / Supabase** (`provisionDatabase`) requires a Supabase pooler host
-(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a pinned
-`POS_DATABASE_ROOT_CERT` (Supabase's `prod-ca-2021.crt`), `sslmode=verify-full`,
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a
+`POS_DATABASE_ROOT_CERT` (Supabase's `prod-ca-2021.crt`) whose SHA-256 matches
+`POS_DATABASE_ROOT_CERT_SHA256` (required, supplied independently), `sslmode=verify-full`,
 and a pooler login whose project suffix matches `POS_EXPECTED_TARGET`. It is the
 only task that writes to a remote database. `sslmode=require` and `verify-ca` are
 rejected: they do not verify the server's identity, so they cannot establish that

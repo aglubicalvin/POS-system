@@ -271,19 +271,17 @@ class ProvisioningSafetyTest {
 
     // ---- remote endpoint and TLS policy -----------------------------------
 
-    /** A real file to satisfy the pinned-certificate check; contents are never parsed here. */
-    private fun certFile(): String {
-        val file = java.io.File.createTempFile("fake-root", ".crt")
-        file.deleteOnExit()
-        file.writeText("-----BEGIN CERTIFICATE-----\nnot-a-real-certificate\n-----END CERTIFICATE-----\n")
-        return file.absolutePath
-    }
+    /** The shared throwaway root certificate: pinned by its real SHA-256 digest. */
+    private fun certFile(): String = TestCertificate.path
+
+    private fun certFingerprint(): String = TestCertificate.sha256
 
     private fun remoteEnv(
         host: String = "aws-0-eu-west-2.pooler.supabase.com",
         port: Int = 5432,
         ssl: String = "?sslmode=verify-full",
         cert: String? = null,
+        fingerprint: String? = null,
     ) = buildMap {
         put(ProvisionTarget.CONFIRM_ENV, "yes")
         put(ProvisionTarget.URL_ENV, "jdbc:postgresql://$host:$port/postgres$ssl")
@@ -291,6 +289,7 @@ class ProvisioningSafetyTest {
         put(ProvisionTarget.PASS_ENV, "not-a-real-password")
         put(ProvisionTarget.EXPECTED_ENV, "abcdefghij0123456789")
         put(ProvisionTarget.ROOT_CERT_ENV, cert ?: certFile())
+        put(ProvisionTarget.ROOT_CERT_SHA256_ENV, fingerprint ?: certFingerprint())
     }
 
     private fun rejected(env: Map<String, String>): ProvisionTarget.Outcome.Rejected {
@@ -481,6 +480,54 @@ class ProvisioningSafetyTest {
             "the connector must use the validating default SSL factory",
         )
         assertNull(ds.sslHostnameVerifier)
+    }
+
+    @Test
+    fun `a certificate without an independent fingerprint is rejected`() {
+        // A readable file is not a trusted CA: the caller controls the path, so
+        // without an independently supplied digest the trust root is unverified.
+        assertEquals(
+            "missing-root-certificate-fingerprint",
+            rejected(remoteEnv() - ProvisionTarget.ROOT_CERT_SHA256_ENV).code,
+        )
+    }
+
+    @Test
+    fun `a malformed fingerprint is rejected`() {
+        assertEquals(
+            "malformed-root-certificate-fingerprint",
+            rejected(remoteEnv(fingerprint = "not-a-digest")).code,
+        )
+        assertEquals(
+            "malformed-root-certificate-fingerprint",
+            rejected(remoteEnv(fingerprint = "ab".repeat(31))).code,
+        )
+    }
+
+    @Test
+    fun `a certificate that does not match the fingerprint is rejected`() {
+        // The file on disk is a valid certificate, but not the expected one.
+        assertEquals(
+            "root-certificate-mismatch",
+            rejected(remoteEnv(fingerprint = "0".repeat(64))).code,
+        )
+    }
+
+    @Test
+    fun `a file that is not a certificate is rejected`() {
+        val bogus = java.io.File.createTempFile("not-a-cert", ".crt")
+        bogus.deleteOnExit()
+        bogus.writeText("this is not a PEM certificate")
+        assertEquals(
+            "malformed-root-certificate",
+            rejected(remoteEnv(cert = bogus.absolutePath, fingerprint = certFingerprint())).code,
+        )
+    }
+
+    @Test
+    fun `the correct certificate and fingerprint are accepted`() {
+        val outcome = ProvisionTarget.resolve(remoteEnv())
+        assertTrue(outcome is ProvisionTarget.Outcome.Ok, "expected acceptance, got $outcome")
     }
 
     @Test

@@ -195,17 +195,6 @@ object Provision {
         }
 
     /**
-     * The fail-closed identity verdict. Returns null only when every check passes.
-     *
-     * Deliberately strict:
-     *  - database must be 'postgres'
-     *  - current_user MUST be the pooler login postgres.<ref>, and <ref> must
-     *    equal POS_EXPECTED_TARGET (compared to the SERVER's answer, not ours)
-     *  - the server must report its own address; a session with no
-     *    inet_server_addr() (a unix socket) cannot confirm a remote endpoint
-     *  - the reported port must be the port we connected to
-     */
-    /**
      * The fail-closed identity verdict. Returns null only when every REQUIRED
      * check passes.
      *
