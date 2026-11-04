@@ -102,9 +102,12 @@ separate paths â€” a remote/Supabase one and a loopback-only local one â�
 end in the same transactional baseline apply. The remote one is:
 
 **Remote / Supabase** (`provisionDatabase`) requires a Supabase pooler host
-(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, `sslmode=require`,
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a pinned
+`POS_DATABASE_ROOT_CERT` (Supabase's `prod-ca-2021.crt`), `sslmode=verify-full`,
 and a pooler login whose project suffix matches `POS_EXPECTED_TARGET`. It is the
-only task that writes to a remote database.
+only task that writes to a remote database. `sslmode=require` and `verify-ca` are
+rejected: they do not verify the server's identity, so they cannot establish that
+the credential is being sent to Supabase.
 
 ```bash
 cd server
@@ -148,10 +151,13 @@ It requires `LOCAL_PROVISION_CONFIRM=yes` (exactly), accepts only loopback hosts
 connection, and does not need a Supabase project reference. Two different
 confirmation variables keep the paths from being used interchangeably.
 
-After connecting, the remote path re-reads the **session's own**
-`current_user`, `current_database()` and `inet_server_addr()/port` and only then
-reports `database_identity=confirmed` â€” a matching username in the configuration
-is not treated as proof of the connected project.
+After connecting, the remote path re-reads the **session's own** `current_user`
+and `current_database()`. Behind a shared pooler those are corroborating, not
+authoritative â€” the pooler need not expose the original login, and
+`inet_server_addr()/port` describe the backend-side socket rather than the
+client-facing endpoint. TLS (`verify-full` against the pinned root) is the
+identity guarantee; `POS_EXPECTED_TARGET` remains the operator's explicit
+assertion and is checked against the session when the pooler exposes it.
 
 Verify the baseline exists:
 

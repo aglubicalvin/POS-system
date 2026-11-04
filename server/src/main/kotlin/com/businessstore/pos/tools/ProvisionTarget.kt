@@ -32,6 +32,8 @@ object ProvisionTarget {
     const val USER_ENV = "POS_DATABASE_USER"
     const val PASS_ENV = "POS_DATABASE_PASS"
     const val EXPECTED_ENV = "POS_EXPECTED_TARGET"
+    /** Path to the Supabase root CA (prod-ca-2021.crt) the driver must pin. */
+    const val ROOT_CERT_ENV = "POS_DATABASE_ROOT_CERT"
     const val CONFIRM_ENV = "PROVISION_CONFIRM"
 
     /** The only value of PROVISION_CONFIRM that proceeds. */
@@ -61,6 +63,7 @@ object ProvisionTarget {
         val expected: String,
         val host: String,
         val port: Int,
+        val rootCertificatePath: String,
     ) {
         /** Identity line safe for logs: no password, no full URL. */
         fun describe(): String = "database=${databaseName()} role=${redactedRole()} endpoint=supabase-pooler"
@@ -179,17 +182,46 @@ object ProvisionTarget {
             )
         }
 
-        // TLS is not optional for a remote target: without it the credential and
-        // the whole session cross the network in clear text. requireSsl makes the
-        // driver refuse a non-TLS connection outright.
-        val query = rawUrl.substringAfter('?', "").lowercase()
-        val sslRequired = listOf("sslmode=require", "sslmode=verify-ca", "sslmode=verify-full")
-            .any { query.contains(it) }
-        if (!sslRequired) {
+        // TLS policy. The distinction matters and is easy to get wrong:
+        //   sslmode=require     encrypts, but does NOT verify the certificate or
+        //                       the hostname -- a MITM with any certificate is
+        //                       accepted, so the credential could be harvested.
+        //   sslmode=verify-ca   verifies the CA chain, but NOT the hostname, so a
+        //                       certificate for another host in the same chain
+        //                       passes.
+        //   sslmode=verify-full verifies the chain AND the hostname.
+        // Remote provisioning sends an administrator credential, so only
+        // verify-full is accepted. Anything else is rejected -- never downgraded.
+        val query = rawUrl.substringAfter('?', "")
+        val sslMode = Regex("(?:^|&)sslmode=([a-z-]+)", RegexOption.IGNORE_CASE)
+            .find(query)?.groupValues?.get(1)?.lowercase()
+
+        if (sslMode != "verify-full") {
+            val seen = sslMode ?: "unset"
             return Outcome.Rejected(
-                "tls-required",
-                "Refusing to provision: $URL_ENV must set sslmode=require (or verify-ca/verify-full). " +
-                    "Remote provisioning is never performed over an unencrypted connection.",
+                "tls-strong-verification-required",
+                "Refusing to provision: $URL_ENV must set sslmode=verify-full " +
+                    "(got '$seen'). sslmode=require encrypts without verifying the server " +
+                    "certificate or hostname, so it cannot establish who we are talking to.",
+            )
+        }
+
+        // A pinned trust root is required: verify-full against the system trust
+        // store still accepts any publicly-trusted certificate for that hostname,
+        // which is weaker than pinning the provider's CA.
+        val rootCert = env[ROOT_CERT_ENV]?.trim()
+        if (rootCert.isNullOrEmpty()) {
+            return Outcome.Rejected(
+                "missing-root-certificate",
+                "Refusing to provision: $ROOT_CERT_ENV is not set. It must point to the " +
+                    "Supabase root certificate (prod-ca-2021.crt, from the Dashboard: " +
+                    "Database Settings -> SSL Configuration) that the driver pins.",
+            )
+        }
+        if (!java.io.File(rootCert).isFile) {
+            return Outcome.Rejected(
+                "missing-root-certificate",
+                "Refusing to provision: $ROOT_CERT_ENV does not name a readable file.",
             )
         }
 
@@ -201,6 +233,7 @@ object ProvisionTarget {
                 expected = expected,
                 host = host,
                 port = port,
+                rootCertificatePath = rootCert,
             ),
         )
     }

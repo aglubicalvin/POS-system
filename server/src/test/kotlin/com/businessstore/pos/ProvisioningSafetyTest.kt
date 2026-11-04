@@ -192,12 +192,13 @@ class ProvisioningSafetyTest {
     // ---- connected target identity ----------------------------------------
 
     private fun target(expected: String, port: Int = 5432) = ProvisionTarget.Target(
-        jdbcUrl = "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:$port/postgres?sslmode=require",
+        jdbcUrl = "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:$port/postgres?sslmode=verify-full",
         user = "postgres.$expected",
         password = "x",
         expected = expected,
         host = "aws-0-eu-west-2.pooler.supabase.com",
         port = port,
+        rootCertificatePath = "/tmp/prod-ca-2021.crt",
     )
 
     private fun session(
@@ -221,24 +222,43 @@ class ProvisioningSafetyTest {
     }
 
     @Test
-    fun `a non-pooler session cannot prove project identity`() {
+    fun `a non-pooler session does not falsely confirm a project identity`() {
         val t = target("abcdefghij0123456789")
         val problem = Provision.identityProblem(session(user = "postgres"), t)
-        assertEquals("identity_unavailable", problem?.first)
+        assertNull(problem, "no suffix is not a mismatch")
+        assertTrue(Provision.identityWeakness(session(user = "postgres")))
     }
 
     @Test
-    fun `a socket session without a server address is rejected`() {
+    fun `a socket session without a server address is not used as an identity signal`() {
+        // inet_server_addr() being empty proves nothing either way; it is simply
+        // not part of the verdict any more.
         val t = target("abcdefghij0123456789")
-        val problem = Provision.identityProblem(session(addr = ""), t)
-        assertEquals("identity_unavailable", problem?.first)
+        assertNull(Provision.identityProblem(session(addr = ""), t))
     }
 
     @Test
-    fun `a session on a different port is rejected`() {
-        val t = target("abcdefghij0123456789", port = 5432)
-        val problem = Provision.identityProblem(session(port = 6543), t)
-        assertEquals("endpoint_mismatch", problem?.first)
+    fun `the reported server port is not treated as the client-facing endpoint`() {
+        // inet_server_port() reports the port the SERVER accepted on. Behind a
+        // shared pooler that is the backend socket, not the 6543 the client
+        // dialled, so it must not be compared to the configured pooler port.
+        val t = target("abcdefghij0123456789", port = 6543)
+        assertNull(
+            Provision.identityProblem(session(port = 5432), t),
+            "a differing server-side port must not fail verification on its own",
+        )
+    }
+
+    @Test
+    fun `a session without a project suffix is allowed but reported as weak`() {
+        // A shared pooler may not surface the original login in current_user.
+        // That is not fatal -- TLS is the identity guarantee -- but it must be
+        // reported rather than claimed as a session-confirmed project.
+        val t = target("abcdefghij0123456789")
+        val shared = session(user = "authenticator")
+        assertNull(Provision.identityProblem(shared, t))
+        assertTrue(Provision.identityWeakness(shared), "a non-suffixed login must be reported as weak")
+        assertFalse(Provision.identityWeakness(session()), "a suffixed login is not weak")
     }
 
     @Test
@@ -250,17 +270,27 @@ class ProvisioningSafetyTest {
 
     // ---- remote endpoint and TLS policy -----------------------------------
 
+    /** A real file to satisfy the pinned-certificate check; contents are never parsed here. */
+    private fun certFile(): String {
+        val file = java.io.File.createTempFile("fake-root", ".crt")
+        file.deleteOnExit()
+        file.writeText("-----BEGIN CERTIFICATE-----\nnot-a-real-certificate\n-----END CERTIFICATE-----\n")
+        return file.absolutePath
+    }
+
     private fun remoteEnv(
         host: String = "aws-0-eu-west-2.pooler.supabase.com",
         port: Int = 5432,
-        ssl: String = "?sslmode=require",
-    ) = mapOf(
-        ProvisionTarget.CONFIRM_ENV to "yes",
-        ProvisionTarget.URL_ENV to "jdbc:postgresql://$host:$port/postgres$ssl",
-        ProvisionTarget.USER_ENV to "postgres.abcdefghij0123456789",
-        ProvisionTarget.PASS_ENV to "not-a-real-password",
-        ProvisionTarget.EXPECTED_ENV to "abcdefghij0123456789",
-    )
+        ssl: String = "?sslmode=verify-full",
+        cert: String? = null,
+    ) = buildMap {
+        put(ProvisionTarget.CONFIRM_ENV, "yes")
+        put(ProvisionTarget.URL_ENV, "jdbc:postgresql://$host:$port/postgres$ssl")
+        put(ProvisionTarget.USER_ENV, "postgres.abcdefghij0123456789")
+        put(ProvisionTarget.PASS_ENV, "not-a-real-password")
+        put(ProvisionTarget.EXPECTED_ENV, "abcdefghij0123456789")
+        put(ProvisionTarget.ROOT_CERT_ENV, cert ?: certFile())
+    }
 
     private fun rejected(env: Map<String, String>): ProvisionTarget.Outcome.Rejected {
         val outcome = ProvisionTarget.resolve(env)
@@ -296,8 +326,30 @@ class ProvisioningSafetyTest {
 
     @Test
     fun `a remote target without TLS cannot proceed`() {
-        assertEquals("tls-required", rejected(remoteEnv(ssl = "")).code)
-        assertEquals("tls-required", rejected(remoteEnv(ssl = "?sslmode=disable")).code)
+        assertEquals("tls-strong-verification-required", rejected(remoteEnv(ssl = "")).code)
+        assertEquals("tls-strong-verification-required", rejected(remoteEnv(ssl = "?sslmode=disable")).code)
+    }
+
+    @Test
+    fun `sslmode=require is rejected because it verifies neither chain nor host`() {
+        // require encrypts but accepts any certificate: a MITM could present its
+        // own and collect the administrator credential.
+        assertEquals("tls-strong-verification-required", rejected(remoteEnv(ssl = "?sslmode=require")).code)
+    }
+
+    @Test
+    fun `sslmode=verify-ca is rejected because it does not verify the hostname`() {
+        assertEquals("tls-strong-verification-required", rejected(remoteEnv(ssl = "?sslmode=verify-ca")).code)
+    }
+
+    @Test
+    fun `a pinned root certificate is required`() {
+        val withoutCert = remoteEnv() - ProvisionTarget.ROOT_CERT_ENV
+        assertEquals("missing-root-certificate", rejected(withoutCert).code)
+        assertEquals(
+            "missing-root-certificate",
+            rejected(remoteEnv(cert = "/nonexistent/does-not-exist.crt")).code,
+        )
     }
 
     @Test

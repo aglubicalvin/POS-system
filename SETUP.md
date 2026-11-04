@@ -102,18 +102,43 @@ auth. It does **not** require a Supabase project reference.
 ```bash
 cd server
 PROVISION_CONFIRM=yes \
-POS_DATABASE_URL='jdbc:postgresql://aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require' \
+POS_DATABASE_URL='jdbc:postgresql://aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=verify-full' \
 POS_DATABASE_USER='postgres.<project-ref>' \
 POS_DATABASE_PASS='<secret, never logged>' \
 POS_EXPECTED_TARGET='<same 20-char project-ref>' \
+POS_DATABASE_ROOT_CERT='./prod-ca-2021.crt' \
 ./gradlew provisionDatabase
 ```
 
+Download `prod-ca-2021.crt` from the Dashboard (**Database Settings -> SSL
+Configuration**); it is the root the driver pins.
+
 `provisionDatabase` requires `PROVISION_CONFIRM=yes`, a **Supabase pooler** host
-(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, `sslmode=require`,
-and a pooler login `postgres.<project-ref>` matching `POS_EXPECTED_TARGET`. After
-connecting it re-reads the session's own `current_user`, `current_database()` and
-`inet_server_addr()/port`, and only then reports `database_identity=confirmed`.
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a readable
+`POS_DATABASE_ROOT_CERT`, a pooler login `postgres.<project-ref>` matching
+`POS_EXPECTED_TARGET`, and **`sslmode=verify-full`**.
+
+### What is actually verified
+
+| sslmode | Encrypted | Certificate chain | Hostname | Accepted here |
+|---|---|---|---|---|
+| `disable` / unset / `require` | yes / no | no | no | **no** |
+| `verify-ca` | yes | yes | no | **no** |
+| `verify-full` + pinned root cert | yes | yes | yes | **yes** |
+
+`require` encrypts but accepts *any* certificate -- a man-in-the-middle could
+present its own and collect the administrator credential. `verify-ca` checks the
+chain but not the hostname. Only `verify-full` verifies both, and pinning
+`prod-ca-2021.crt` means the chain must come from Supabase rather than any
+publicly-trusted CA.
+
+Behind a shared pooler, `current_user` and `inet_server_addr()`/`inet_server_port()`
+are only partly informative: the pooler does not necessarily expose the original
+login, and `inet_server_port()` reports the port **the server accepted on**, not
+the client-facing endpoint. Provisioning therefore treats TLS as the identity
+guarantee and reports `database_identity=confirmed_by_tls_and_expected_target`
+when the session does not expose a project suffix. The project identity is
+ultimately the operator's `POS_EXPECTED_TARGET` assertion, backed by verified TLS.
 
 To apply migrations `0001`-`0009` afterwards (deliberate, separate step):
 

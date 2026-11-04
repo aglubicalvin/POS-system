@@ -236,7 +236,11 @@ class ExplicitProvisioningTest {
 
     private val validEnv = mapOf(
         ProvisionTarget.CONFIRM_ENV to "yes",
-        ProvisionTarget.URL_ENV to "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require",
+        ProvisionTarget.URL_ENV to "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-full",
+        ProvisionTarget.ROOT_CERT_ENV to java.io.File.createTempFile("root", ".crt").apply {
+            deleteOnExit()
+            writeText("test certificate placeholder")
+        }.absolutePath,
         ProvisionTarget.USER_ENV to "postgres.abcdefghij0123456789",
         ProvisionTarget.PASS_ENV to "not-a-real-password",
         ProvisionTarget.EXPECTED_ENV to "abcdefghij0123456789",

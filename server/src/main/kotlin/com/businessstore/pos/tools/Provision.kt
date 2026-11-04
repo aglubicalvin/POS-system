@@ -42,6 +42,10 @@ object Provision {
             setURL(target.jdbcUrl)
             user = target.user
             password = target.password
+            // Pin the provider's root CA. Without sslrootcert the driver falls
+            // back to the JVM trust store, and sslmode=verify-full then accepts
+            // any publicly-trusted certificate for this hostname.
+            setSslRootCert(target.rootCertificatePath)
         }
 
         val identity = runCatching { connectedIdentity(dataSource) }
@@ -53,20 +57,35 @@ object Provision {
         }
         val session = identity.getOrThrow()
 
-        // Establish the CONNECTED target, not the configured one.
+        // Establish what can actually be established about the connected target.
         //
-        // What this proves: the session is a live PostgreSQL connection whose
-        // current_database is 'postgres', whose current_user is the pooler
-        // administror login postgres.<ref>, and whose inet_server_addr/port match
-        // the endpoint we asked for. Together those mean the credentials logged
-        // into the project encoded in the username -- a Supabase pooler
-        // authenticates the tenant from the username suffix, so a session for
-        // postgres.<ref> can only exist against project <ref>.
+        // TLS (sslmode=verify-full with a pinned root CA, enforced in
+        // ProvisionTarget before this point) is what proves the SERVER'S IDENTITY:
+        // the peer presented a chain from the Supabase root and a certificate
+        // valid for the hostname we dialled. That is the strong guarantee, and it
+        // happens in the driver, not in SQL.
         //
-        // What this does NOT prove: that <ref> is the project the operator
-        // intended. That is what POS_EXPECTED_TARGET is for, and it is compared
-        // here against the SESSION's current_user, never against the username we
-        // already supplied.
+        // The session query below adds weaker, corroborating facts:
+        //   current_database() -> we are in the 'postgres' database
+        //   current_user       -> the role the SESSION authenticated as
+        //
+        // What it does NOT prove, and must not be described as proving:
+        //   - A Supabase pooler does not necessarily expose the original login in
+        //     current_user; behind a shared pooler the session may be attributed
+        //     to a different internal role. So the project suffix seen here is
+        //     corroborating, not authoritative.
+        //   - inet_server_addr()/inet_server_port() report the address and port
+        //     the SERVER accepted the connection on (PostgreSQL docs, System
+        //     Information Functions). Behind a pooler that is the pooler's
+        //     backend-side socket, NOT the client-facing endpoint. Comparing it to
+        //     the pooler port we dialled compares two different things, so it is
+        //     deliberately NOT used as an identity signal.
+        //
+        // The project identity is therefore ultimately a HUMAN-CONTROLLED
+        // assertion: POS_EXPECTED_TARGET states what the operator believes, and
+        // it is checked against the session's current_user where the pooler
+        // exposes it. If it is not exposed, we say so and proceed on the strength
+        // of verified TLS plus the configured target -- never claiming more.
         //
         // If any signal is unavailable the verdict is fail-closed: no identity, no
         // provisioning.
@@ -77,8 +96,16 @@ object Provision {
             System.err.println("  error_detail=" + problem.second)
             exitProcess(3)
         }
-        println("  session_user_ref=" + "<project-ref>")
-        println("  database_identity=confirmed")
+        println("  tls=verify-full (chain pinned to " + ProvisionTarget.ROOT_CERT_ENV + ")")
+        println("  session_database=confirmed")
+        if (identityWeakness(session)) {
+            // Be explicit rather than implying a guarantee the provider does not
+            // give: identity here rests on verified TLS + POS_EXPECTED_TARGET.
+            println("  database_identity=confirmed_by_tls_and_expected_target")
+            println("  identity_caveat=current_user did not expose a project suffix")
+        } else {
+            println("  database_identity=confirmed (tls + session project)")
+        }
 
         val created = try {
             Schema.apply(dataSource)
@@ -151,27 +178,41 @@ object Provision {
      *    inet_server_addr() (a unix socket) cannot confirm a remote endpoint
      *  - the reported port must be the port we connected to
      */
+    /**
+     * The fail-closed identity verdict. Returns null only when every REQUIRED
+     * check passes.
+     *
+     * Required:
+     *  - the connected database must be 'postgres'
+     *  - if the pooler exposes a project-suffixed current_user, it MUST equal
+     *    POS_EXPECTED_TARGET (a disagreement is fatal)
+     *
+     * Deliberately NOT used: inet_server_addr()/inet_server_port(). Behind a
+     * shared pooler those describe the backend-side socket, not the endpoint the
+     * client dialled, so comparing them to the pooler host/port would be a false
+     * assurance.
+     *
+     * When the pooler does not expose a suffixed login, identity rests on
+     * verified TLS plus the operator's configured target; [identityWeakness]
+     * reports that so the run can say so out loud instead of overclaiming.
+     */
     internal fun identityProblem(session: ConnectedIdentity, target: ProvisionTarget.Target): Pair<String, String>? {
         if (session.database != "postgres") {
             return "unexpected_database" to "database=<other> expected=postgres"
         }
         val ref = session.currentUser?.let { Regex("^postgres\\.([a-z0-9]{20})$").find(it)?.groupValues?.get(1) }
-        if (ref == null) {
-            // A pooler session that did not authenticate as postgres.<ref> cannot
-            // be attributed to any project.
-            return "identity_unavailable" to "current_user=<not a pooler project login>"
-        }
-        if (ref != target.expected) {
+        if (ref != null && ref != target.expected) {
             return "target_mismatch" to "session_project=<project-ref> expected=<project-ref>"
-        }
-        if (session.serverAddr.isNullOrBlank()) {
-            return "identity_unavailable" to "inet_server_addr=<empty> (socket session cannot confirm endpoint)"
-        }
-        if (session.serverPort != target.port) {
-            return "endpoint_mismatch" to "inet_server_port=<other> configured_port=" + target.port
         }
         return null
     }
+
+    /**
+     * Non-fatal caveat to print: true when the session did not expose a project
+     * suffix, so project identity is corroborated only by TLS + configuration.
+     */
+    internal fun identityWeakness(session: ConnectedIdentity): Boolean =
+        session.currentUser?.let { Regex("^postgres\\.([a-z0-9]{20})$").find(it) } == null
 
     /** SQLState (+ a short sanitized class) only: never the driver's message. */
     private fun sqlStateOf(error: Throwable): String {
