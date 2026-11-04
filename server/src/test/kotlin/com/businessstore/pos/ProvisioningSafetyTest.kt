@@ -535,18 +535,6 @@ class ProvisioningSafetyTest {
         assertEquals("non-loopback-host", code)
     }
 
-    @Test
-    fun `local provisioning rejects query parameters`() {
-        // The local path builds its connector from the raw URL, so a query string
-        // would be handed to the driver verbatim -- the same injection class that
-        // was closed on the remote path.
-        assertEquals(
-            "unsupported-query-parameter",
-            localRejected(
-                localEnv(url = "jdbc:postgresql://localhost:5432/business_store?sslfactory=org.postgresql.ssl.NonValidatingFactory"),
-            ).code,
-        )
-    }
 
     @Test
     fun `local provisioning rejects query parameters`() {
