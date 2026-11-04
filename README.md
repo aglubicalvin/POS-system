@@ -88,17 +88,71 @@ cd admin-mobile && npm install && npm start
 
 ## Database setup
 
-The canonical schema ships with the server and is applied at startup (`0000
-baseline_schema`). The admin surface is migrations `0001`–`0009`:
+Provisioning and startup are **separate** operations, by design.
+
+**Normal startup never writes schema.** `Application.main` connects, runs a
+read-only check (`SchemaVerifier.requireProvisioned`) for the
+`supabase_migrations` schema, the `schema_migrations` table and baseline version
+`0000`, and exits with `STARTUP_FAILED` if they are absent. It never creates a
+schema, creates a table, applies DDL, records migration history or runs a
+migration â€” starting the server cannot change the database.
+
+**Provisioning is explicit and separately confirmed.** The baseline (`0000
+baseline_schema`) is created only by this task, and only for an explicitly named
+target:
+
+```bash
+cd server
+PROVISION_CONFIRM=yes \
+POS_DATABASE_URL='jdbc:postgresql://<host>:<port>/postgres' \
+POS_DATABASE_USER='postgres.<project-ref>' \
+POS_DATABASE_PASS='<secret, never logged>' \
+POS_EXPECTED_TARGET='<same 20-char project-ref>' \
+./gradlew provisionDatabase
+```
+
+The run validates everything **before opening a connection**, then:
+
+1. rejects any `PROVISION_CONFIRM` other than the exact string `yes`;
+2. rejects a missing, malformed or credential-bearing `POS_DATABASE_URL`
+   (there is no default target, and the database must be `postgres`);
+3. requires `POS_EXPECTED_TARGET`, because a pooler hostname is shared by every
+   project in a region and identifies nothing on its own;
+4. requires the pooler username `postgres.<project-ref>` to *match* that
+   expected target â€” the only per-project signal a JDBC URL carries;
+5. connects, confirms `current_database()` is `postgres`, applies the baseline
+   and records version `0000` **in one transaction**, rolls back on any failure,
+   and re-reads the baseline before reporting success.
+
+Re-running is safe: an already-provisioned database reports
+`already_provisioned` and nothing is duplicated.
+
+Verify the baseline exists:
+
+```sql
+select version, name from supabase_migrations.schema_migrations order by version;  -- expect 0000
+```
+
+Then start the server normally with `POS_DATABASE_URL` / `POS_DATABASE_USER` /
+`POS_DATABASE_PASSWORD`.
+
+### Applying migrations 0001â€“0009
+
+The admin surface is migrations `0001`â€“`0009` and is a **separate, deliberate
+step**. `provisionDatabase` never applies them:
 
 ```bash
 supabase db query --linked --file supabase/migrations/0001_admin_foundation.sql
-# … in filename order through 0009
+# â€¦ in filename order through 0009
 ```
 
 Verify with `server/tools/ProbeState.java` (read-only) and
 `CleanReplayMigrationTest` / `AdminMigrationTest`.
 
+**Staging has not been provisioned and no migration has been applied there.**
+The read-only identity probe confirmed connectivity and a read-only transaction
+only; staging still reports `migration_history: not_initialized`. Provisioning
+staging requires separate explicit authorization.
 ## API documentation summary
 
 - Device API: `/health`, `/devices`, `/sync`, `/sync/pull`, `/reports/*`,

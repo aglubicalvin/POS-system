@@ -1,13 +1,32 @@
 import java.sql.*;
 
+/**
+ * READ-ONLY schema inventory check for an explicitly nominated database.
+ *
+ * There is deliberately NO default target: this tool used to fall back to a
+ * hard-coded Supabase pooler URL when CHECK_URL was unset, so a typo in the
+ * environment silently pointed a developer at a shared project. It now refuses
+ * instead, exactly like ProbeState.
+ *
+ * Every statement below is a SELECT against information_schema / pg_class.
+ * This tool never writes.
+ *
+ * Usage: CHECK_URL=jdbc:postgresql://<host>:<port>/<db> CHECK_USER=... CHECK_PASS=...
+ */
 public class CheckSchema {
-    static String url  = System.getenv().getOrDefault("CHECK_URL",
-            "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres");
-    static String user = System.getenv("CHECK_USER");
-    static String pass = System.getenv("CHECK_PASS");
-
     public static void main(String[] args) throws Exception {
+        String url = System.getenv("CHECK_URL");
+        if (url == null || url.isBlank()) {
+            System.err.println("REFUSED: CHECK_URL is not set. This tool has no default target.");
+            System.exit(2);
+        }
+        String user = System.getenv("CHECK_USER");
+        String pass = System.getenv("CHECK_PASS");
+
         try (Connection c = DriverManager.getConnection(url, user, pass)) {
+            c.setAutoCommit(false);
+            c.setReadOnly(true);
+
             ResultSet rs = c.createStatement().executeQuery(
                 "select table_name from information_schema.tables " +
                 "where table_schema='public' and table_type='BASE TABLE' order by 1");
@@ -43,6 +62,8 @@ public class CheckSchema {
             var fns = new java.util.ArrayList<String>();
             while (rs.next()) fns.add(rs.getString(1));
             System.out.println("functions in public: " + (fns.isEmpty() ? "none" : fns));
+
+            c.rollback();
         }
     }
 }

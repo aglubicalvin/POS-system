@@ -93,14 +93,32 @@ val compileProbeState = tasks.register<JavaCompile>("compileProbeState") {
 }
 
 /**
- * Explicit schema provisioning. Normal startup never writes schema; this task
- * does, so it requires PROVISION_CONFIRM=yes and an explicit POS_DATABASE_URL.
- * There is no default target in the task or in the code it runs.
+ * Explicit schema provisioning â€” the ONLY task that writes schema.
+ *
+ * Normal server startup never writes schema: `Application.main` calls
+ * `SchemaVerifier.requireProvisioned` (SELECTs only) and fails with an actionable
+ * message when the baseline is absent. This task is the deliberate, separate
+ * step that creates it.
+ *
+ * Everything is supplied by the environment; nothing has a default, and the
+ * process refuses before opening a connection when anything is missing:
+ *   PROVISION_CONFIRM=yes        exact confirmation, no other value proceeds
+ *   POS_DATABASE_URL             jdbc:postgresql://<host>:<port>/<db>
+ *   POS_DATABASE_USER            pooler administrator, postgres.<project-ref>
+ *   POS_DATABASE_PASS            role password (optional; never logged)
+ *   POS_EXPECTED_TARGET          20-char project ref the URL must resolve to
+ *
+ * The run applies the baseline and records version 0000 in ONE transaction, then
+ * re-reads the baseline to verify it. Migrations 0001-0009 are NOT applied here;
+ * they remain a separate step.
  */
 tasks.register<JavaExec>("provisionDatabase") {
     group = "database"
-    description = "Create the canonical POS schema on an explicitly confirmed, disposable database."
+    description = "Provision the baseline schema (version 0000) on an explicitly confirmed target."
     mainClass.set("com.businessstore.pos.tools.ProvisionKt")
+    // Provision.kt lives in the main source set, so the task must depend on it
+    // explicitly: without this a clean tree runs a stale or missing class.
+    dependsOn(tasks.named("compileKotlin"))
     classpath = sourceSets.main.get().runtimeClasspath
 }
 
