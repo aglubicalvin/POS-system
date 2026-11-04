@@ -64,6 +64,23 @@ public final class CheckSchemaConfig {
             throw new Rejected("credentials-in-url",
                 "REFUSED: CHECK_URL must not embed credentials; use CHECK_USER and CHECK_PASS.");
         }
+        // Userinfo is not the only place a credential can hide: pgJDBC also accepts
+        // these as URL query parameters, which would sidestep the CHECK_USER /
+        // CHECK_PASS contract entirely and put a secret into a value that can end up
+        // in driver diagnostics. Refuse them as a URL parameter, exactly as for
+        // userinfo.
+        int queryStart = rest.indexOf('?');
+        if (queryStart >= 0) {
+            String query = rest.substring(queryStart + 1);
+            for (String parameter : query.split("&")) {
+                String name = parameter.split("=", 2)[0].trim().toLowerCase();
+                if (name.equals("password") || name.equals("user") || name.equals("sslpassword")) {
+                    throw new Rejected("credentials-in-url",
+                        "REFUSED: CHECK_URL must not carry credentials in its query parameters; " +
+                            "use CHECK_USER and CHECK_PASS.");
+                }
+            }
+        }
         int slash = rest.indexOf('/');
         if (slash <= 0 || slash == rest.length() - 1) {
             throw new Rejected("malformed-url", "REFUSED: CHECK_URL must name a host and a database.");

@@ -62,6 +62,24 @@ class CheckSchemaConfigTest {
     }
 
     @Test
+    fun `credentials in url query parameters are rejected`() {
+        // pgJDBC accepts password/user as URL parameters too, so rejecting only
+        // userinfo would leave the CHECK_USER / CHECK_PASS contract bypassable and
+        // put a secret into a value the driver can echo in diagnostics.
+        for (query in listOf("?password=secret", "?Password=secret", "?user=postgres", "?sslpassword=x", "?sslmode=require&password=secret")) {
+            assertEquals(
+                "credentials-in-url",
+                rejected(valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres$query")).code,
+                query,
+            )
+        }
+        // A non-credential query parameter is still allowed (resolves, no throw).
+        CheckSchemaConfig.resolve(
+            valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres?sslmode=require"),
+        )
+    }
+
+    @Test
     fun `missing username is rejected`() {
         assertEquals("missing-user", rejected(valid - "CHECK_USER").code)
         assertEquals("missing-user", rejected(valid + ("CHECK_USER" to "  ")).code)
