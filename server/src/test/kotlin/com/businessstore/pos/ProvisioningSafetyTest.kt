@@ -340,7 +340,7 @@ class ProvisioningSafetyTest {
 
     @Test
     fun `sslmode=verify-ca is rejected because it does not verify the hostname`() {
-        assertEquals("tls-strong-verification-required", rejected(remoteEnv(ssl = "?sslmode=verify-ca")).code)
+        assertEquals("tls-weak-sslmode", rejected(remoteEnv(ssl = "?sslmode=verify-ca")).code)
     }
 
     @Test
@@ -483,6 +483,23 @@ class ProvisioningSafetyTest {
         assertNull(ds.sslHostnameVerifier)
     }
 
+    @Test
+    fun `a comma-separated multi-host URL is rejected on the remote path`() {
+        // pgJDBC fails over to the next host in a comma-separated authority, so a
+        // URL whose first host is a valid pooler could still land elsewhere.
+        assertEquals(
+            "multiple-hosts",
+            rejected(
+                remoteEnv(host = "aws-0-eu-west-2.pooler.supabase.com,attacker.example.test"),
+            ).code,
+        )
+    }
+
+    @Test
+    fun `sslmode=verify-ca is rejected by name`() {
+        assertEquals("tls-weak-sslmode", rejected(remoteEnv(ssl = "?sslmode=verify-ca")).code)
+    }
+
     // ---- local provisioning path ------------------------------------------
 
     private fun localEnv(
@@ -535,6 +552,18 @@ class ProvisioningSafetyTest {
         assertEquals("non-loopback-host", code)
     }
 
+
+    @Test
+    fun `local provisioning rejects a comma-separated multi-host URL`() {
+        // The leading host is loopback, but the driver would fail over to the
+        // remote one -- the case that makes a loopback-only check meaningless.
+        assertEquals(
+            "multiple-hosts",
+            localRejected(
+                localEnv(url = "jdbc:postgresql://localhost:5432,attacker.example.test:5432/business_store"),
+            ).code,
+        )
+    }
 
     @Test
     fun `local provisioning rejects query parameters`() {

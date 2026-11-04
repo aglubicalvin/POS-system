@@ -84,6 +84,20 @@ object LocalProvisionTarget {
         }
 
         val rest = rawUrl.removePrefix("jdbc:postgresql://")
+
+        // pgJDBC accepts a comma-separated authority and fails over to the next
+        // host when the first is unreachable, so "localhost:5432,evil.example.test"
+        // would connect to a remote server while looking loopback-only. The
+        // authority must therefore name exactly one host.
+        val authority = rest.substringBefore('/').substringBefore('?')
+        if (authority.contains(',')) {
+            return Outcome.Rejected(
+                "multiple-hosts",
+                "Refusing to provision a local database: $URL_ENV names more than one host. " +
+                    "A single loopback host is required; the driver would otherwise fail over " +
+                    "to the other hosts.",
+            )
+        }
         val hostPort = rest.substringBefore('/').substringBefore('?')
         if (hostPort.isEmpty()) {
             return Outcome.Rejected("malformed-url", "Refusing to provision a local database: $URL_ENV has no host.")

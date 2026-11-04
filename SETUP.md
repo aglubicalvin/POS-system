@@ -142,6 +142,12 @@ one query parameter, `sslmode`, and it must be `verify-full`:
 - A second `sslmode` (for example `verify-full&sslmode=require`) is rejected;
   checking only the first occurrence would let the weaker value reach the driver.
 - Any other query parameter is rejected rather than ignored.
+- A comma-separated multi-host authority is rejected. pgJDBC fails over to the
+  next host when the first is unreachable, so `localhost:5432,elsewhere` would
+  connect to the second host while appearing to target the first.
+
+The same multi-host rule applies to `POS_LOCAL_DATABASE_URL`, which additionally
+accepts no query parameters at all.
 
 The provisioner does not pass the URL to the driver at all: it builds the
 connection from the validated host, port and database, then sets `sslmode` and

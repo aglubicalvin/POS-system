@@ -304,6 +304,14 @@ object ProvisionTarget {
                     "use $USER_ENV and $PASS_ENV instead."
         }
         val hostPort = rest.substringBefore('/').substringBefore('?')
+        // pgJDBC accepts comma-separated hosts and fails over to them, so a URL
+        // whose first host is a valid pooler could still connect elsewhere.
+        // Exactly one endpoint is allowed.
+        if (hostPort.contains(',')) {
+            return "multiple-hosts" to
+                "Refusing to provision: $URL_ENV names more than one host. Exactly one " +
+                    "Supabase pooler endpoint is required."
+        }
         if (hostPort.isEmpty() || !hostPort.contains('.')) {
             return "malformed-url" to
                 "Refusing to provision: $URL_ENV must name a fully qualified host."
@@ -391,6 +399,13 @@ object ProvisionTarget {
         }
 
         val sslModes = seen["sslmode"].orEmpty()
+        // Reject the two weaker modes by name here. They still fail the
+        // verify-full requirement below, but naming them makes the remedy clear.
+        if (sslModes.any { it == "verify-ca" }) {
+            return "tls-weak-sslmode" to
+                "Refusing to provision: sslmode=verify-ca validates the CA but not the " +
+                "hostname. sslmode=verify-full is required."
+        }
         if (sslModes.size > 1) {
             return "duplicate-sslmode" to
                 "Refusing to provision: $URL_ENV sets sslmode ${sslModes.size} times. " +

@@ -112,8 +112,9 @@ the credential is being sent to Supabase.
 The URL may set only `sslmode=verify-full`. SSL factories, hostname verifiers and
 URL-supplied root certificates (`sslfactory`, `sslhostnameverifier`,
 `sslrootcert`, ...) are rejected rather than stripped, duplicate `sslmode` values
-are rejected, and the connector is built from validated fields so no URL
-parameter can reach the driver.
+are rejected, a comma-separated multi-host authority is rejected (pgJDBC would
+fail over to the next host), and the connector is built from validated fields so
+no URL parameter can reach the driver.
 
 ```bash
 cd server
