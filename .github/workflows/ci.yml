@@ -2,7 +2,7 @@
 #
 # The repository previously had no build/test workflow: the only check on PRs was
 # Supabase Preview, which does not compile or test this code. This workflow runs
-# the checks that actually guard the provisioning work.
+# the checks that guard the provisioning work.
 #
 # It never connects to Supabase and applies no migrations: the Kotlin tests use an
 # embedded PostgreSQL, and the provisioning smoke tests run with configuration
@@ -57,34 +57,44 @@ jobs:
         working-directory: server
         run: ./gradlew --no-parallel -Dorg.gradle.jvmargs=-Xmx900m compileKotlin compileJava compileTestKotlin compileProbeState
 
-      - name: Server tests (no build cache, all tests executed)
+      - name: Server tests (no build cache, every test executed)
         working-directory: server
         run: ./gradlew --no-parallel -Dorg.gradle.jvmargs=-Xmx900m test --rerun-tasks --no-build-cache
 
+      # A Gradle JavaExec failure is reported by Gradle as its own status (1); the
+      # JVM's real exit code appears in the build output. Asserting only Gradle's
+      # status would either pass on any failure or fail on the documented exit 2,
+      # so these steps check BOTH the rejection marker and the JVM exit code.
       - name: Provisioning smoke test - missing confirmation is rejected before connecting
         working-directory: server
         env:
           # Every provisioning variable is deliberately empty: the task must reach
-          # its configuration validation, reject it, and exit 2 without a connection.
+          # its configuration validation, reject it, and exit 2 without connecting.
           PROVISION_CONFIRM: ''
           POS_DATABASE_URL: ''
           POS_DATABASE_USER: ''
           POS_EXPECTED_TARGET: ''
         run: |
           set -uo pipefail
-          # The probe runs as the condition of an if, so errexit does not abort
-          # before the status is inspected.
-          if ./gradlew --no-parallel --console=plain -q provisionDatabase; then
+          if OUTPUT=$(./gradlew --no-parallel --console=plain provisionDatabase 2>&1); then
             echo "::error::provisionDatabase succeeded without confirmation"
             exit 1
-          else
-            STATUS=$?
           fi
-          if [ "$STATUS" -ne 2 ]; then
-            echo "::error::expected exit 2 (configuration rejected), got $STATUS"
+          echo "$OUTPUT" | grep -q "PROVISION_REJECTED code=missing-confirmation" || {
+            echo "::error::provisionDatabase did not reach configuration validation"
+            echo "$OUTPUT" | tail -20
+            exit 1
+          }
+          echo "$OUTPUT" | grep -q "non-zero exit value 2" || {
+            echo "::error::expected the JVM to exit 2 (configuration rejected)"
+            echo "$OUTPUT" | tail -20
+            exit 1
+          }
+          if echo "$OUTPUT" | grep -q "database_identity="; then
+            echo "::error::provisionDatabase reached the connection stage"
             exit 1
           fi
-          echo "provisionDatabase rejected missing confirmation (exit 2)"
+          echo "provisionDatabase rejected missing confirmation before connecting (exit 2)"
 
       - name: Local provisioning smoke test - missing confirmation is rejected
         working-directory: server
@@ -94,17 +104,21 @@ jobs:
           POS_LOCAL_DATABASE_USER: ''
         run: |
           set -uo pipefail
-          if ./gradlew --no-parallel --console=plain -q provisionLocalDatabase; then
+          if OUTPUT=$(./gradlew --no-parallel --console=plain provisionLocalDatabase 2>&1); then
             echo "::error::provisionLocalDatabase succeeded without confirmation"
             exit 1
-          else
-            STATUS=$?
           fi
-          if [ "$STATUS" -ne 2 ]; then
-            echo "::error::expected exit 2 (configuration rejected), got $STATUS"
+          echo "$OUTPUT" | grep -q "LOCAL_PROVISION_REJECTED code=missing-confirmation" || {
+            echo "::error::provisionLocalDatabase did not reach configuration validation"
+            echo "$OUTPUT" | tail -20
             exit 1
-          fi
-          echo "provisionLocalDatabase rejected missing confirmation (exit 2)"
+          }
+          echo "$OUTPUT" | grep -q "non-zero exit value 2" || {
+            echo "::error::expected the JVM to exit 2 (configuration rejected)"
+            echo "$OUTPUT" | tail -20
+            exit 1
+          }
+          echo "provisionLocalDatabase rejected missing confirmation before connecting (exit 2)"
 
       - name: Whitespace check
         run: git diff --check HEAD^ 2>/dev/null || git diff --check
