@@ -17,7 +17,8 @@ import org.junit.jupiter.api.Test
 class CheckSchemaConfigTest {
 
     private val valid = mapOf(
-        "CHECK_URL" to "jdbc:postgresql://db.example.test:5432/postgres",
+        // A non-loopback target with verified TLS: the only remote shape accepted.
+        "CHECK_URL" to "jdbc:postgresql://db.example.test:5432/postgres?sslmode=verify-full",
         "CHECK_USER" to "checker",
         "CHECK_PASS" to "not-a-real-password",
     )
@@ -75,8 +76,58 @@ class CheckSchemaConfigTest {
         }
         // A non-credential query parameter is still allowed (resolves, no throw).
         CheckSchemaConfig.resolve(
-            valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres?sslmode=require"),
+            valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres?sslmode=verify-full"),
         )
+    }
+
+    @Test
+    fun `a remote target must verify TLS`() {
+        // CHECK_PASS travels to this target. Without verify-full the password is
+        // either sent unencrypted or sent to an unverified peer, so every weaker
+        // mode is refused before a connection exists.
+        for (query in listOf(
+            "",
+            "?sslmode=disable",
+            "?sslmode=allow",
+            "?sslmode=prefer",
+            "?sslmode=require",
+            "?sslmode=verify-ca",
+        )) {
+            assertEquals(
+                "tls-required",
+                rejected(valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test:5432/postgres$query")).code,
+                "query '$query'",
+            )
+        }
+
+        // A duplicate would let the first occurrence satisfy a check while the
+        // driver applied the last.
+        assertEquals(
+            "duplicate-sslmode",
+            rejected(
+                valid + ("CHECK_URL" to
+                    "jdbc:postgresql://db.example.test:5432/postgres?sslmode=verify-full&sslmode=disable"),
+            ).code,
+        )
+
+        // An unrecognised mode is a typo, not a policy change.
+        assertEquals(
+            "malformed-url",
+            rejected(valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres?sslmode=verify-maybe")).code,
+        )
+
+        // Remote with verified TLS is the accepted shape.
+        CheckSchemaConfig.resolve(
+            valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test:5432/postgres?sslmode=verify-full"),
+        )
+
+        // A loopback target has no network to intercept, so local development keeps
+        // the weaker modes.
+        for (query in listOf("", "?sslmode=disable", "?sslmode=require")) {
+            CheckSchemaConfig.resolve(
+                valid + ("CHECK_URL" to "jdbc:postgresql://127.0.0.1:5432/postgres$query"),
+            )
+        }
     }
 
     @Test
@@ -161,9 +212,10 @@ class CheckSchemaConfigTest {
     @Test
     fun `a single host authority is still accepted`() {
         for (url in listOf(
-            "jdbc:postgresql://db.example.test/postgres",
-            "jdbc:postgresql://db.example.test:5432/postgres",
-            "jdbc:postgresql://db.example.test:6543/postgres?sslmode=require",
+            "jdbc:postgresql://db.example.test/postgres?sslmode=verify-full",
+            "jdbc:postgresql://db.example.test:5432/postgres?sslmode=verify-full",
+            "jdbc:postgresql://db.example.test:6543/postgres?sslmode=verify-full&",
+            "jdbc:postgresql://127.0.0.1:6543/postgres?sslmode=disable",
         )) {
             assertEquals("checker", CheckSchemaConfig.resolve(valid + ("CHECK_URL" to url)).user, url)
         }

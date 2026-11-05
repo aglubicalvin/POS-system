@@ -12,6 +12,9 @@ import java.util.Map;
  *                          Only the 'sslmode' query parameter is accepted: the URL
  *                          reaches pgJDBC unchanged, and a query parameter such as
  *                          ?host= would replace the authority validated here.
+ *                          A non-loopback host must set sslmode=verify-full: this
+ *                          tool sends CHECK_PASS, and weaker modes would either
+ *                          omit TLS or skip verifying the server.
  *   CHECK_USER             required; never inferred from the URL
  *   CHECK_PASS             required unless CHECK_PASS_ALLOW_EMPTY=yes is explicitly
  *                          set (local trust/peer auth on a development machine).
@@ -38,6 +41,10 @@ public final class CheckSchemaConfig {
      * the new parameter to escape the validated authority.
      */
     private static final java.util.Set<String> ALLOWED_QUERY_PARAMS = java.util.Set.of("sslmode");
+
+    /** The sslmode values pgJDBC understands; anything else is a typo, not a setting. */
+    private static final java.util.Set<String> KNOWN_SSL_MODES = java.util.Set.of(
+        "disable", "allow", "prefer", "require", "verify-ca", "verify-full");
 
     private CheckSchemaConfig() {}
 
@@ -86,6 +93,7 @@ public final class CheckSchemaConfig {
         // CHECK_PASS contract entirely and put a secret into a value that can end up
         // in driver diagnostics. Refuse them as a URL parameter, exactly as for
         // userinfo.
+        java.util.List<String> sslModes = new java.util.ArrayList<>();
         int queryStart = rest.indexOf('?');
         if (queryStart >= 0) {
             String query = rest.substring(queryStart + 1);
@@ -106,6 +114,11 @@ public final class CheckSchemaConfig {
                             "parameters; only 'sslmode' is accepted, because the host, port and " +
                             "database are validated from the URL authority.");
                 }
+                // sslmode is the one parameter allowed through, so it is the one whose
+                // value must be judged. It is collected here and validated below, once
+                // the host is known.
+                String[] pair = parameter.split("=", 2);
+                sslModes.add(pair.length == 2 ? pair[1].trim().toLowerCase() : "");
             }
         }
         // pgJDBC reads a comma as a host-list separator and connects to each
@@ -139,12 +152,38 @@ public final class CheckSchemaConfig {
         if (!hostPort.contains(".")) {
             throw new Rejected("malformed-url", "REFUSED: CHECK_URL must name a fully qualified host.");
         }
+        String host = hostPort.split(":", 2)[0].toLowerCase();
         int colon = hostPort.indexOf(':');
         if (colon >= 0) {
             int port = Integer.parseInt(hostPort.substring(colon + 1));
             if (port < 1 || port > 65535) {
                 throw new Rejected("malformed-url", "REFUSED: CHECK_URL names a port outside 1-65535.");
             }
+        }
+        // A duplicate would make the effective mode depend on which occurrence a
+        // parser read, so the TLS rule below could be satisfied by the first one
+        // while pgJDBC applied the last.
+        if (sslModes.size() > 1) {
+            throw new Rejected("duplicate-sslmode",
+                "REFUSED: CHECK_URL sets sslmode more than once; the effective value must be " +
+                    "unambiguous.");
+        }
+        String sslMode = sslModes.isEmpty() ? null : sslModes.get(0);
+        if (sslMode != null && !KNOWN_SSL_MODES.contains(sslmodeCanonical(sslMode))) {
+            throw new Rejected("malformed-url", "REFUSED: CHECK_URL sets an unrecognised sslmode value.");
+        }
+        boolean loopback = host.equals("localhost") || host.equals("::1") || host.startsWith("127.");
+        // This tool authenticates with CHECK_USER / CHECK_PASS. Over a network those
+        // credentials need both encryption and a verified server: sslmode=disable
+        // sends them in clear, and sslmode=require (or prefer/allow) encrypts without
+        // checking the certificate, so an on-path attacker can collect them or
+        // impersonate the database. Only a loopback target, where there is no network
+        // to intercept, may use a weaker mode.
+        if (!loopback && !"verify-full".equals(sslMode)) {
+            throw new Rejected("tls-required",
+                "REFUSED: a non-loopback CHECK_URL must set sslmode=verify-full. Weaker modes " +
+                    "either send the credentials without TLS or encrypt without verifying the " +
+                    "server; they are accepted only for a loopback target.");
         }
         try {
             URI uri = new URI(url.substring("jdbc:".length()));
@@ -188,6 +227,11 @@ public final class CheckSchemaConfig {
         if (config.expectedDatabase != null && !config.expectedDatabase.equals(actualDatabase)) {
             throw new Rejected("identity-mismatch", "REFUSED: connected database is not CHECK_EXPECTED_DATABASE.");
         }
+    }
+
+    /** pgJDBC treats sslmode values case-insensitively and tolerates whitespace. */
+    private static String sslmodeCanonical(String value) {
+        return value == null ? "" : value.trim().toLowerCase();
     }
 
     private static String blankToNull(String value) {
