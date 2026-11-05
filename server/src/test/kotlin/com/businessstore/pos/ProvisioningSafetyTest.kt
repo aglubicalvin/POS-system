@@ -514,6 +514,29 @@ class ProvisioningSafetyTest {
     }
 
     @Test
+    fun `a root file carrying an extra certificate is rejected`() {
+        // pgJDBC trusts EVERY certificate in sslrootcert. Hashing only the first one
+        // would accept a file whose pinned root is followed by another CA, letting
+        // that CA issue a certificate for the pooler hostname while the digest of
+        // the pinned root still matched.
+        assertEquals(
+            "multiple-root-certificates",
+            rejected(
+                remoteEnv(
+                    cert = TestCertificate.pathWithExtraCa,
+                    fingerprint = TestCertificate.sha256,
+                ),
+            ).code,
+        )
+        // The single-certificate file is still accepted, so the rejection is about
+        // the extra certificate rather than the file being unreadable.
+        assertTrue(
+            ProvisionTarget.resolve(remoteEnv()) is ProvisionTarget.Outcome.Ok,
+            "one pinned root must still be accepted",
+        )
+    }
+
+    @Test
     fun `a file that is not a certificate is rejected`() {
         val bogus = java.io.File.createTempFile("not-a-cert", ".crt")
         bogus.deleteOnExit()

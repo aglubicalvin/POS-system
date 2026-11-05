@@ -25,8 +25,11 @@ here is stubbed or faked in code — it is simply absent.
   18.6 via embedded Postgres, which is a real PostgreSQL binary — but it has never
   run against a managed instance, with no connection-string management, TLS to
   the database, backups, or a tested restore.
-- **No versioned migrations.** `Schema.apply` runs the DDL with
-  `CREATE TABLE IF NOT EXISTS` at startup. That is fine for a first deploy and
+- **No versioned migrations.** Schema creation is explicit, never implicit:
+  `./gradlew provisionDatabase` validates its target before connecting, then
+  applies `schema.sql` (`CREATE TABLE IF NOT EXISTS`) and records `0000` in one
+  transaction. Normal startup only verifies that `0000` exists and fails closed
+  otherwise. `CREATE TABLE IF NOT EXISTS` is still fine for a first deploy and
   useless for evolving a live schema; a real migration tool should replace it.
 - **No rate limiting or request size caps** on `/sync`.
 - **Enrollment secret is a shared string**, not per-admin identity. Reasonable

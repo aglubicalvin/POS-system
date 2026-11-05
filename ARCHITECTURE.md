@@ -90,7 +90,7 @@ sanctioned writer of that flag), denial clears it.
 
 - Server: plain SQL with explicit transactions (no ORM) because the idempotency
   claim and stock upsert depend on exact `ON CONFLICT` semantics.
-- `Schema.apply` runs the canonical DDL at startup and records `0000`.
+- Startup never writes schema: it calls `SchemaVerifier.requireProvisioned` and fails closed when baseline `0000` is absent. `Schema.apply` (the canonical DDL plus the `0000` history row, in one transaction) is reachable only through the explicit `./gradlew provisionDatabase` task, which validates its target before connecting.
 - Migrations 0001–0009 layer the admin surface on top; each file is applied in
   one transaction and recorded in `supabase_migrations.schema_migrations`.
 - Sync writes go through `EventApplier` only; every event is claimed by unique

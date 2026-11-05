@@ -302,9 +302,17 @@ object ProvisionTarget {
                 "Refusing to provision: $ROOT_CERT_SHA256_ENV must be a 64-character hex SHA-256 digest.",
             )
         }
-        val actualFingerprint = sha256OfCertificateFile(certFile)
-        if (actualFingerprint == null) {
-            return Outcome.Rejected(
+        val actualFingerprint = when (val root = readRootCertificate(certFile)) {
+            is RootCertificate.Pinned -> root.sha256
+            // verify-full trusts EVERY certificate in this file, so hashing only the
+            // first one would accept a root whose file also carries another CA.
+            RootCertificate.MoreThanOne -> return Outcome.Rejected(
+                "multiple-root-certificates",
+                "Refusing to provision: $ROOT_CERT_ENV contains more than one certificate. " +
+                    "The driver trusts every certificate in the file, so exactly one root -- " +
+                    "the one matching $ROOT_CERT_SHA256_ENV -- is accepted.",
+            )
+            RootCertificate.Unparseable -> return Outcome.Rejected(
                 "malformed-root-certificate",
                 "Refusing to provision: $ROOT_CERT_ENV is not a readable PEM certificate.",
             )
@@ -458,25 +466,52 @@ object ProvisionTarget {
     }
 
     /**
-     * SHA-256 of the DER encoding of the FIRST certificate in a PEM file, or null
-     * when the file is not a parseable X.509 certificate.
+     * What a root-certificate file turned out to contain.
+     *
+     * Exactly one certificate is the only acceptable shape. pgJDBC trusts EVERY
+     * certificate in `sslrootcert`, so a file whose first certificate matches the
+     * expected fingerprint and whose second is another CA would pass a
+     * first-certificate-only digest check while letting that CA issue the
+     * certificate for the pooler hostname. Counting the certificates is therefore
+     * part of pinning, not a cosmetic check.
+     */
+    internal sealed class RootCertificate {
+        data class Pinned(val sha256: String) : RootCertificate()
+        object MoreThanOne : RootCertificate()
+        object Unparseable : RootCertificate()
+    }
+
+    /** Parse every certificate in the file and classify what it holds. */
+    internal fun readRootCertificate(file: java.io.File): RootCertificate = try {
+        val certificates = file.inputStream().use { input ->
+            java.security.cert.CertificateFactory.getInstance("X.509")
+                .generateCertificates(input)
+        }
+        when {
+            certificates.isEmpty() -> RootCertificate.Unparseable
+            certificates.size > 1 -> RootCertificate.MoreThanOne
+            else -> RootCertificate.Pinned(sha256Of(certificates.first()))
+        }
+    } catch (error: java.security.cert.CertificateException) {
+        RootCertificate.Unparseable
+    } catch (error: java.io.IOException) {
+        RootCertificate.Unparseable
+    }
+
+    /**
+     * SHA-256 of the DER encoding of the single certificate in a PEM file, or null
+     * when the file is not exactly one parseable X.509 certificate.
      *
      * The JDK's CertificateFactory parses the PEM, so the digest covers the
      * certificate itself rather than the file's whitespace or line endings.
      */
-    internal fun sha256OfCertificateFile(file: java.io.File): String? = try {
-        val certificate = file.inputStream().use { input ->
-            java.security.cert.CertificateFactory.getInstance("X.509")
-                .generateCertificate(input)
-        } ?: return null
+    internal fun sha256OfCertificateFile(file: java.io.File): String? =
+        (readRootCertificate(file) as? RootCertificate.Pinned)?.sha256
+
+    private fun sha256Of(certificate: java.security.cert.Certificate): String =
         java.security.MessageDigest.getInstance("SHA-256")
             .digest(certificate.encoded)
             .joinToString("") { "%02x".format(it) }
-    } catch (error: java.security.cert.CertificateException) {
-        null
-    } catch (error: java.io.IOException) {
-        null
-    }
 
     /** host[:port] of the URL, empty when it cannot be parsed. */
     private fun endpointOf(raw: String): Pair<String, Int>? {

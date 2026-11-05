@@ -25,12 +25,44 @@ object TestCertificate {
     /** Lowercase hex SHA-256 of the certificate's DER encoding. */
     val sha256: String get() = generated.second
 
+    /**
+     * A PEM file holding the pinned root FOLLOWED BY a second, unrelated CA.
+     *
+     * pgJDBC trusts every certificate in `sslrootcert`, so this is the shape that
+     * a first-certificate-only fingerprint check would wave through: the digest of
+     * the first block still matches while the second CA can issue the pooler's
+     * certificate.
+     */
+    val pathWithExtraCa: String by lazy {
+        val combined = java.io.File(tempDir("fake-root-multi"), "two-certs.crt")
+        combined.deleteOnExit()
+        val extra = createCertificate("extraca", "CN=extra-ca", tempDir("fake-extra-ca"))
+        extra.deleteOnExit()
+        combined.writeText(
+            java.io.File(generated.first).readText() + "\n" + extra.readText(),
+        )
+        combined.absolutePath
+    }
+
     private fun generate(): Pair<String, String> {
-        val dir = java.nio.file.Files.createTempDirectory("fake-root").toFile()
-        dir.deleteOnExit()
+        val certOut = createCertificate("testroot", "CN=fake-root", tempDir("fake-root"))
+        val fingerprint = requireNotNull(ProvisionTarget.sha256OfCertificateFile(certOut)) {
+            "the generated certificate could not be fingerprinted"
+        }
+        certOut.deleteOnExit()
+        return certOut.absolutePath to fingerprint
+    }
+
+    /** Generate one self-signed certificate and export it as PEM. */
+    private fun createCertificate(
+        alias: String,
+        distinguishedName: String,
+        dir: java.io.File,
+    ): java.io.File {
         val keytool = resolveKeytool()
-        val keystore = java.io.File(dir, "ks.p12")
-        val certOut = java.io.File(dir, "root.crt")
+        val keystore = java.io.File(dir, "$alias.p12")
+        val certOut = java.io.File(dir, "$alias.crt")
+        keystore.deleteOnExit()
 
         fun run(vararg args: String) {
             val process = ProcessBuilder(listOf(keytool) + args)
@@ -41,23 +73,20 @@ object TestCertificate {
         }
 
         run(
-            "-genkeypair", "-alias", "testroot", "-keyalg", "RSA", "-keysize", "2048",
-            "-dname", "CN=fake-root", "-validity", "1",
+            "-genkeypair", "-alias", alias, "-keyalg", "RSA", "-keysize", "2048",
+            "-dname", distinguishedName, "-validity", "1",
             "-keystore", keystore.absolutePath, "-storepass", "changeit", "-storetype", "PKCS12",
         )
         run(
-            "-exportcert", "-rfc", "-alias", "testroot",
+            "-exportcert", "-rfc", "-alias", alias,
             "-keystore", keystore.absolutePath, "-storepass", "changeit",
             "-file", certOut.absolutePath,
         )
-
-        val fingerprint = requireNotNull(ProvisionTarget.sha256OfCertificateFile(certOut)) {
-            "the generated certificate could not be fingerprinted"
-        }
-        certOut.deleteOnExit()
-        keystore.deleteOnExit()
-        return certOut.absolutePath to fingerprint
+        return certOut
     }
+
+    private fun tempDir(prefix: String): java.io.File =
+        java.nio.file.Files.createTempDirectory(prefix).toFile().also { it.deleteOnExit() }
 
     /** keytool next to the running JDK, falling back to PATH. */
     private fun resolveKeytool(): String {

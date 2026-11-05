@@ -80,6 +80,39 @@ class CheckSchemaConfigTest {
     }
 
     @Test
+    fun `connection target overrides in url query parameters are rejected`() {
+        // CheckSchema hands the raw URL to pgJDBC, which lets a query parameter
+        // replace the authority. Validating the host and then forwarding ?host=...
+        // would send CHECK_USER / CHECK_PASS to an unchecked host.
+        for (query in listOf(
+            "?host=attacker.example.test",
+            "?HOST=attacker.example.test",
+            "?port=6543",
+            "?database=other",
+            "?dbname=other",
+            "?socketFactory=com.example.SocketFactory",
+            "?sslfactory=org.postgresql.ssl.NonValidatingFactory",
+            "?sslhostnameverifier=com.example.AnyVerifier",
+            "?sslmode=require&host=attacker.example.test",
+        )) {
+            assertEquals(
+                "unsupported-query-parameter",
+                rejected(valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres$query")).code,
+                query,
+            )
+        }
+    }
+
+    @Test
+    fun `a rejected query parameter is neither echoed nor allowed to carry a value`() {
+        val message = rejected(
+            valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test/postgres?host=attacker.example.test"),
+        ).message!!
+        assertFalse(message.contains("attacker.example.test"), "message leaked the value: $message")
+        assertFalse(message.contains("db.example.test"), "message leaked the host: $message")
+    }
+
+    @Test
     fun `missing username is rejected`() {
         assertEquals("missing-user", rejected(valid - "CHECK_USER").code)
         assertEquals("missing-user", rejected(valid + ("CHECK_USER" to "  ")).code)

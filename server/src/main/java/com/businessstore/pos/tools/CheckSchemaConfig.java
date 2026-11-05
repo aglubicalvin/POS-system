@@ -8,7 +8,10 @@ import java.util.Map;
  * it can be unit-tested without opening a connection.
  *
  * Policy (no defaults, nothing implicit):
- *   CHECK_URL              required; must be jdbc:postgresql://host[:port]/database
+ *   CHECK_URL              required; must be jdbc:postgresql://host[:port]/database.
+ *                          Only the 'sslmode' query parameter is accepted: the URL
+ *                          reaches pgJDBC unchanged, and a query parameter such as
+ *                          ?host= would replace the authority validated here.
  *   CHECK_USER             required; never inferred from the URL
  *   CHECK_PASS             required unless CHECK_PASS_ALLOW_EMPTY=yes is explicitly
  *                          set (local trust/peer auth on a development machine).
@@ -21,6 +24,20 @@ import java.util.Map;
  * No value is ever echoed: a JDBC URL can carry a password in its userinfo.
  */
 public final class CheckSchemaConfig {
+
+    /**
+     * The only query parameter CheckSchema accepts.
+     *
+     * CheckSchema passes the raw URL to pgJDBC, and the driver lets a query
+     * parameter REPLACE the authority it was given: `?host=example.test` would send
+     * CHECK_USER and CHECK_PASS to a host this validator never checked. So anything
+     * that can retarget the connection (host, port, database, servers) or replace
+     * its TLS configuration (sslfactory, sslhostnameverifier, sslrootcert, socket
+     * factories) is refused rather than forwarded. This list is short on purpose:
+     * widening it needs a documented reason and a test that the driver cannot use
+     * the new parameter to escape the validated authority.
+     */
+    private static final java.util.Set<String> ALLOWED_QUERY_PARAMS = java.util.Set.of("sslmode");
 
     private CheckSchemaConfig() {}
 
@@ -78,6 +95,16 @@ public final class CheckSchemaConfig {
                     throw new Rejected("credentials-in-url",
                         "REFUSED: CHECK_URL must not carry credentials in its query parameters; " +
                             "use CHECK_USER and CHECK_PASS.");
+                }
+                // The URL is not rebuilt from the validated parts: it is handed to
+                // the driver, so a parameter pgJDBC honours would win over the
+                // authority validated above. The name is not echoed -- it can carry
+                // arbitrary caller text.
+                if (!ALLOWED_QUERY_PARAMS.contains(name)) {
+                    throw new Rejected("unsupported-query-parameter",
+                        "REFUSED: CHECK_URL must not carry connection overrides in its query " +
+                            "parameters; only 'sslmode' is accepted, because the host, port and " +
+                            "database are validated from the URL authority.");
                 }
             }
         }
