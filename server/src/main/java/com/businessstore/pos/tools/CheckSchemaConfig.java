@@ -108,13 +108,43 @@ public final class CheckSchemaConfig {
                 }
             }
         }
+        // pgJDBC reads a comma as a host-list separator and connects to each
+        // endpoint in turn, so "db.example.test:5432,attacker.example.test:5432"
+        // fails over to a server this validator never approved -- CHECK_USER and
+        // CHECK_PASS would be offered to it before verifyIdentity can run. No
+        // supported URL needs a comma, so one is refused before the driver sees the
+        // string at all; validating only the first host would leave the rest of the
+        // list trusted.
+        if (rest.indexOf(',') >= 0) {
+            throw new Rejected("multiple-hosts",
+                "REFUSED: CHECK_URL must name exactly one host. pgJDBC treats a comma as " +
+                    "a failover list, so the driver could otherwise connect to an endpoint " +
+                    "that was never validated. Use a single-host URL.");
+        }
         int slash = rest.indexOf('/');
         if (slash <= 0 || slash == rest.length() - 1) {
             throw new Rejected("malformed-url", "REFUSED: CHECK_URL must name a host and a database.");
         }
         String hostPort = rest.substring(0, slash).split("\\?", 2)[0];
-        if (hostPort.isEmpty() || !hostPort.contains(".")) {
+        // Exactly one host, at most one numeric port. Anything else is refused
+        // rather than interpreted: whitespace, a second colon (which would be a
+        // port list), IPv6 brackets, or a percent-encoded separator all describe an
+        // authority this tool cannot reason about by inspection, and guessing is how
+        // a client ends up somewhere it never validated.
+        if (!hostPort.matches("[A-Za-z0-9.\\-]+(:[0-9]{1,5})?")) {
+            throw new Rejected("malformed-url",
+                "REFUSED: CHECK_URL must be jdbc:postgresql://<host>[:port]/<database> with " +
+                    "one host, an optional numeric port, and no extra characters in the host.");
+        }
+        if (!hostPort.contains(".")) {
             throw new Rejected("malformed-url", "REFUSED: CHECK_URL must name a fully qualified host.");
+        }
+        int colon = hostPort.indexOf(':');
+        if (colon >= 0) {
+            int port = Integer.parseInt(hostPort.substring(colon + 1));
+            if (port < 1 || port > 65535) {
+                throw new Rejected("malformed-url", "REFUSED: CHECK_URL names a port outside 1-65535.");
+            }
         }
         try {
             URI uri = new URI(url.substring("jdbc:".length()));

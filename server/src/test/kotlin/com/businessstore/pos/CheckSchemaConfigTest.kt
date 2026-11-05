@@ -113,6 +113,72 @@ class CheckSchemaConfigTest {
     }
 
     @Test
+    fun `multi host authorities are rejected`() {
+        // pgJDBC reads a comma as a failover list and tries each endpoint, so a
+        // first host that passes validation says nothing about the others. Every
+        // comma-bearing authority is refused instead of being partially checked.
+        for (authority in listOf(
+            "db.example.test:5432,attacker.example.test:5432",
+            "127.0.0.1:5432,attacker.example.test:5432",
+            "db.example.test:5432,other.example.test:6543",
+            "DB.EXAMPLE.TEST:5432,ATTACKER.EXAMPLE.TEST:5432",
+            "db.example.test:5432, attacker.example.test:5432",
+            "db.example.test:5432,",
+            ",db.example.test:5432",
+            "db.example.test,attacker.example.test",
+        )) {
+            assertEquals(
+                "multiple-hosts",
+                rejected(valid + ("CHECK_URL" to "jdbc:postgresql://$authority/postgres")).code,
+                authority,
+            )
+        }
+    }
+
+    @Test
+    fun `ambiguous or encoded authorities are rejected rather than guessed`() {
+        // A second colon is a port list, whitespace hides a second endpoint, and a
+        // percent-encoded byte is an authority this tool cannot reason about by
+        // inspection. None of them is interpreted.
+        for (authority in listOf(
+            "db.example.test:5432:6543",
+            "db.example.test :5432",
+            "db.example.test\t:5432",
+            "db.example.test%2Cattacker.example.test",
+            "db%2Eexample%2Etest:5432",
+            "db.example.test:70000",
+            "db.example.test:0",
+            "[::1]:5432",
+        )) {
+            assertEquals(
+                "malformed-url",
+                rejected(valid + ("CHECK_URL" to "jdbc:postgresql://$authority/postgres")).code,
+                authority,
+            )
+        }
+    }
+
+    @Test
+    fun `a single host authority is still accepted`() {
+        for (url in listOf(
+            "jdbc:postgresql://db.example.test/postgres",
+            "jdbc:postgresql://db.example.test:5432/postgres",
+            "jdbc:postgresql://db.example.test:6543/postgres?sslmode=require",
+        )) {
+            assertEquals("checker", CheckSchemaConfig.resolve(valid + ("CHECK_URL" to url)).user, url)
+        }
+    }
+
+    @Test
+    fun `a host list rejection never echoes the hosts`() {
+        val message = rejected(
+            valid + ("CHECK_URL" to "jdbc:postgresql://db.example.test:5432,attacker.example.test:5432/postgres"),
+        ).message!!
+        assertFalse(message.contains("attacker.example.test"), "message leaked the host: $message")
+        assertFalse(message.contains("db.example.test"), "message leaked the host: $message")
+    }
+
+    @Test
     fun `missing username is rejected`() {
         assertEquals("missing-user", rejected(valid - "CHECK_USER").code)
         assertEquals("missing-user", rejected(valid + ("CHECK_USER" to "  ")).code)
