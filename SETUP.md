@@ -74,18 +74,110 @@ Public values only. The service-role key must never appear here.
 
 ## 6. Database setup
 
-Local PostgreSQL:
+There are two **separate** provisioning paths. Both create the canonical baseline
+and record version `0000`; neither applies migrations `0001`-`0009`. Normal server
+startup never creates schema — it only verifies the baseline exists and refuses to
+start without it, so `psql ... -f schema.sql` on its own is no longer enough
+(the tables appear but `0000` is never recorded).
+
+### Local PostgreSQL (loopback only)
 
 ```bash
 createdb business_store
-psql business_store -f server/src/main/resources/db/schema.sql   # canonical (0000)
+cd server
+LOCAL_PROVISION_CONFIRM=yes \
+POS_LOCAL_DATABASE_URL='jdbc:postgresql://localhost:5432/business_store' \
+POS_LOCAL_DATABASE_USER='business_store' \
+POS_LOCAL_DATABASE_PASS='' \
+./gradlew provisionLocalDatabase
 ```
 
-Supabase project (dev/verify):
+`provisionLocalDatabase` requires `LOCAL_PROVISION_CONFIRM=yes` (exactly), accepts
+only a loopback host (`localhost`, `127.0.0.1`, `::1`) and refuses a remote host
+before opening a connection. An empty password is allowed for local trust/peer
+auth. It does **not** require a Supabase project reference.
+
+### Supabase project (staging/dev) — separate path
+
+```bash
+cd server
+PROVISION_CONFIRM=yes \
+POS_DATABASE_URL='jdbc:postgresql://aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=verify-full' \
+POS_DATABASE_USER='postgres.<project-ref>' \
+POS_DATABASE_PASS='<secret, never logged>' \
+POS_EXPECTED_TARGET='<same 20-char project-ref>' \
+POS_DATABASE_ROOT_CERT='./prod-ca-2021.crt' \
+POS_DATABASE_ROOT_CERT_SHA256='<64-hex SHA-256 of that certificate>' \
+./gradlew provisionDatabase
+```
+
+Download `prod-ca-2021.crt` from the Dashboard (**Database Settings -> SSL
+Configuration**); it is the root the driver pins.
+
+`POS_DATABASE_ROOT_CERT_SHA256` is **required** and must be obtained from a source
+other than the file itself (the value published with the release notes, or
+recorded when the certificate was first downloaded). Checking only that the file
+exists and is readable would accept *any* CA the caller names, and `verify-full`
+would then merely prove the peer chains to that file. The provisioner computes
+the SHA-256 of the certificate's DER encoding and rejects a mismatch:
+`missing-root-certificate-fingerprint`, `malformed-root-certificate-fingerprint`,
+`malformed-root-certificate` or `root-certificate-mismatch`.
+
+`provisionDatabase` requires `PROVISION_CONFIRM=yes`, a **Supabase pooler** host
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a readable
+`POS_DATABASE_ROOT_CERT` matching `POS_DATABASE_ROOT_CERT_SHA256`, a pooler login
+`postgres.<project-ref>` matching `POS_EXPECTED_TARGET`, and
+**`sslmode=verify-full`**.
+
+### What is actually verified
+
+| sslmode | Encrypted | Certificate chain | Hostname | Accepted here |
+|---|---|---|---|---|
+| `disable` / unset / `require` | yes / no | no | no | **no** |
+| `verify-ca` | yes | yes | no | **no** |
+| `verify-full` + pinned root cert | yes | yes | yes | **yes** |
+
+`require` encrypts but accepts *any* certificate -- a man-in-the-middle could
+present its own and collect the administrator credential. `verify-ca` checks the
+chain but not the hostname. Only `verify-full` verifies both, and pinning
+`prod-ca-2021.crt` means the chain must come from Supabase rather than any
+publicly-trusted CA.
+
+The URL cannot be used to undo any of this. `POS_DATABASE_URL` accepts exactly
+one query parameter, `sslmode`, and it must be `verify-full`:
+
+- `sslfactory`, `sslfactoryarg`, `sslhostnameverifier`, `sslrootcert`, `sslcert`,
+  `sslkey`, `socketfactory` and similar keys are **rejected**, not stripped. In
+  particular `sslfactory=org.postgresql.ssl.NonValidatingFactory` would install a
+  trust-all TrustManager and silently defeat `verify-full`.
+- A second `sslmode` (for example `verify-full&sslmode=require`) is rejected;
+  checking only the first occurrence would let the weaker value reach the driver.
+- Any other query parameter is rejected rather than ignored.
+- A comma-separated multi-host authority is rejected. pgJDBC fails over to the
+  next host when the first is unreachable, so `localhost:5432,elsewhere` would
+  connect to the second host while appearing to target the first.
+
+The same multi-host rule applies to `POS_LOCAL_DATABASE_URL`, which additionally
+accepts no query parameters at all.
+
+The provisioner does not pass the URL to the driver at all: it builds the
+connection from the validated host, port and database, then sets `sslmode` and
+`sslrootcert` explicitly, leaving pgJDBC's validating default SSL factory in
+place. The configured certificate must also be **readable** by the process, not
+merely present.
+
+Behind a shared pooler, `current_user` and `inet_server_addr()`/`inet_server_port()`
+are only partly informative: the pooler does not necessarily expose the original
+login, and `inet_server_port()` reports the port **the server accepted on**, not
+the client-facing endpoint. Provisioning therefore treats TLS as the identity
+guarantee and reports `database_identity=confirmed_by_tls_and_expected_target`
+when the session does not expose a project suffix. The project identity is
+ultimately the operator's `POS_EXPECTED_TARGET` assertion, backed by verified TLS.
+
+To apply migrations `0001`-`0009` afterwards (deliberate, separate step):
 
 ```bash
 supabase projects list
-supabase db query --project-ref <ref> --linked --file server/src/main/resources/db/schema.sql
 for f in 0001_admin_foundation 0002_product_management 0003_dashboard_aggregation_and_authz \
          0004_rpc_search_path_hardening 0005_customers_payroll_hirepurchase \
          0006_phase43_workflows 0007_mobile_money_reconciliation \

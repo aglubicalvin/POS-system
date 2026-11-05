@@ -11,3 +11,6 @@ server/build/
 server/.gradle/
 .gradle/
 build/
+
+# Kotlin build artifact directory (not source)
+server/.kotlin/

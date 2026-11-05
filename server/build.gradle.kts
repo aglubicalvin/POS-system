@@ -85,7 +85,11 @@ val compileProbeState = tasks.register<JavaCompile>("compileProbeState") {
     group = "verification"
     description = "Compile the standalone read-only ProbeState audit tool."
     source(probeStateSourceSet.java.srcDirs)
-    classpath = sourceSets.main.get().runtimeClasspath
+    // The probe tools reference classes in the main source set (CheckSchema uses
+    // com.businessstore.pos.tools.CheckSchemaConfig), so the main output must be
+    // on the compile classpath, not only the runtime dependencies.
+    dependsOn(tasks.named("classes"))
+    classpath = files(sourceSets.main.get().output) + sourceSets.main.get().runtimeClasspath
     destinationDirectory.set(layout.buildDirectory.dir("classes/java/probeState"))
     sourceCompatibility = JavaVersion.VERSION_21.toString()
     targetCompatibility = JavaVersion.VERSION_21.toString()
@@ -93,14 +97,61 @@ val compileProbeState = tasks.register<JavaCompile>("compileProbeState") {
 }
 
 /**
- * Explicit schema provisioning. Normal startup never writes schema; this task
- * does, so it requires PROVISION_CONFIRM=yes and an explicit POS_DATABASE_URL.
- * There is no default target in the task or in the code it runs.
+ * Explicit schema provisioning â€” the ONLY task that writes schema.
+ *
+ * Normal server startup never writes schema: `Application.main` calls
+ * `SchemaVerifier.requireProvisioned` (SELECTs only) and fails with an actionable
+ * message when the baseline is absent. This task is the deliberate, separate
+ * step that creates it.
+ *
+ * Everything is supplied by the environment; nothing has a default, and the
+ * process refuses before opening a connection when anything is missing:
+ *   PROVISION_CONFIRM=yes        exact confirmation, no other value proceeds
+ *   POS_DATABASE_URL             jdbc:postgresql://<host>:<port>/<db>
+ *   POS_DATABASE_USER            pooler administrator, postgres.<project-ref>
+ *   POS_DATABASE_PASS            role password (optional; never logged)
+ *   POS_EXPECTED_TARGET          20-char project ref the URL must resolve to
+ *
+ * The run applies the baseline and records version 0000 in ONE transaction, then
+ * re-reads the baseline to verify it. Migrations 0001-0009 are NOT applied here;
+ * they remain a separate step.
  */
 tasks.register<JavaExec>("provisionDatabase") {
     group = "database"
-    description = "Create the canonical POS schema on an explicitly confirmed, disposable database."
-    mainClass.set("com.businessstore.pos.tools.ProvisionKt")
+    description = "Provision the baseline schema (version 0000) on an explicitly confirmed remote/Supabase target."
+    // Entry point verified with `javap`: @JvmStatic main() inside `object Provision`
+    // compiles to com.businessstore.pos.tools.Provision with a static main(String[]).
+    // It does NOT generate ProvisionKt (that requires a top-level Kotlin function),
+    // so this class name is the real JVM entry point, not a guess.
+    mainClass.set("com.businessstore.pos.tools.Provision")
+    // `classes` pulls in compileJava/compileKotlin AND processResources, so
+    // /db/schema.sql is on the runtime classpath even from a clean checkout.
+    // Depending on compileKotlin alone left processResources unrun.
+    dependsOn(tasks.named("classes"))
+    classpath = sourceSets.main.get().runtimeClasspath
+}
+
+/**
+ * Explicit LOCAL baseline provisioning â€” the developer-laptop counterpart to
+ * `provisionDatabase`, kept strictly separate from it.
+ *
+ * The remote task requires a Supabase pooler login and a project reference, which
+ * a laptop does not have; the local task requires loopback and an explicit local
+ * confirmation, which a remote target can never satisfy. Both finish with the same
+ * transactional Schema.apply and neither applies migrations 0001-0009.
+ *
+ *   LOCAL_PROVISION_CONFIRM=yes     exact confirmation
+ *   POS_LOCAL_DATABASE_URL          jdbc:postgresql://localhost:5432/business_store
+ *   POS_LOCAL_DATABASE_USER         the local role (e.g. business_store)
+ *   POS_LOCAL_DATABASE_PASS         optional, never logged
+ */
+tasks.register<JavaExec>("provisionLocalDatabase") {
+    group = "database"
+    description = "Provision the baseline schema (version 0000) on an explicitly confirmed loopback database."
+    // Verified with javap: @JvmStatic main() in `object ProvisionLocal` compiles
+    // to the ProvisionLocal class, not ProvisionLocalKt.
+    mainClass.set("com.businessstore.pos.tools.ProvisionLocal")
+    dependsOn(tasks.named("classes"))
     classpath = sourceSets.main.get().runtimeClasspath
 }
 

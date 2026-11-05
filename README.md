@@ -88,8 +88,98 @@ cd admin-mobile && npm install && npm start
 
 ## Database setup
 
-The canonical schema ships with the server and is applied at startup (`0000
-baseline_schema`). The admin surface is migrations `0001`–`0009`:
+Provisioning and startup are **separate** operations, by design.
+
+**Normal startup never writes schema.** `Application.main` connects, runs a
+read-only check (`SchemaVerifier.requireProvisioned`) for the
+`supabase_migrations` schema, the `schema_migrations` table and baseline version
+`0000`, and exits with `STARTUP_FAILED` if they are absent. It never creates a
+schema, creates a table, applies DDL, records migration history or runs a
+migration — starting the server cannot change the database.
+
+**Provisioning is explicit and separately confirmed.** There are two strictly
+separate paths â€” a remote/Supabase one and a loopback-only local one â€” and both
+end in the same transactional baseline apply. The remote one is:
+
+**Remote / Supabase** (`provisionDatabase`) requires a Supabase pooler host
+(`aws-<n>-<region>.pooler.supabase.com`), port 5432 or 6543, a
+`POS_DATABASE_ROOT_CERT` (Supabase's `prod-ca-2021.crt`) whose SHA-256 matches
+`POS_DATABASE_ROOT_CERT_SHA256` (required, supplied independently), `sslmode=verify-full`,
+and a pooler login whose project suffix matches `POS_EXPECTED_TARGET`. It is the
+only task that writes to a remote database. `sslmode=require` and `verify-ca` are
+rejected: they do not verify the server's identity, so they cannot establish that
+the credential is being sent to Supabase.
+
+The URL may set only `sslmode=verify-full`. SSL factories, hostname verifiers and
+URL-supplied root certificates (`sslfactory`, `sslhostnameverifier`,
+`sslrootcert`, ...) are rejected rather than stripped, duplicate `sslmode` values
+are rejected, a comma-separated multi-host authority is rejected (pgJDBC would
+fail over to the next host), and the connector is built from validated fields so
+no URL parameter can reach the driver.
+
+```bash
+cd server
+PROVISION_CONFIRM=yes \
+POS_DATABASE_URL='jdbc:postgresql://<host>:<port>/postgres' \
+POS_DATABASE_USER='postgres.<project-ref>' \
+POS_DATABASE_PASS='<secret, never logged>' \
+POS_EXPECTED_TARGET='<same 20-char project-ref>' \
+./gradlew provisionDatabase
+```
+
+The run validates everything **before opening a connection**, then:
+
+1. rejects any `PROVISION_CONFIRM` other than the exact string `yes`;
+2. rejects a missing, malformed or credential-bearing `POS_DATABASE_URL`
+   (there is no default target, and the database must be `postgres`);
+3. requires `POS_EXPECTED_TARGET`, because a pooler hostname is shared by every
+   project in a region and identifies nothing on its own;
+4. requires the pooler username `postgres.<project-ref>` to *match* that
+   expected target — the only per-project signal a JDBC URL carries;
+5. connects, confirms `current_database()` is `postgres`, applies the baseline
+   and records version `0000` **in one transaction**, rolls back on any failure,
+   and re-reads the baseline before reporting success.
+
+Re-running is safe: an already-provisioned database reports
+`already_provisioned` and nothing is duplicated.
+
+**Local PostgreSQL** (`provisionLocalDatabase`) is the developer-laptop path and
+never touches a remote database:
+
+```bash
+cd server
+LOCAL_PROVISION_CONFIRM=yes \
+POS_LOCAL_DATABASE_URL='jdbc:postgresql://localhost:5432/business_store' \
+POS_LOCAL_DATABASE_USER='business_store' \
+./gradlew provisionLocalDatabase
+```
+
+It requires `LOCAL_PROVISION_CONFIRM=yes` (exactly), accepts only loopback hosts
+(`localhost`, `127.0.0.1`, `::1`), refuses any remote host before opening a
+connection, and does not need a Supabase project reference. Two different
+confirmation variables keep the paths from being used interchangeably.
+
+After connecting, the remote path re-reads the **session's own** `current_user`
+and `current_database()`. Behind a shared pooler those are corroborating, not
+authoritative â€” the pooler need not expose the original login, and
+`inet_server_addr()/port` describe the backend-side socket rather than the
+client-facing endpoint. TLS (`verify-full` against the pinned root) is the
+identity guarantee; `POS_EXPECTED_TARGET` remains the operator's explicit
+assertion and is checked against the session when the pooler exposes it.
+
+Verify the baseline exists:
+
+```sql
+select version, name from supabase_migrations.schema_migrations order by version;  -- expect 0000
+```
+
+Then start the server normally with `POS_DATABASE_URL` / `POS_DATABASE_USER` /
+`POS_DATABASE_PASSWORD`.
+
+### Applying migrations 0001–0009
+
+The admin surface is migrations `0001`–`0009` and is a **separate, deliberate
+step**. `provisionDatabase` never applies them:
 
 ```bash
 supabase db query --linked --file supabase/migrations/0001_admin_foundation.sql
@@ -99,6 +189,10 @@ supabase db query --linked --file supabase/migrations/0001_admin_foundation.sql
 Verify with `server/tools/ProbeState.java` (read-only) and
 `CleanReplayMigrationTest` / `AdminMigrationTest`.
 
+**Staging has not been provisioned and no migration has been applied there.**
+The read-only identity probe confirmed connectivity and a read-only transaction
+only; staging still reports `migration_history: not_initialized`. Provisioning
+staging requires separate explicit authorization.
 ## API documentation summary
 
 - Device API: `/health`, `/devices`, `/sync`, `/sync/pull`, `/reports/*`,

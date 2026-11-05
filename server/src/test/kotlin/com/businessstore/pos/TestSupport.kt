@@ -37,6 +37,17 @@ object TestDb {
 
     val dataSource: DataSource get() = pg.postgresDatabase
 
+    /**
+     * TCP port of the embedded server. Child processes (the standalone tools in
+     * `server/tools`) need an address rather than a DataSource. The server listens
+     * on loopback only.
+     */
+    val port: Int by lazy {
+        dataSource.connection.use { conn ->
+            conn.metaData.url.substringAfter("//").substringAfter(':').substringBefore('/').toInt()
+        }
+    }
+
     private val TABLES = listOf(
         "approvals", "audit_log", "device_tokens", "devices", "goods_received_items",
         "goods_received", "outbox", "payments", "processed_events", "products",

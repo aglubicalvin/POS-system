@@ -235,7 +235,13 @@ Preconditions:
 
 Apply order — one transaction per file, history row written after each:
 `0001 → 0002 → 0003 → 0004 → 0005 → 0006 → 0007 → 0008 → 0009`, after the
-canonical `schema.sql` baseline (`0000`) applied by the Kotlin server. Order is
+canonical `schema.sql` baseline (`0000`). The baseline is NOT applied by server
+startup: `Application.main` only *verifies* it is present and refuses to start
+otherwise. It is created by the explicit, separately confirmed
+`./gradlew provisionDatabase` task (`PROVISION_CONFIRM=yes`, `POS_DATABASE_URL`,
+`POS_DATABASE_USER`, `POS_DATABASE_PASS`, `POS_EXPECTED_TARGET`,
+`POS_DATABASE_ROOT_CERT`, `POS_DATABASE_ROOT_CERT_SHA256`), which applies
+the baseline and records `0000` in one transaction. Order is
 not cosmetic: 0001 needs the POS tables, 0002 needs `is_admin()`, 0008 retargets
 policies created in 0001, and 0009 needs 0007's `payments` shape plus 0006's
 tables.

@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -303,11 +303,13 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     // The stub reads its output from an absolute path: `$0` and `pwd` are not
     // reliable under Git Bash's MSYS path translation on Windows.
     writeFileSync(join(dir, 'probe-output.txt'), probeOutput, 'utf8');
-    writeFileSync(
-      join(serverDir, 'gradlew'),
-      stubScript(join(dir, 'probe-output.txt'), probeStatus),
-      'utf8',
-    );
+    const stubPath = join(serverDir, 'gradlew');
+    writeFileSync(stubPath, stubScript(join(dir, 'probe-output.txt'), probeStatus), 'utf8');
+    // The step invokes `./gradlew`, so the stub must carry the execute bit. On
+    // Windows the bit is meaningless (hence local runs passing), but on Linux a
+    // non-executable stub makes bash exit 126 -- the very failure this suite
+    // exists to catch, and a false negative if not set.
+    chmodSync(stubPath, 0o755);
     const scriptPath = join(dir, 'step.sh');
     writeFileSync(scriptPath, harness.script, 'utf8');
 

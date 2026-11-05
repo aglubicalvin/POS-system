@@ -66,44 +66,116 @@ class Database(private val dataSource: DataSource) {
     }
 }
 
-/** The canonical Postgres DDL, loaded from one resource shared with the TS tests. */
+/**
+ * The canonical Postgres DDL, loaded from one resource shared with the TS tests.
+ *
+ * `apply` is the ONLY code path in the server that writes schema. It is reached
+ * exclusively from the explicit provisioner (`ProvisionKt`), never from normal
+ * application startup: `Application.main` calls [SchemaVerifier.requireProvisioned]
+ * instead, which only reads. Keeping the two apart is what makes "starting the
+ * server cannot change the database" true by construction rather than by
+ * convention.
+ */
 object Schema {
     private const val RESOURCE = "/db/schema.sql"
+
+    /** The baseline version recorded when the canonical DDL is applied. */
+    const val BASELINE_VERSION = "0000"
+    private const val BASELINE_NAME = "baseline_schema"
 
     fun ddl(): String =
         Schema::class.java.getResourceAsStream(RESOURCE)?.bufferedReader()?.use { it.readText() }
             ?: error("schema resource $RESOURCE not found on the classpath")
 
-    fun apply(dataSource: DataSource) {
-        dataSource.connection.use { conn ->
-            // Ensure migrations tracking table exists
-            conn.createStatement().use { statement ->
-                statement.execute(
-                    "create schema if not exists supabase_migrations; " +
-                    "create table if not exists supabase_migrations.schema_migrations (" +
-                    " version text primary key," +
-                    " statements jsonb," +
-                    " name text not null," +
-                    " statements_hash text," +
-                    " executed_at timestamp not null default clock_timestamp())"
-                )
-            }
-            // Apply base schema if not already tracked
-            conn.createStatement().use { statement ->
-                statement.execute(ddl())
-            }
-            // Record base schema if not recorded
-            conn.createStatement().use { statement ->
-                statement.execute(
+    /**
+     * Apply the baseline schema and record version 0000, atomically.
+     *
+     * Everything runs in ONE transaction with autocommit disabled: if any step
+     * fails, the whole thing rolls back and the database is left exactly as it
+     * was. The previous implementation used three autocommit statements, so a
+     * failure after the first left an empty `supabase_migrations` schema behind
+     * that looked like partial progress but was not recorded.
+     *
+     * Idempotent: re-running against an already-provisioned database commits
+     * successfully and records nothing new (`on conflict do nothing`).
+     *
+     * @return true when this call created the baseline, false when it was
+     *         already present. A false result is NOT an error.
+     */
+    fun apply(dataSource: DataSource): Boolean {
+        var created = false
+        val conn = dataSource.connection
+        var safelyCompleted = false
+        try {
+            val previousAutoCommit = conn.autoCommit
+            conn.autoCommit = false
+            try {
+                conn.createStatement().use { statement ->
+                    statement.execute(
+                        "create schema if not exists supabase_migrations"
+                    )
+                }
+                conn.createStatement().use { statement ->
+                    statement.execute(
+                        "create table if not exists supabase_migrations.schema_migrations (" +
+                            " version text primary key," +
+                            " statements jsonb," +
+                            " name text not null," +
+                            " statements_hash text," +
+                            " executed_at timestamp not null default clock_timestamp())"
+                    )
+                }
+                conn.createStatement().use { statement ->
+                    statement.execute(ddl())
+                }
+                created = conn.prepareStatement(
                     "insert into supabase_migrations.schema_migrations (version, name, statements) " +
-                    "values ('0000', 'baseline_schema', to_jsonb('applied by Schema.apply'::text)) " +
-                    "on conflict (version) do nothing"
-                )
+                        "values (?, ?, to_jsonb(?::text)) " +
+                        "on conflict (version) do nothing"
+                ).use { insert ->
+                    insert.setString(1, BASELINE_VERSION)
+                    insert.setString(2, BASELINE_NAME)
+                    insert.setString(3, "applied by explicit provisioning")
+                    insert.executeUpdate() > 0
+                }
+                conn.commit()
+                // The transaction is complete: only now is autocommit safe to
+                // restore. Restoring it earlier would be a WRITE, see below.
+                safelyCompleted = true
+                conn.autoCommit = previousAutoCommit
+            } catch (error: Throwable) {
+                // Roll back the provisioning statements. If this fails the
+                // connection's transactional state is UNKNOWN.
+                //
+                // JDBC specifies that setting autoCommit back to true commits any
+                // active transaction. Restoring it here after a failed rollback
+                // could therefore COMMIT the very work we are trying to undo, so
+                // autocommit is deliberately NOT restored on this path; the
+                // connection is invalidated and closed instead, which makes the
+                // server discard the session (and with it any open transaction).
+                try {
+                    conn.rollback()
+                    safelyCompleted = true
+                } catch (rollbackError: Throwable) {
+                    // Preserve the original failure; keep the rollback failure as
+                    // suppressed context rather than masking the real cause.
+                    error.addSuppressed(rollbackError)
+                }
+                throw error
             }
+        } finally {
+            // A connection whose rollback failed must never return to a pool in
+            // an indeterminate transactional state.
+            if (!safelyCompleted) {
+                runCatching { conn.rollback() }
+                runCatching {
+                    if (!conn.isValid(1)) conn.abort { }
+                }
+            }
+            runCatching { conn.close() }
         }
+        return created
     }
 
-    fun apply(database: Database) {
-        apply(database.source())
-    }
+    fun apply(database: Database): Boolean = apply(database.source())
 }
