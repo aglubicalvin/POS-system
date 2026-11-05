@@ -44,6 +44,42 @@ object TestCertificate {
         combined.absolutePath
     }
 
+    /**
+     * A SECOND, unrelated self-signed CA.
+     *
+     * This is the certificate an attacker would substitute for the pinned root
+     * after configuration resolution, so the TOCTOU tests can prove that a swap of
+     * the caller-controlled file cannot change what the driver trusts.
+     */
+    private val alternate: Pair<String, String> by lazy {
+        val certOut = createCertificate("otherroot", "CN=other-root", tempDir("other-root"))
+        val fingerprint = requireNotNull(ProvisionTarget.sha256OfCertificateFile(certOut)) {
+            "the alternate certificate could not be fingerprinted"
+        }
+        certOut.deleteOnExit()
+        certOut.absolutePath to fingerprint
+    }
+
+    /** Absolute path to a second, unrelated CA certificate. */
+    val otherPath: String get() = alternate.first
+
+    /** Lowercase hex SHA-256 of the alternate certificate's DER encoding. */
+    val otherSha256: String get() = alternate.second
+
+    /** PEM text of the alternate certificate. */
+    val otherPem: String get() = java.io.File(alternate.first).readText()
+
+    /**
+     * A writable copy of [sourcePath], so a test can replace its contents after the
+     * configuration has been resolved -- the exact window the pinning bug exploited.
+     */
+    fun mutableCopy(sourcePath: String, name: String): java.io.File {
+        val copy = java.io.File(tempDir("mutable-cert"), name)
+        copy.deleteOnExit()
+        copy.writeText(java.io.File(sourcePath).readText())
+        return copy
+    }
+
     private fun generate(): Pair<String, String> {
         val certOut = createCertificate("testroot", "CN=fake-root", tempDir("fake-root"))
         val fingerprint = requireNotNull(ProvisionTarget.sha256OfCertificateFile(certOut)) {

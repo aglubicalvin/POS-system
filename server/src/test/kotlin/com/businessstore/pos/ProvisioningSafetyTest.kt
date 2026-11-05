@@ -4,10 +4,12 @@ import com.businessstore.pos.db.Database
 import com.businessstore.pos.db.Schema
 import com.businessstore.pos.db.SchemaVerifier
 import com.businessstore.pos.tools.LocalProvisionTarget
+import com.businessstore.pos.tools.PinnedTrustMaterial
 import com.businessstore.pos.tools.Provision
 import com.businessstore.pos.tools.ProvisionTarget
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -199,8 +201,18 @@ class ProvisioningSafetyTest {
         host = "aws-0-eu-west-2.pooler.supabase.com",
         port = port,
         database = "postgres",
-        rootCertificatePath = "/tmp/prod-ca-2021.crt",
+        // Identity tests never open a connection, so the certificate fields only
+        // need to be present; the TOCTOU tests use a real certificate.
+        rootCertificatePem = "",
+        rootCertificateSha256 = "0".repeat(64),
     )
+
+    /** Private trust material built from an already-resolved target. */
+    private fun trustFor(target: ProvisionTarget.Target): PinnedTrustMaterial {
+        val outcome = PinnedTrustMaterial.create(target)
+        assertTrue(outcome is PinnedTrustMaterial.Outcome.Ready, "expected trust material, got $outcome")
+        return (outcome as PinnedTrustMaterial.Outcome.Ready).material
+    }
 
     private fun session(
         db: String? = "postgres",
@@ -439,9 +451,19 @@ class ProvisioningSafetyTest {
         assertTrue(outcome is ProvisionTarget.Outcome.Ok, "expected acceptance, got $outcome")
         val target = (outcome as ProvisionTarget.Outcome.Ok).target
 
-        val ds = Provision.buildDataSource(target)
-        assertEquals("verify-full", ds.sslMode)
-        assertEquals(env[ProvisionTarget.ROOT_CERT_ENV], ds.sslRootCert)
+        val ds = trustFor(target).use { material ->
+            val built = Provision.buildDataSource(target, material)
+            assertEquals("verify-full", built.sslMode)
+            // The driver is pointed at the PRIVATE COPY of the verified bytes, which
+            // stays on disk for as long as the connection needs it -- never at the
+            // caller-supplied path that can be replaced after validation.
+            assertNotEquals(env[ProvisionTarget.ROOT_CERT_ENV], built.sslRootCert)
+            assertEquals(
+                TestCertificate.sha256,
+                ProvisionTarget.sha256OfCertificateFile(java.io.File(requireNotNull(built.sslRootCert))),
+            )
+            built
+        }
         assertEquals("postgres", ds.databaseName)
         assertEquals("aws-0-eu-west-2.pooler.supabase.com", ds.serverNames.single())
         assertEquals(5432, ds.portNumbers.single())
@@ -472,7 +494,7 @@ class ProvisioningSafetyTest {
         // With a clean environment the resulting connector is still the
         // validating one, regardless of anything an operator put in the URL.
         val clean = ProvisionTarget.resolve(remoteEnv()) as ProvisionTarget.Outcome.Ok
-        val ds = Provision.buildDataSource(clean.target)
+        val ds = trustFor(clean.target).use { Provision.buildDataSource(clean.target, it) }
         assertEquals("verify-full", ds.sslMode)
         assertEquals(
             "org.postgresql.ssl.LibPQFactory",

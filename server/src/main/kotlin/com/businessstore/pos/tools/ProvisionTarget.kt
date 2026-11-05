@@ -83,7 +83,15 @@ object ProvisionTarget {
         val host: String,
         val port: Int,
         val database: String,
-        val rootCertificatePath: String,
+        /**
+         * The verified certificate itself, as PEM, re-encoded from the DER that was
+         * hashed. This -- not a path -- is the trust root of record: the driver is
+         * given a private copy of THESE bytes (see PinnedTrustMaterial), so a later
+         * write to the file the caller named cannot change what is trusted.
+         */
+        val rootCertificatePem: String,
+        /** SHA-256 of the same certificate's DER encoding, for re-verification. */
+        val rootCertificateSha256: String,
     ) {
         /** Identity line safe for logs: no password, no full URL. */
         fun describe(): String = "database=${databaseName()} role=${redactedRole()} endpoint=supabase-pooler"
@@ -265,18 +273,20 @@ object ProvisionTarget {
                 "Refusing to provision: $ROOT_CERT_ENV does not name an existing file.",
             )
         }
-        // isFile alone says nothing about permissions: a root-owned 0600 file
-        // passes isFile on Windows but not necessarily on a POSIX host. Prove the
-        // process can actually read it before any connection is attempted.
-        val readable = try {
-            certFile.bufferedReader().use { it.readLine() }
-            true
+        // Read the certificate material EXACTLY ONCE, into a byte snapshot. Every
+        // later check -- parsing, the digest, and the private copy handed to the
+        // driver -- is derived from these bytes, never from reopening this path:
+        // re-reading it would reintroduce the window between verification and use.
+        // isFile alone says nothing about permissions either, so the read is the
+        // proof that this process can use the file at all.
+        val snapshot = try {
+            java.nio.file.Files.readAllBytes(certFile.toPath())
         } catch (error: java.io.IOException) {
-            false
+            return Outcome.Rejected(
+                "unreadable-root-certificate",
+                "Refusing to provision: $ROOT_CERT_ENV names a file this process cannot read.",
+            )
         } catch (error: SecurityException) {
-            false
-        }
-        if (!readable) {
             return Outcome.Rejected(
                 "unreadable-root-certificate",
                 "Refusing to provision: $ROOT_CERT_ENV names a file this process cannot read.",
@@ -302,8 +312,8 @@ object ProvisionTarget {
                 "Refusing to provision: $ROOT_CERT_SHA256_ENV must be a 64-character hex SHA-256 digest.",
             )
         }
-        val actualFingerprint = when (val root = readRootCertificate(certFile)) {
-            is RootCertificate.Pinned -> root.sha256
+        val verified = when (val root = readRootCertificate(snapshot)) {
+            is RootCertificate.Pinned -> root
             // verify-full trusts EVERY certificate in this file, so hashing only the
             // first one would accept a root whose file also carries another CA.
             RootCertificate.MoreThanOne -> return Outcome.Rejected(
@@ -317,7 +327,7 @@ object ProvisionTarget {
                 "Refusing to provision: $ROOT_CERT_ENV is not a readable PEM certificate.",
             )
         }
-        if (actualFingerprint != expectedFingerprint) {
+        if (verified.sha256 != expectedFingerprint) {
             return Outcome.Rejected(
                 "root-certificate-mismatch",
                 "Refusing to provision: the certificate in $ROOT_CERT_ENV does not match " +
@@ -334,7 +344,8 @@ object ProvisionTarget {
                 host = host,
                 port = port,
                 database = database,
-                rootCertificatePath = rootCert,
+                rootCertificatePem = verified.pem,
+                rootCertificateSha256 = verified.sha256,
             ),
         )
     }
@@ -476,25 +487,40 @@ object ProvisionTarget {
      * part of pinning, not a cosmetic check.
      */
     internal sealed class RootCertificate {
-        data class Pinned(val sha256: String) : RootCertificate()
+        /**
+         * [sha256] is the digest of the certificate's DER encoding; [pem] is that
+         * same encoding re-encoded as PEM, so the bytes that were hashed are the
+         * bytes that can be handed to the driver.
+         */
+        data class Pinned(val sha256: String, val pem: String) : RootCertificate()
         object MoreThanOne : RootCertificate()
         object Unparseable : RootCertificate()
     }
 
-    /** Parse every certificate in the file and classify what it holds. */
-    internal fun readRootCertificate(file: java.io.File): RootCertificate = try {
-        val certificates = file.inputStream().use { input ->
-            java.security.cert.CertificateFactory.getInstance("X.509")
-                .generateCertificates(input)
-        }
+    /** Parse every certificate in [bytes] and classify what it holds. */
+    internal fun readRootCertificate(bytes: ByteArray): RootCertificate = try {
+        val certificates = java.security.cert.CertificateFactory.getInstance("X.509")
+            .generateCertificates(java.io.ByteArrayInputStream(bytes))
         when {
             certificates.isEmpty() -> RootCertificate.Unparseable
             certificates.size > 1 -> RootCertificate.MoreThanOne
-            else -> RootCertificate.Pinned(sha256Of(certificates.first()))
+            else -> {
+                val certificate = certificates.first()
+                RootCertificate.Pinned(sha256Of(certificate), pemOf(certificate))
+            }
         }
     } catch (error: java.security.cert.CertificateException) {
         RootCertificate.Unparseable
     } catch (error: java.io.IOException) {
+        RootCertificate.Unparseable
+    }
+
+    /** Convenience for callers that only have a file (tests, tooling). */
+    internal fun readRootCertificate(file: java.io.File): RootCertificate = try {
+        readRootCertificate(java.nio.file.Files.readAllBytes(file.toPath()))
+    } catch (error: java.io.IOException) {
+        RootCertificate.Unparseable
+    } catch (error: SecurityException) {
         RootCertificate.Unparseable
     }
 
@@ -512,6 +538,20 @@ object ProvisionTarget {
         java.security.MessageDigest.getInstance("SHA-256")
             .digest(certificate.encoded)
             .joinToString("") { "%02x".format(it) }
+
+    /**
+     * PEM encoding of the certificate's DER bytes.
+     *
+     * Re-encoding from `encoded` rather than copying the input text means the
+     * driver's file is provably the same certificate object whose digest was
+     * compared: whitespace, extra blocks or commentary in the source cannot ride
+     * along into the trust material.
+     */
+    private fun pemOf(certificate: java.security.cert.Certificate): String {
+        val base64 = java.util.Base64.getMimeEncoder(64, byteArrayOf('\n'.code.toByte()))
+            .encodeToString(certificate.encoded)
+        return "-----BEGIN CERTIFICATE-----\n" + base64 + "\n-----END CERTIFICATE-----\n"
+    }
 
     /** host[:port] of the URL, empty when it cannot be parsed. */
     private fun endpointOf(raw: String): Pair<String, Int>? {

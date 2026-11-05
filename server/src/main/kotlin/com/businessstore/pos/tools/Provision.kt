@@ -38,6 +38,38 @@ object Provision {
         println("== explicit baseline provisioning ==")
         println("  target: " + target.describe())
 
+        // The driver reads sslrootcert from DISK when it opens the TLS connection,
+        // so the VERIFIED certificate is materialised in a private location first
+        // and only that copy's path is used. The caller's path is never reused:
+        // anything able to write it between the fingerprint check and the handshake
+        // could otherwise substitute its own CA and intercept POS_DATABASE_PASS.
+        val material = when (val trust = PinnedTrustMaterial.create(target)) {
+            is PinnedTrustMaterial.Outcome.Ready -> trust.material
+            is PinnedTrustMaterial.Outcome.Unavailable -> {
+                System.err.println("PROVISION_REJECTED code=" + trust.code)
+                System.err.println(
+                    "  Refusing to provision: a private copy of the pinned certificate could " +
+                        "not be created or verified, so the driver would have to read a file " +
+                        "another local principal could have replaced.",
+                )
+                exitProcess(2)
+            }
+        }
+
+        // `use` rather than exiting inside the body: the copy stays alive across
+        // the identity check, the transactional apply and the post-apply
+        // verification, and is deleted whether the run succeeds, fails or throws.
+        exitProcess(material.use { provision(target, it) })
+    }
+
+    /**
+     * The provisioning sequence for an already-verified target and trust material.
+     *
+     * Returns the exit code instead of calling exitProcess so the caller can
+     * release the private certificate copy deterministically on every path,
+     * including the failure exits.
+     */
+    internal fun provision(target: ProvisionTarget.Target, trust: PinnedTrustMaterial): Int {
         // Build the connector from VALIDATED FIELDS, never from the raw URL.
         //
         // pgJDBC's BaseDataSource.setUrl() copies every URL parameter into the
@@ -48,14 +80,14 @@ object Provision {
         // and this constructor removes the possibility entirely: no URL is handed
         // to the driver, and every security-relevant setting is assigned here,
         // after the host/port/database fields, in an order we control.
-        val dataSource = buildDataSource(target)
+        val dataSource = buildDataSource(target, trust)
 
         val identity = runCatching { connectedIdentity(dataSource) }
         identity.exceptionOrNull()?.let { error ->
             System.err.println("  provision_status=error")
             System.err.println("  error_category=connection_failed")
             System.err.println("  error_detail=" + sqlStateOf(error))
-            exitProcess(4)
+            return 4
         }
         val session = identity.getOrThrow()
 
@@ -96,7 +128,7 @@ object Provision {
             System.err.println("  provision_status=error")
             System.err.println("  error_category=target_identity_not_confirmed")
             System.err.println("  error_detail=" + problem.second)
-            exitProcess(3)
+            return 3
         }
         println("  tls=verify-full (chain pinned to " + ProvisionTarget.ROOT_CERT_ENV + ")")
         println("  session_database=confirmed")
@@ -116,7 +148,7 @@ object Provision {
             System.err.println("  error_category=provisioning_failed")
             System.err.println("  error_detail=" + sqlStateOf(error))
             System.err.println("  transaction=rolled_back")
-            exitProcess(4)
+            return 4
         }
 
         // A reported success must be observable. Re-read the baseline rather than
@@ -127,13 +159,14 @@ object Provision {
             System.err.println("  provision_status=error")
             System.err.println("  error_category=baseline_not_verified")
             System.err.println("  error_detail=" + (result?.describe() ?: "verification_failed"))
-            exitProcess(5)
+            return 5
         }
 
         println("  baseline_version=" + SchemaVerifier.REQUIRED_VERSION)
         println("  " + result.describe())
         println("  provision_status=" + if (created) "created" else "already_provisioned")
         println("  note=migrations 0001-0009 are NOT applied by this run")
+        return 0
     }
 
     /**
@@ -142,15 +175,26 @@ object Provision {
      * Every security-relevant property is set explicitly and AFTER the connection
      * fields, so nothing can pre-empt it:
      *   sslmode=verify-full      chain + hostname verification
-     *   sslrootcert=<file>       pin the provider CA instead of the JVM store
+     *   sslrootcert=<file>       pin the provider CA instead of the JVM store; the
+     *                            file is the PRIVATE COPY of the verified bytes
+     *                            ([trust]), never the caller-supplied path
      *   sslfactory               left at the driver default (LibPQFactory), which
      *                            honours sslmode; never a non-validating factory
      *   sslhostnameverifier      left at the driver default for verify-full
      *
      * Returns the configured PGSimpleDataSource for inspection by tests.
      */
-    internal fun buildDataSource(target: ProvisionTarget.Target): PGSimpleDataSource =
-        PGSimpleDataSource().apply {
+    internal fun buildDataSource(
+        target: ProvisionTarget.Target,
+        trust: PinnedTrustMaterial,
+    ): PGSimpleDataSource {
+        // The path below is chosen by this process, but prove the invariant anyway:
+        // the certificate the driver will read must be the one whose fingerprint
+        // was verified, so a mismatched material set can never be connected with.
+        check(trust.sha256 == target.rootCertificateSha256) {
+            "trust material does not match the pinned certificate"
+        }
+        return PGSimpleDataSource().apply {
             setServerNames(arrayOf(target.host))
             setPortNumbers(intArrayOf(target.port))
             setDatabaseName(target.database)
@@ -158,8 +202,9 @@ object Provision {
             password = target.password
             // Explicit TLS configuration; no value here can come from a URL.
             setSslMode("verify-full")
-            setSslRootCert(target.rootCertificatePath)
+            setSslRootCert(trust.path)
         }
+    }
 
     /** Facts about the CONNECTED session, read with a single read-only query. */
     internal data class ConnectedIdentity(
