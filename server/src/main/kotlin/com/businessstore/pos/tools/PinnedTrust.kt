@@ -53,9 +53,45 @@ internal class PinnedTrustMaterial private constructor(
     val path: String get() = file.toString()
 
     /** Delete the copy and its directory. Safe to call more than once. */
+    /**
+     * Delete the private copy and its directory.
+     *
+     * Both deletions are attempted even if the first fails, and a failure is
+     * REPORTED rather than swallowed: leftover private material is a real
+     * condition an operator should see. The message names only the path kind, never
+     * the certificate contents.
+     *
+     * Throwing here is safe for the caller: `use` runs close() in a finally, so if
+     * the provisioning body is already failing, Kotlin keeps that exception
+     * primary and attaches this one as suppressed (pinned by
+     * CertificatePinningTest). On a successful run the failure surfaces instead of
+     * being silently discarded.
+     *
+     * This cannot cover SIGKILL, Runtime.halt or power loss: no Java cleanup
+     * handler runs then, and a shutdown hook would not change that.
+     */
     override fun close() {
-        runCatching { Files.deleteIfExists(file) }
-        runCatching { Files.deleteIfExists(directory) }
+        val failures = mutableListOf<String>()
+        try {
+            Files.deleteIfExists(file)
+        } catch (error: IOException) {
+            failures += "certificate copy"
+        } catch (error: SecurityException) {
+            failures += "certificate copy"
+        }
+        try {
+            Files.deleteIfExists(directory)
+        } catch (error: IOException) {
+            failures += "temporary directory"
+        } catch (error: SecurityException) {
+            failures += "temporary directory"
+        }
+        if (failures.isNotEmpty()) {
+            throw IllegalStateException(
+                "pinned trust cleanup failed for: " + failures.joinToString(", ") +
+                    " (private material may remain in the temporary directory)",
+            )
+        }
     }
 
     sealed class Outcome {

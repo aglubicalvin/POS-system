@@ -4,6 +4,8 @@ import com.businessstore.pos.tools.PinnedTrustMaterial
 import com.businessstore.pos.tools.Provision
 import com.businessstore.pos.tools.ProvisionTarget
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -236,6 +238,100 @@ class CertificatePinningTest {
                     "the ACL must not grant other local accounts: $names",
                 )
             }
+        }
+    }
+    // ---- cleanup failure semantics ----------------------------------------
+
+    @Test
+    fun `a cleanup failure does not mask the provisioning exception`() {
+        // `use` closes in a finally. If close() throws while the body is already
+        // failing, Kotlin attaches the close failure as SUPPRESSED and keeps the
+        // body's exception primary. This pins that behaviour for the material.
+        val body = IllegalStateException("provisioning failed")
+        val thrown = runCatching {
+            FakeMaterial().use { throw body }
+        }.exceptionOrNull()
+
+        assertSame(body, thrown, "the provisioning exception must remain primary")
+        assertEquals(
+            listOf("cleanup failed"),
+            thrown!!.suppressed.map { it.message },
+            "the cleanup failure must be attached as suppressed, not swallowed",
+        )
+    }
+
+    @Test
+    fun `a cleanup failure on a successful run is still reported`() {
+        // If the body succeeded, a close() failure must surface rather than be
+        // silently discarded: leftover private material is a real condition.
+        val thrown = runCatching { FakeMaterial().use { } }.exceptionOrNull()
+        assertNotNull(thrown, "a cleanup failure must not be swallowed on success")
+        assertEquals("cleanup failed", thrown!!.message)
+    }
+
+    /** Minimal AutoCloseable that always fails to clean up. */
+    private class FakeMaterial : AutoCloseable {
+        override fun close() {
+            throw IllegalStateException("cleanup failed")
+        }
+    }
+    @Test
+    fun `a real cleanup failure is reported and does not mask the primary error`() {
+        // Force a genuine deletion failure: replace the private certificate file
+        // with a NON-EMPTY DIRECTORY of the same name, so Files.deleteIfExists(file)
+        // fails with DirectoryNotEmptyException.
+        val parent = Files.createTempDirectory("pin-cleanup")
+        val material = ready(targetFor(), parent)
+        val filePath = Paths.get(material.path)
+
+        Files.delete(filePath)
+        Files.createDirectory(filePath)
+        Files.writeString(filePath.resolve("blocker"), "x")
+
+        val primary = IllegalStateException("provisioning failed")
+        val thrown = runCatching { material.use { throw primary } }.exceptionOrNull()
+
+        assertSame(primary, thrown, "the provisioning exception must remain primary")
+        assertTrue(
+            thrown!!.suppressed.any { it.message?.contains("pinned trust cleanup failed") == true },
+            "the cleanup failure must be reported as suppressed, got ${thrown.suppressed.map { it.message }}",
+        )
+        // The message must not leak certificate material.
+        assertFalse(
+            thrown.suppressed.any { it.message?.contains("BEGIN CERTIFICATE") == true },
+            "cleanup messages must not contain certificate contents",
+        )
+
+        // Tidy up: the material's own directory still exists under `parent`
+        // (its deletion failed by design), so remove the tree.
+        Files.deleteIfExists(filePath.resolve("blocker"))
+        Files.deleteIfExists(filePath)
+        deleteTree(parent)
+    }
+
+    @Test
+    fun `a successful run with a failing cleanup surfaces the cleanup error`() {
+        val parent = Files.createTempDirectory("pin-cleanup-ok")
+        val material = ready(targetFor(), parent)
+        val filePath = Paths.get(material.path)
+        Files.delete(filePath)
+        Files.createDirectory(filePath)
+        Files.writeString(filePath.resolve("blocker"), "x")
+
+        val thrown = runCatching { material.use { } }.exceptionOrNull()
+        assertNotNull(thrown, "a cleanup failure must not be swallowed on success")
+        assertTrue(thrown!!.message?.contains("pinned trust cleanup failed") == true)
+
+        Files.deleteIfExists(filePath.resolve("blocker"))
+        Files.deleteIfExists(filePath)
+        deleteTree(parent)
+    }
+
+    /** Best-effort recursive delete for test teardown only. */
+    private fun deleteTree(root: Path) {
+        if (!Files.exists(root)) return
+        Files.walk(root).use { stream ->
+            stream.sorted(Comparator.reverseOrder()).forEach { runCatching { Files.deleteIfExists(it) } }
         }
     }
 }
