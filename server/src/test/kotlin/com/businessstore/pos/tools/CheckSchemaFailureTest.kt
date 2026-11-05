@@ -76,6 +76,25 @@ class CheckSchemaFailureTest {
     }
 
     @Test
+    fun `a hostname that only starts with 127 is refused before any connection`() {
+        // The loopback exception decides whether CHECK_PASS may travel without
+        // verified TLS. A name such as 127.0.0.1.evil.example passes the hostname
+        // grammar and begins with "127." but resolves wherever its owner points it, so
+        // it has to be judged remote during configuration -- before DriverManager can
+        // be asked for a connection.
+        val run = runCheckSchema(
+            mapOf(
+                "CHECK_URL" to "jdbc:postgresql://127.0.0.1.evil.example:5432/postgres?sslmode=disable",
+                "CHECK_USER" to "schema-checker",
+                "CHECK_PASS" to LOCAL_PASSWORD,
+            ),
+        )
+        assertEquals(2, run.exitCode, run.describe())
+        assertTrue(run.stderr.contains("CHECK_REJECTED code=tls-required"), run.stderr)
+        assertSanitized(run, listOf(LOCAL_PASSWORD, "evil.example", "127.0.0.1"))
+    }
+
+    @Test
     fun `pgJDBC dials a host that only appears later in a comma separated authority`() {
         // Measured against pgJDBC 42.7.14: with the first endpoint unreachable the
         // driver opens a socket to the SECOND endpoint in the list. That is the

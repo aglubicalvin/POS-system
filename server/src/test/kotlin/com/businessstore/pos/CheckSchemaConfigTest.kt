@@ -47,7 +47,7 @@ class CheckSchemaConfigTest {
         for (bad in listOf(
             "postgresql://db.example.test/postgres",
             "jdbc:postgresql:///postgres",
-            "jdbc:postgresql://localhost/postgres",
+            "jdbc:postgresql://db/postgres",
             "jdbc:mysql://db.example.test/postgres",
         )) {
             assertEquals("malformed-url", rejected(valid + ("CHECK_URL" to bad)).code, "url '$bad'")
@@ -126,6 +126,51 @@ class CheckSchemaConfigTest {
         for (query in listOf("", "?sslmode=disable", "?sslmode=require")) {
             CheckSchemaConfig.resolve(
                 valid + ("CHECK_URL" to "jdbc:postgresql://127.0.0.1:5432/postgres$query"),
+            )
+        }
+    }
+
+    @Test
+    fun `a loopback exception is an exact literal, not a hostname prefix`() {
+        // "127.db.attacker.example" is a name the attacker can register: it passes
+        // the hostname grammar and starts with "127.". A textual prefix therefore
+        // cannot decide that CHECK_PASS may travel without verified TLS.
+        for (host in listOf("127.0.0.1", "127.0.0.2", "127.255.255.255", "localhost", "LOCALHOST")) {
+            for (query in listOf("", "?sslmode=disable")) {
+                CheckSchemaConfig.resolve(
+                    valid + ("CHECK_URL" to "jdbc:postgresql://$host:5432/postgres$query"),
+                )
+            }
+        }
+
+        for (host in listOf(
+            "127.db.attacker.example",
+            "127.attacker.example",
+            "127.0.example",
+            "127.0.0.1.evil.example",
+            "localhost.attacker.example",
+            "127.1",
+            "127.999.0.1",
+            "127.000.0.1",
+        )) {
+            for (query in listOf(
+                "",
+                "?sslmode=disable",
+                "?sslmode=allow",
+                "?sslmode=prefer",
+                "?sslmode=require",
+                "?sslmode=verify-ca",
+            )) {
+                assertEquals(
+                    "tls-required",
+                    rejected(valid + ("CHECK_URL" to "jdbc:postgresql://$host:5432/postgres$query")).code,
+                    "host '$host' with query '$query'",
+                )
+            }
+
+            // The same host is still a valid remote target with verified TLS.
+            CheckSchemaConfig.resolve(
+                valid + ("CHECK_URL" to "jdbc:postgresql://$host:5432/postgres?sslmode=verify-full"),
             )
         }
     }

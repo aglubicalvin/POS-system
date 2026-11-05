@@ -14,7 +14,10 @@ import java.util.Map;
  *                          ?host= would replace the authority validated here.
  *                          A non-loopback host must set sslmode=verify-full: this
  *                          tool sends CHECK_PASS, and weaker modes would either
- *                          omit TLS or skip verifying the server.
+ *                          omit TLS or skip verifying the server. Loopback means
+ *                          the exact hostname 'localhost' or a strict IPv4 literal
+ *                          in 127.0.0.0/8 -- never a host that merely begins
+ *                          with "127.", which is a remote DNS name.
  *   CHECK_USER             required; never inferred from the URL
  *   CHECK_PASS             required unless CHECK_PASS_ALLOW_EMPTY=yes is explicitly
  *                          set (local trust/peer auth on a development machine).
@@ -149,10 +152,14 @@ public final class CheckSchemaConfig {
                 "REFUSED: CHECK_URL must be jdbc:postgresql://<host>[:port]/<database> with " +
                     "one host, an optional numeric port, and no extra characters in the host.");
         }
-        if (!hostPort.contains(".")) {
+        String host = hostPort.split(":", 2)[0].toLowerCase();
+        // A fully qualified name is required so a bare label cannot be completed by
+        // the local resolver. 'localhost' is the one exception: it is the
+        // conventional local name, and it only reaches a weaker TLS mode through
+        // the loopback check below, which matches it exactly.
+        if (!hostPort.contains(".") && !host.equals("localhost")) {
             throw new Rejected("malformed-url", "REFUSED: CHECK_URL must name a fully qualified host.");
         }
-        String host = hostPort.split(":", 2)[0].toLowerCase();
         int colon = hostPort.indexOf(':');
         if (colon >= 0) {
             int port = Integer.parseInt(hostPort.substring(colon + 1));
@@ -172,7 +179,7 @@ public final class CheckSchemaConfig {
         if (sslMode != null && !KNOWN_SSL_MODES.contains(sslmodeCanonical(sslMode))) {
             throw new Rejected("malformed-url", "REFUSED: CHECK_URL sets an unrecognised sslmode value.");
         }
-        boolean loopback = host.equals("localhost") || host.equals("::1") || host.startsWith("127.");
+        boolean loopback = isLoopback(host);
         // This tool authenticates with CHECK_USER / CHECK_PASS. Over a network those
         // credentials need both encryption and a verified server: sslmode=disable
         // sends them in clear, and sslmode=require (or prefer/allow) encrypts without
@@ -227,6 +234,40 @@ public final class CheckSchemaConfig {
         if (config.expectedDatabase != null && !config.expectedDatabase.equals(actualDatabase)) {
             throw new Rejected("identity-mismatch", "REFUSED: connected database is not CHECK_EXPECTED_DATABASE.");
         }
+    }
+
+    /**
+     * Whether an already-validated host names the local machine.
+     *
+     * Exactly two shapes qualify: the hostname 'localhost' (compared after
+     * lowercasing, never by prefix) and a strict dotted-quad IPv4 literal in
+     * 127.0.0.0/8 -- four decimal octets, each 0-255, with no leading zero. A
+     * textual prefix is deliberately not used: "127.db.attacker.example" passes the
+     * hostname grammar and can resolve anywhere, so treating it as loopback would
+     * let a remote target keep sslmode=disable and expose CHECK_PASS. No DNS lookup
+     * happens here; resolution cannot make a remote name local, and a name that
+     * resolves to loopback today may not tomorrow.
+     */
+    private static boolean isLoopback(String host) {
+        if (host.equals("localhost")) return true;
+        String[] octets = host.split("\\.", -1);
+        if (octets.length != 4) return false;
+        int first = -1;
+        for (int i = 0; i < octets.length; i++) {
+            String octet = octets[i];
+            // "" is a shortened form such as "127.1"; more than three digits cannot
+            // be in 0-255; a leading zero ('01', '000') is a non-canonical spelling
+            // whose meaning differs between parsers.
+            if (octet.isEmpty() || octet.length() > 3) return false;
+            if (octet.length() > 1 && octet.charAt(0) == '0') return false;
+            for (int c = 0; c < octet.length(); c++) {
+                if (octet.charAt(c) < '0' || octet.charAt(c) > '9') return false;
+            }
+            int value = Integer.parseInt(octet);
+            if (value > 255) return false;
+            if (i == 0) first = value;
+        }
+        return first == 127;
     }
 
     /** pgJDBC treats sslmode values case-insensitively and tolerates whitespace. */
