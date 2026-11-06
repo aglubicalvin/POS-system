@@ -4,23 +4,37 @@ import com.businessstore.pos.tools.MigrationHistory
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Proxy
+import java.nio.file.Files
+import java.sql.Connection
+import java.sql.SQLException
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /**
- * Transaction and history-table guarantees of the migration runner.
+ * Transaction, history-content and connection-lifecycle guarantees of the
+ * migration runner.
  *
  * These tests call the production operation, `MigrationHistory.apply`, against a
  * disposable embedded database instead of re-implementing its statement
  * sequence, so what is asserted is what the runner actually executes.
  *
- * The history table belongs to the Supabase CLI
- * (`supabase_migrations.schema_migrations`, with `statements text[]` and
- * `name text`), so the cases below cover: a database with no history at all, an
- * existing CLI-shaped table, a CLI table that predates the optional columns, and
- * the `statements jsonb` table written by the earlier ApplyMigration. In every
- * case the bootstrap DDL, the migration and the history row must commit together
- * or not at all.
+ * Three things are covered here:
+ *
+ *  1. The history table is the Supabase CLI's (`statements text[]`, `name text`),
+ *     so a database with no history, a CLI-shaped table, a CLI table that
+ *     predates the optional columns and the earlier `statements jsonb` table all
+ *     accept the row.
+ *  2. `statements` holds the migration FILE, not a placeholder, so
+ *     `supabase migration fetch` (which writes `statements.join(";\n") + ";\n"`)
+ *     reproduces executable SQL that keeps functions, comments, quoted strings
+ *     and multi-statement files intact.
+ *  3. A failed rollback must never be followed by `setAutoCommit(true)` (JDBC
+ *     commits an active transaction when autocommit is enabled): the connection
+ *     is aborted instead and the failure is reported as an uncertain outcome.
  */
 class MigrationTransactionTest {
 
@@ -48,10 +62,19 @@ class MigrationTransactionTest {
         }
     }
 
-    /** The real production operation, driven exactly as ApplyMigration drives it. */
-    private fun apply(ds: javax.sql.DataSource, version: String, sql: String) {
+    /**
+     * The real production operation, driven as ApplyMigration drives it. `name`
+     * is recorded the way the CLI records it: without the version prefix and
+     * without the `.sql` suffix.
+     */
+    private fun apply(
+        ds: javax.sql.DataSource,
+        version: String,
+        sql: String,
+        name: String = "test",
+    ) {
         ds.connection.use { c ->
-            MigrationHistory.apply(c, version, "${version}_test.sql", sql)
+            MigrationHistory.apply(c, version, name, sql)
         }
     }
 
@@ -107,11 +130,28 @@ class MigrationTransactionTest {
             }
         }
 
-    /** `statements` rendered as text; works for both text[] and jsonb. */
-    private fun statementsAsText(ds: javax.sql.DataSource, version: String): String? =
+    /** The `statements` array as the CLI reads it: one string per element. */
+    private fun statementsElements(ds: javax.sql.DataSource, version: String): List<String> {
         ds.connection.use { c ->
             c.prepareStatement(
-                "select statements::text from supabase_migrations.schema_migrations where version = ?",
+                "select statements from supabase_migrations.schema_migrations where version = ?",
+            ).use { ps ->
+                ps.setString(1, version)
+                ps.executeQuery().use { rs ->
+                    if (!rs.next()) return emptyList()
+                    val array = rs.getArray(1) ?: return emptyList()
+                    val values = array.array as Array<*>
+                    return values.map { it as String }
+                }
+            }
+        }
+    }
+
+    /** First element of a legacy `jsonb` column, read the way a JSON reader would. */
+    private fun jsonbElement(ds: javax.sql.DataSource, version: String): String? =
+        ds.connection.use { c ->
+            c.prepareStatement(
+                "select statements->>0 from supabase_migrations.schema_migrations where version = ?",
             ).use { ps ->
                 ps.setString(1, version)
                 ps.executeQuery().use { if (it.next()) it.getString(1) else null }
@@ -138,6 +178,45 @@ class MigrationTransactionTest {
             }
         }
 
+    private fun scalar(ds: javax.sql.DataSource, sql: String): String? =
+        ds.connection.use { c ->
+            c.createStatement().use { st ->
+                st.executeQuery(sql).use { rs -> if (rs.next()) rs.getString(1) else null }
+            }
+        }
+
+    /**
+     * Exactly how `supabase migration fetch` writes a history row back to disk:
+     * `statements.join(";\n") + ";\n"`
+     * (apps/cli/src/legacy/commands/migration/fetch/fetch.handler.ts).
+     */
+    private fun reconstruct(statements: List<String>): String =
+        statements.joinToString(";\n") + ";\n"
+
+    /**
+     * A migration file that a naive semicolon split would corrupt: a leading
+     * comment, several statements, a semicolon inside a string literal and a
+     * dollar-quoted function body that itself contains a semicolon.
+     */
+    private val multiStatementMigration = """
+        -- split on ';' would break this file
+        create table mig_rec (
+            id int primary key,
+            note text
+        );
+
+        insert into mig_rec (id, note) values (1, 'semicolon; inside a literal');
+
+        create function mig_rec_label() returns text
+        language sql as ${'$'}${'$'}
+        select 'dollar; quoted body'::text
+        ${'$'}${'$'};
+
+        comment on table mig_rec is 'kept exactly as written';
+    """.trimIndent()
+
+    // ---------------------------------------------------------------- history
+
     @Test
     fun `a database with no migration history is bootstrapped`() {
         val db = newDatabase()
@@ -146,7 +225,8 @@ class MigrationTransactionTest {
             assertFalse(trackingSchemaExists(ds), "the fixture must start without the tracking schema")
             assertFalse(trackingTableExists(ds), "the fixture must start without the tracking table")
 
-            apply(ds, "0005", "create table mig_boot (id int primary key)")
+            val sql = "create table mig_boot (id int primary key, owner text)"
+            apply(ds, "0005", sql)
 
             assertTrue(trackingSchemaExists(ds), "the runner must create supabase_migrations")
             assertTrue(trackingTableExists(ds), "the runner must create schema_migrations")
@@ -156,11 +236,8 @@ class MigrationTransactionTest {
                 "a fresh table must use statements text[], the CLI shape",
             )
             assertTrue(tableExists(ds, "mig_boot"), "the migration itself must be applied")
-            assertEquals(listOf("0005" to "0005_test.sql"), historyRows(ds), "version and name must be recorded")
-            assertTrue(
-                statementsAsText(ds, "0005")!!.contains(MigrationHistory.PROVENANCE),
-                "the row must record how it was written",
-            )
+            assertEquals(listOf("0005" to "test"), historyRows(ds), "version and name must be recorded")
+            assertEquals(listOf(sql), statementsElements(ds, "0005"))
         } finally {
             drop(db)
         }
@@ -186,13 +263,11 @@ class MigrationTransactionTest {
 
             assertEquals("ARRAY", statementsType(ds), "the CLI column type must be left alone")
             assertEquals(
-                listOf("0001" to "0001_admin_foundation.sql", "0006" to "0006_test.sql"),
+                listOf("0001" to "0001_admin_foundation.sql", "0006" to "test"),
                 historyRows(ds),
             )
             assertTrue(tableExists(ds, "mig_cli"))
-            val recorded = statementsAsText(ds, "0006")!!
-            assertTrue(recorded.startsWith("{"), "statements must still be an array, was: $recorded")
-            assertTrue(recorded.contains(MigrationHistory.PROVENANCE))
+            assertEquals(listOf("create table mig_cli (id int)"), statementsElements(ds, "0006"))
         } finally {
             drop(db)
         }
@@ -217,7 +292,7 @@ class MigrationTransactionTest {
             apply(ds, "0007", "create table mig_old (id int)")
 
             assertEquals("ARRAY", statementsType(ds), "the bootstrap must add statements text[]")
-            assertEquals(listOf("0007" to "0007_test.sql"), historyRows(ds))
+            assertEquals(listOf("0007" to "test"), historyRows(ds))
             assertTrue(tableExists(ds, "mig_old"))
         } finally {
             drop(db)
@@ -243,16 +318,167 @@ class MigrationTransactionTest {
                 }
             }
 
-            apply(ds, "0008", "create table mig_json (id int)")
+            val sql = "create table mig_json (id int)"
+            apply(ds, "0008", sql)
 
             assertEquals("jsonb", statementsType(ds), "an existing column type must not be altered")
-            assertEquals(listOf("0008" to "0008_test.sql"), historyRows(ds))
-            assertTrue(statementsAsText(ds, "0008")!!.contains(MigrationHistory.PROVENANCE))
+            assertEquals(listOf("0008" to "test"), historyRows(ds))
             assertTrue(tableExists(ds, "mig_json"))
+            assertEquals(sql, jsonbElement(ds, "0008"))
         } finally {
             drop(db)
         }
     }
+
+    @Test
+    fun `the recorded statements array holds the migration file as one element`() {
+        val db = newDatabase()
+        try {
+            val ds = dataSourceFor(db)
+            apply(ds, "0012", multiStatementMigration, name = "rec")
+
+            val elements = statementsElements(ds, "0012")
+            assertEquals(1, elements.size, "one element must hold the whole file, got: $elements")
+            assertEquals(multiStatementMigration, elements.single())
+            assertTrue(
+                elements.single().contains("create function mig_rec_label()"),
+                "the function body must be recorded verbatim",
+            )
+        } finally {
+            drop(db)
+        }
+    }
+
+    @Test
+    fun `the legacy jsonb column holds the migration file`() {
+        val db = newDatabase()
+        try {
+            val ds = dataSourceFor(db)
+            ds.connection.use { c ->
+                c.createStatement().use {
+                    it.execute("create schema supabase_migrations")
+                    it.execute(
+                        "create table supabase_migrations.schema_migrations (" +
+                            " version text primary key, statements jsonb, name text not null)",
+                    )
+                }
+            }
+
+            apply(ds, "0013", multiStatementMigration, name = "rec")
+
+            assertEquals("jsonb", statementsType(ds), "the legacy column type must not be altered")
+            assertEquals(multiStatementMigration, jsonbElement(ds, "0013"))
+        } finally {
+            drop(db)
+        }
+    }
+
+    @Test
+    fun `the provenance placeholder is never written`() {
+        val db = newDatabase()
+        try {
+            val ds = dataSourceFor(db)
+            val sql = "create table mig_no_marker (id int)"
+            apply(ds, "0014", sql)
+
+            val recorded = statementsElements(ds, "0014").single()
+            assertEquals(sql, recorded)
+            assertFalse(
+                recorded.contains("applied by ApplyMigration"),
+                "the history row must carry the migration, not a placeholder",
+            )
+        } finally {
+            drop(db)
+        }
+    }
+
+    // ---------------------------------------------------------- reconstruction
+
+    @Test
+    fun `fetch reconstruction reproduces the original file and stays executable`() {
+        val db = newDatabase()
+        val replica = newDatabase()
+        try {
+            val ds = dataSourceFor(db)
+            apply(ds, "0010", multiStatementMigration, name = "rec")
+
+            val reconstructed = reconstruct(statementsElements(ds, "0010"))
+            assertEquals(multiStatementMigration + ";\n", reconstructed)
+            assertTrue(
+                reconstructed.contains("-- split on ';' would break this file"),
+                "comments must survive",
+            )
+            assertTrue(
+                reconstructed.contains("semicolon; inside a literal"),
+                "quoted semicolons must survive",
+            )
+            assertTrue(
+                reconstructed.contains("dollar; quoted body"),
+                "dollar-quoted bodies must survive",
+            )
+
+            // The reconstructed text must be executable SQL on its own.
+            dataSourceFor(replica).connection.use { c ->
+                c.createStatement().use { it.execute(reconstructed) }
+            }
+            val restored = dataSourceFor(replica)
+            assertTrue(tableExists(restored, "mig_rec"), "reconstruction must recreate the table")
+            assertEquals("dollar; quoted body", scalar(restored, "select mig_rec_label()"))
+            assertEquals(
+                "kept exactly as written",
+                scalar(restored, "select obj_description('mig_rec'::regclass, 'pg_class')"),
+            )
+            assertEquals(
+                "1",
+                scalar(restored, "select count(*)::text from mig_rec"),
+                "the recorded insert must be part of the reconstruction",
+            )
+        } finally {
+            drop(db)
+            drop(replica)
+        }
+    }
+
+    @Test
+    fun `the supabase cli fetches the recorded migration`() {
+        val cli = findSupabaseCli()
+        assumeTrue(
+            cli != null,
+            "supabase CLI not installed; set SUPABASE_CLI=<path> to run this integration check",
+        )
+        val db = newDatabase()
+        val workdir = Files.createTempDirectory("mig_fetch_")
+        try {
+            apply(dataSourceFor(db), "0011", multiStatementMigration, name = "rec")
+            val migrations = Files.createDirectories(
+                workdir.resolve("supabase").resolve("migrations"),
+            )
+            // The disposable embedded server speaks plaintext only; the CLI
+            // defaults to TLS. Nothing here is remote.
+            val url = "postgresql://postgres@127.0.0.1:${TestDb.port}/$db?sslmode=disable"
+
+            val process = ProcessBuilder(
+                cli!!, "migration", "fetch", "--db-url", url, "--workdir", workdir.toString(),
+            ).redirectErrorStream(true).start()
+            val output = process.inputStream.bufferedReader().readText()
+            val finished = process.waitFor(180, TimeUnit.SECONDS)
+            assertTrue(finished, "supabase migration fetch did not finish: $output")
+            assertEquals(0, process.exitValue(), "supabase migration fetch failed: $output")
+
+            val fetched = migrations.resolve("0011_rec.sql")
+            assertTrue(Files.exists(fetched), "the CLI must write $fetched; output: $output")
+            assertEquals(
+                multiStatementMigration + ";\n",
+                Files.readString(fetched),
+                "the fetched file must be the original migration",
+            )
+        } finally {
+            workdir.toFile().deleteRecursively()
+            drop(db)
+        }
+    }
+
+    // -------------------------------------------------------------- behaviour
 
     @Test
     fun `a successful migration records its history`() {
@@ -261,7 +487,7 @@ class MigrationTransactionTest {
             val ds = dataSourceFor(db)
             apply(ds, "0001", "create table mig_ok (id int primary key)")
             assertTrue(tableExists(ds, "mig_ok"))
-            assertEquals(listOf("0001" to "0001_test.sql"), historyRows(ds))
+            assertEquals(listOf("0001" to "test"), historyRows(ds))
         } finally {
             drop(db)
         }
@@ -344,11 +570,189 @@ class MigrationTransactionTest {
             assertTrue(tableExists(ds, "mig_seq_a"))
             assertTrue(tableExists(ds, "mig_seq_b"), "a second migration must not collide with the bootstrap")
             assertEquals(
-                listOf("0011" to "0011_test.sql", "0012" to "0012_test.sql"),
+                listOf("0011" to "test", "0012" to "test"),
                 historyRows(ds),
             )
         } finally {
             drop(db)
         }
     }
+
+    // ------------------------------------------------- connection lifecycle
+
+    @Test
+    fun `a failed rollback never commits and discards the connection`() {
+        val db = newDatabase()
+        val real = dataSourceFor(db).connection
+        try {
+            val faulty = FaultyConnection(real).also { it.failRollback = true }
+            val thrown = runCatching {
+                MigrationHistory.apply(
+                    faulty.proxy,
+                    "0090",
+                    "rb",
+                    "create table mig_rb (id int); select * from mig_rb_missing",
+                )
+            }.exceptionOrNull()
+
+            // 1. The migration's own error stays primary.
+            val failure = thrown as? SQLException
+                ?: error("expected the migration to fail, got: $thrown")
+            assertEquals("42P01", failure.sqlState, "the migration error must stay primary: $failure")
+
+            // 2. The rollback failure is attached, never swallowed.
+            val rollbackFailures = failure.suppressed.filterIsInstance<MigrationHistory.RollbackFailed>()
+            assertEquals(1, rollbackFailures.size, "suppressed: ${failure.suppressed.toList()}")
+            assertEquals(
+                "08006",
+                (rollbackFailures.single().cause as SQLException).sqlState,
+                "the driver's rollback error must be the cause",
+            )
+            assertTrue(MigrationHistory.rollbackFailed(failure))
+            assertFalse(MigrationHistory.discardFailed(failure), "abort must have succeeded")
+
+            // 3. Nothing ran that could commit the still-open transaction.
+            assertTrue(faulty.calls.any { it.startsWith("rollback") }, "calls: ${faulty.calls}")
+            assertFalse(
+                faulty.calls.any { it == "setAutoCommit[true]" },
+                "autocommit must never be enabled after a failed rollback: ${faulty.calls}",
+            )
+            assertFalse(
+                faulty.calls.dropWhile { !it.startsWith("rollback") }.any { it.startsWith("commit") },
+                "no commit may follow the failed rollback: ${faulty.calls}",
+            )
+
+            // 4. The physical connection was terminated, not merely reset.
+            assertTrue(faulty.proxy.isClosed, "the failed connection must be discarded")
+
+            // 5. Verified on an independent connection after termination.
+            val check = dataSourceFor(db)
+            assertFalse(tableExists(check, "mig_rb"), "the DDL must not survive a discarded transaction")
+            assertTrue(historyRows(check).isEmpty(), "no history row may survive")
+        } finally {
+            runCatching { real.close() }
+            drop(db)
+        }
+    }
+
+    @Test
+    fun `a failed abort is reported as an uncertain outcome`() {
+        val db = newDatabase()
+        val real = dataSourceFor(db).connection
+        try {
+            val faulty = FaultyConnection(real).also {
+                it.failRollback = true
+                it.failAbort = true
+            }
+            val failure = runCatching {
+                MigrationHistory.apply(
+                    faulty.proxy,
+                    "0091",
+                    "rb",
+                    "create table mig_rb2 (id int); select * from mig_rb2_missing",
+                )
+            }.exceptionOrNull() as? SQLException ?: error("expected the migration to fail")
+
+            assertEquals("42P01", failure.sqlState)
+            assertTrue(MigrationHistory.rollbackFailed(failure))
+            assertTrue(
+                MigrationHistory.discardFailed(failure),
+                "an abort failure must not be dropped: ${failure.suppressed.toList()}",
+            )
+            assertTrue(failure.suppressed.any { it is MigrationHistory.DiscardFailed })
+            assertFalse(
+                faulty.calls.any { it == "setAutoCommit[true]" },
+                "autocommit must never be enabled when cleanup failed: ${faulty.calls}",
+            )
+        } finally {
+            runCatching { real.close() }
+            drop(db)
+        }
+    }
+
+    @Test
+    fun `a committed migration with an unresettable connection is reported committed`() {
+        val db = newDatabase()
+        val real = dataSourceFor(db).connection
+        try {
+            val faulty = FaultyConnection(real).also { it.failAutoCommitReset = true }
+            val thrown = runCatching {
+                MigrationHistory.apply(
+                    faulty.proxy,
+                    "0092",
+                    "ok",
+                    "create table mig_committed (id int)",
+                )
+            }.exceptionOrNull()
+
+            assertTrue(
+                thrown is MigrationHistory.CommittedButUnclean,
+                "a durable commit must not be reported as a failed migration: $thrown",
+            )
+            // The commit itself stands and was not rolled back.
+            val check = dataSourceFor(db)
+            assertTrue(tableExists(check, "mig_committed"))
+            assertEquals(listOf("0092" to "ok"), historyRows(check))
+            assertTrue(faulty.calls.any { it.startsWith("commit") }, "calls: ${faulty.calls}")
+            assertTrue(faulty.proxy.isClosed, "the unclean connection must be discarded")
+        } finally {
+            runCatching { real.close() }
+            drop(db)
+        }
+    }
+
+    /**
+     * Records the calls the runner makes and injects failures into them, so the
+     * real production lifecycle can be observed rather than copied.
+     */
+    private class FaultyConnection(private val real: Connection) {
+        val calls = mutableListOf<String>()
+        var failRollback = false
+        var failAbort = false
+        var failAutoCommitReset = false
+
+        val proxy: Connection = Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf<Class<*>>(Connection::class.java),
+        ) { _, method, args ->
+            val values = args ?: emptyArray()
+            when {
+                method.name == "rollback" && failRollback -> {
+                    calls += "rollback(failed)"
+                    throw SQLException("injected rollback failure", "08006")
+                }
+                method.name == "abort" && failAbort -> {
+                    calls += "abort(failed)"
+                    throw SQLException("injected abort failure", "08003")
+                }
+                method.name == "setAutoCommit" && values.firstOrNull() == true &&
+                    failAutoCommitReset -> {
+                    calls += "setAutoCommit[true](failed)"
+                    throw SQLException("injected autocommit failure", "08003")
+                }
+                else -> {
+                    calls += method.name +
+                        values.joinToString(",", "[", "]") { it?.toString() ?: "null" }
+                    try {
+                        method.invoke(real, *values)
+                    } catch (e: InvocationTargetException) {
+                        throw e.targetException
+                    }
+                }
+            }
+        } as Connection
+    }
+
+    /** The real CLI when it is available locally; CI has no supabase binary. */
+    private fun findSupabaseCli(): String? =
+        listOfNotNull(System.getenv("SUPABASE_CLI"), "supabase", "supabase.cmd", "supabase.exe")
+            .firstOrNull { exe ->
+                runCatching {
+                    val process = ProcessBuilder(exe, "--version")
+                        .redirectErrorStream(true)
+                        .start()
+                    process.inputStream.bufferedReader().readText()
+                    process.waitFor(60, TimeUnit.SECONDS) && process.exitValue() == 0
+                }.getOrDefault(false)
+            }
 }

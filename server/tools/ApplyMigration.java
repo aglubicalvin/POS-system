@@ -26,7 +26,13 @@ import com.businessstore.pos.tools.MigrationHistory;
  *     schema already exists.
  *  4. The history table is the one the Supabase CLI creates (`statements text[]`,
  *     `name text`), so a CLI-managed database is written to correctly rather than
- *     rejected on a column type.
+ *     rejected on a column type. `statements` holds the migration file itself and
+ *     `name` is recorded the way the CLI records it, so `supabase migration fetch`
+ *     writes the original `<version>_<name>.sql` back out instead of an invalid
+ *     placeholder or a doubled file name.
+ *  5. A failed rollback is never followed by setAutoCommit(true), which JDBC would
+ *     treat as a COMMIT: the connection is aborted so the server discards the
+ *     transaction, and the run reports outcome_uncertain instead of rolled_back.
  *  5. Diagnostics are sanitized: SQLState and a short message with host, port,
  *     database and role scrubbed. No stack traces, no credentials.
  *
@@ -102,13 +108,32 @@ public class ApplyMigration {
 
             // ONE transaction for the bootstrap DDL, the migration SQL and its
             // history row; see MigrationHistory for the CLI-compatible table.
-            String fileName = Path.of(config.migrationFile).getFileName().toString();
+            // The version/name split is the CLI's own: 0005_admin.sql -> 0005,
+            // admin. Fetching the row then rewrites 0005_admin.sql, not
+            // 0005_0005_admin.sql.sql.
+            String version = versionOf(config.migrationFile);
             try {
-                MigrationHistory.apply(c, versionOf(config.migrationFile), fileName, sql);
+                MigrationHistory.apply(c, version, nameOf(config.migrationFile), sql);
                 System.out.println("  migration_status=applied");
-                System.out.println("  version=" + versionOf(config.migrationFile));
+                System.out.println("  version=" + version);
+            } catch (MigrationHistory.CommittedButUnclean e) {
+                // The COMMIT succeeded; only resetting the connection failed, so
+                // the migration must NOT be reported as rolled back.
+                System.out.println("  migration_status=applied");
+                System.out.println("  version=" + version);
+                System.err.println("  connection_state=discarded");
+                System.err.println("  error_detail=" + sanitize(e));
             } catch (SQLException e) {
-                System.err.println("  migration_status=rolled_back");
+                if (MigrationHistory.rollbackFailed(e)) {
+                    // The transaction may still be live on the server; saying
+                    // "rolled_back" here would be a claim we cannot make.
+                    System.err.println("  migration_status=outcome_uncertain");
+                    System.err.println("  rollback_failed=true");
+                    System.err.println(
+                        "  connection_discarded=" + !MigrationHistory.discardFailed(e));
+                } else {
+                    System.err.println("  migration_status=rolled_back");
+                }
                 System.err.println("  error_detail=" + sanitize(e));
                 System.exit(4);
             }
@@ -118,6 +143,18 @@ public class ApplyMigration {
             System.err.println("  error_detail=" + sanitize(e));
             System.exit(4);
         }
+    }
+
+    /**
+     * "0003_admin_roles.sql" -> "admin_roles": the name the CLI's own file
+     * parser stores (it strips the version prefix and the .sql suffix), so a
+     * fetched row is written back as 0003_admin_roles.sql.
+     */
+    static String nameOf(String file) {
+        String name = Path.of(file).getFileName().toString();
+        int underscore = name.indexOf('_');
+        String rest = underscore > 0 ? name.substring(underscore + 1) : name;
+        return rest.endsWith(".sql") ? rest.substring(0, rest.length() - 4) : rest;
     }
 
     /** "0003_admin_roles.sql" -> "0003". */
