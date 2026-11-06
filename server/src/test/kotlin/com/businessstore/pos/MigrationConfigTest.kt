@@ -171,8 +171,88 @@ class MigrationConfigTest {
         assertEquals("missing-migration-file", rejected(valid - MigrationConfig.FILE_ENV).code)
         assertEquals(
             "missing-migration-file",
-            rejected(valid + (MigrationConfig.FILE_ENV to "/nonexistent/0001.sql")).code,
+            rejected(valid + (MigrationConfig.FILE_ENV to "/nonexistent/0001_admin_foundation.sql")).code,
         )
+    }
+
+    // ---- migration file-name contract --------------------------------------
+
+    @Test
+    fun `a migration name that the CLI could not round-trip is rejected`() {
+        // Everything here is rejected by resolve(), which has no database code
+        // and is called before DriverManager is reached: nothing can connect.
+        for (bad in listOf(
+            "migration.sql",
+            "0001.sql",
+            "_admin.sql",
+            "0001_.sql",
+            "abc_admin.sql",
+            "0001_admin.sql.bak",
+            "0001_admin",
+        )) {
+            assertEquals(
+                "malformed-migration-file",
+                rejected(valid + (MigrationConfig.FILE_ENV to "/nonexistent/$bad")).code,
+                "name '$bad' must be rejected",
+            )
+        }
+    }
+
+    @Test
+    fun `a malformed name is rejected even when the file exists`() {
+        val dir = java.nio.file.Files.createTempDirectory("mig_bad_name_")
+        try {
+            for (bad in listOf(
+                "migration.sql",
+                "0001.sql",
+                "_admin.sql",
+                "0001_.sql",
+                "abc_admin.sql",
+                "0001_admin.sql.bak",
+                "0001_admin",
+            )) {
+                val file = dir.resolve(bad).also { it.toFile().writeText("select 1;") }
+                assertEquals(
+                    "malformed-migration-file",
+                    rejected(valid + (MigrationConfig.FILE_ENV to file.toString())).code,
+                    "an existing file named '$bad' must still be rejected",
+                )
+            }
+        } finally {
+            dir.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `established migration names are split by the one shared parser`() {
+        val cases = listOf(
+            "0001_admin_foundation.sql" to ("0001" to "admin_foundation"),
+            "0005_customers_payroll_hirepurchase.sql" to ("0005" to "customers_payroll_hirepurchase"),
+            "0008_authorize_admin_policies.sql" to ("0008" to "authorize_admin_policies"),
+            "0009_phase47_faults.sql" to ("0009" to "phase47_faults"),
+        )
+        for ((file, expected) in cases) {
+            // A directory prefix is allowed; only the file name is recorded.
+            val parsed = MigrationConfig.parseMigrationFile("supabase/migrations/$file")
+            assertEquals(file, parsed.fileName)
+            assertEquals(expected.first, parsed.version, "version of $file")
+            assertEquals(expected.second, parsed.name, "name of $file")
+        }
+    }
+
+    @Test
+    fun `the resolved config carries the same version and name that were validated`() {
+        val dir = java.nio.file.Files.createTempDirectory("mig_name_")
+        try {
+            val file = dir.resolve("0005_customers_payroll_hirepurchase.sql")
+                .also { it.toFile().writeText("select 1;") }
+            val config = MigrationConfig.resolve(valid + (MigrationConfig.FILE_ENV to file.toString()))
+            assertEquals("0005", config.migrationVersion)
+            assertEquals("customers_payroll_hirepurchase", config.migrationName)
+            assertEquals("0005_customers_payroll_hirepurchase.sql", config.migrationFileName)
+        } finally {
+            dir.toFile().deleteRecursively()
+        }
     }
 
     // ---- acceptance and redaction -----------------------------------------

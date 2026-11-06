@@ -61,6 +61,12 @@ import java.util.concurrent.Executor;
  * own exception stays primary and the cleanup failure is attached as
  * suppressed, so callers can distinguish "rolled back" from "outcome
  * uncertain".
+ *
+ * <p>Disposal is reported as an explicit {@link Disposal} - ABORTED,
+ * CLOSED_FALLBACK or DISPOSAL_UNCERTAIN - and never inferred from the absence
+ * of an error: a failed abort whose close() fallback worked is
+ * CLOSED_FALLBACK, and two failed cleanups are DISPOSAL_UNCERTAIN. The abort and
+ * close errors both remain attached as suppressed exceptions.
  */
 public final class MigrationHistory {
 
@@ -91,7 +97,8 @@ public final class MigrationHistory {
      * the rollback or discard failure (if any) attached as suppressed.
      *
      * @throws CommittedButUnclean the migration WAS committed, but the connection
-     *     could not be returned in a clean state; it has been discarded.
+     *     could not be returned in a clean state; {@link CommittedButUnclean#disposal}
+     *     says whether it was aborted, closed, or left in an uncertain state.
      */
     public static void apply(Connection c, String version, String name, String sql)
             throws SQLException {
@@ -161,32 +168,103 @@ public final class MigrationHistory {
                 "migration committed, but autocommit could not be restored: "
                     + resetError.getMessage(),
                 resetError);
-            discard(c, unclean);
+            unclean.disposal = discard(c, unclean);
             throw unclean;
         }
     }
 
     /**
      * Terminate the physical connection so PostgreSQL discards whatever
-     * transaction is still open. close() is only a fallback: JDBC does not
-     * promise that closing a connection with an open transaction rolls it back.
-     * Every cleanup failure is attached to {@code failure}, never dropped.
+     * transaction is still open. abort() is preferred; close() is only a
+     * fallback, because JDBC does not promise that closing a connection with an
+     * open transaction rolls it back.
+     *
+     * <p>Returns which of the three things actually happened and attaches the
+     * same facts as a {@link DisposalRecord} to {@code failure}, so a caller can
+     * report the connection state truthfully. Every cleanup failure is attached
+     * as {@link DiscardFailed}, never dropped: an abort that failed is recorded
+     * even when the fallback close() succeeded.
      */
-    private static void discard(Connection c, Throwable failure) {
+    private static Disposal discard(Connection c, Throwable failure) {
+        boolean abortSucceeded = false;
         try {
             c.abort(INLINE);
+            abortSucceeded = true;
         } catch (SQLException | RuntimeException abortError) {
             failure.addSuppressed(new DiscardFailed(
-                "abort failed, so the transaction outcome is uncertain: "
-                    + abortError.getMessage(),
+                "abort failed: " + abortError.getMessage(),
                 abortError));
-            try {
-                c.close();
-            } catch (SQLException | RuntimeException closeError) {
-                failure.addSuppressed(new DiscardFailed(
-                    "close failed as well: " + closeError.getMessage(), closeError));
+        }
+        if (abortSucceeded) {
+            failure.addSuppressed(new DisposalRecord(Disposal.ABORTED, true, false, false));
+            return Disposal.ABORTED;
+        }
+        boolean closeSucceeded = false;
+        try {
+            c.close();
+            closeSucceeded = true;
+        } catch (SQLException | RuntimeException closeError) {
+            failure.addSuppressed(new DiscardFailed(
+                "close failed as well, so the connection may still be open: "
+                    + closeError.getMessage(),
+                closeError));
+        }
+        Disposal disposal = closeSucceeded
+            ? Disposal.CLOSED_FALLBACK
+            : Disposal.DISPOSAL_UNCERTAIN;
+        failure.addSuppressed(new DisposalRecord(disposal, false, true, closeSucceeded));
+        return disposal;
+    }
+
+    /**
+     * How the runner disposed of a connection it could not reuse. There is no
+     * "unknown" member: when the outcome is not provable, it is reported as
+     * {@link #DISPOSAL_UNCERTAIN} rather than assumed clean.
+     */
+    public enum Disposal {
+        /** abort() succeeded; the server terminated the session. */
+        ABORTED,
+        /** abort() failed, but the fallback close() succeeded. */
+        CLOSED_FALLBACK,
+        /** abort() and close() both failed; the transaction outcome is unknown. */
+        DISPOSAL_UNCERTAIN
+    }
+
+    /**
+     * The recorded disposal outcome: which cleanup was attempted, which one
+     * worked, and whether anything is still open. Attached as a suppressed
+     * exception so it travels with the primary failure.
+     */
+    public static final class DisposalRecord extends Exception {
+        public final Disposal disposal;
+        public final boolean abortSucceeded;
+        public final boolean closeAttempted;
+        public final boolean closeSucceeded;
+
+        DisposalRecord(Disposal disposal, boolean abortSucceeded,
+                       boolean closeAttempted, boolean closeSucceeded) {
+            super("connection_disposal=" + disposal.name(), null, false, false);
+            this.disposal = disposal;
+            this.abortSucceeded = abortSucceeded;
+            this.closeAttempted = closeAttempted;
+            this.closeSucceeded = closeSucceeded;
+        }
+    }
+
+    /**
+     * The disposal outcome of a failed run, or null when the connection never
+     * needed disposing (rollback succeeded and autocommit was restored).
+     */
+    public static Disposal disposalOf(Throwable failure) {
+        if (failure instanceof CommittedButUnclean) {
+            return ((CommittedButUnclean) failure).disposal;
+        }
+        for (Throwable suppressed : failure.getSuppressed()) {
+            if (suppressed instanceof DisposalRecord) {
+                return ((DisposalRecord) suppressed).disposal;
             }
         }
+        return null;
     }
 
     /**
@@ -239,7 +317,11 @@ public final class MigrationHistory {
         return false;
     }
 
-    /** Whether the failed connection could not be terminated. */
+    /**
+     * Whether abort() or the fallback close() failed. True means the record
+     * still carries a discard error; the outcome itself is in
+     * {@link #disposalOf(Throwable)}.
+     */
     public static boolean discardFailed(Throwable failure) {
         for (Throwable suppressed : failure.getSuppressed()) {
             if (suppressed instanceof DiscardFailed) {
@@ -272,9 +354,13 @@ public final class MigrationHistory {
 
     /**
      * The migration committed, but the connection could not be returned to its
-     * original autocommit mode and was discarded. The migration IS applied.
+     * original autocommit mode and was discarded. The migration IS applied;
+     * {@link #disposal} states exactly how the connection ended.
      */
     public static final class CommittedButUnclean extends SQLException {
+        /** Never null by the time this escapes apply(). */
+        public Disposal disposal;
+
         CommittedButUnclean(String reason, Throwable cause) {
             super(reason, "08003", cause);
         }

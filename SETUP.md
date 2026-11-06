@@ -207,6 +207,36 @@ PROBE_CONFIRM=yes java -cp .:<postgresql.jar> ProbeState
 
 Expected: 30 tables, 6 views, 20 policies, 12 functions, 5 triggers.
 
+### Migration runner exit codes (`server/tools/ApplyMigration.java`)
+
+`ApplyMigration` applies ONE file transactionally. The exit code says what was
+proven; `migration_status` on stderr says what happened to the data.
+
+| Exit | Meaning | `migration_status` |
+|---|---|---|
+| 0 | the migration committed. `connection_disposal=none` means the connection was returned cleanly; `ABORTED`, `CLOSED_FALLBACK` or `DISPOSAL_UNCERTAIN` means the commit still stands but the connection could not be reset | `applied` |
+| 2 | configuration rejected **before a connection existed**: bad or missing variables, unreadable file, or a file name that is not `<digits>_<name>.sql` | — |
+| 3 | connected, but the database/role proves a different target than `MIGRATION_EXPECTED_TARGET`; no migration SQL ran | — |
+| 4 | connection failure, migration failure, or history-insert failure | `rolled_back`, `outcome_uncertain` or `error` |
+
+**Exit 4 does not mean the migration was rolled back.** It means the run did
+not commit. Read `migration_status`:
+
+- `rolled_back` — the rollback completed; no schema change or history row was
+  kept.
+- `outcome_uncertain` — the rollback itself failed (also `rollback_failed=true`),
+  so the server may still hold the transaction. The runner aborts the connection
+  instead of re-enabling autocommit, and `connection_disposal` reports whether the
+  abort worked (`ABORTED`), only the fallback close worked (`CLOSED_FALLBACK`), or
+  neither did (`DISPOSAL_UNCERTAIN`). Inspect the database by hand; never re-run
+  automatically.
+- `error` — no migration ran (connection or pre-flight failure).
+
+A committed migration whose connection cleanup failed exits 0, never 4, and
+prints both `migration_status=applied` and the `connection_disposal` outcome.
+Migration status and connection-disposal status are separate: one describes the
+DATA, the other the CONNECTION.
+
 ## 7. API configuration
 
 - Device API base URL is wherever the server runs (`http://localhost:8080`).

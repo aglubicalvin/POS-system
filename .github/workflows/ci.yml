@@ -38,6 +38,16 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # The migration fetch integration test drives the REAL `supabase migration
+      # fetch`. Without the CLI it skipped silently, so a broken history/fetch
+      # contract could pass CI. The action is pinned to an immutable commit for
+      # the reviewed v3 tag; the CLI version is the one the test was proven
+      # against locally.
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@689adcfb80d947100a1eab127289b97d1fb07b13 # v3
+        with:
+          version: '2.122.0'
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -59,6 +69,9 @@ jobs:
 
       - name: Server tests (no build cache, every test executed)
         working-directory: server
+        env:
+          # A missing CLI must FAIL in CI, never skip the fetch integration test.
+          SUPABASE_CLI_REQUIRED: 'true'
         run: ./gradlew --no-parallel -Dorg.gradle.jvmargs=-Xmx900m test --rerun-tasks --no-build-cache
 
       # A Gradle JavaExec failure is reported by Gradle as its own status (1); the

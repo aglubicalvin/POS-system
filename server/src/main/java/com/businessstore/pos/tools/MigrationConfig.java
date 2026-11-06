@@ -47,6 +47,12 @@ public final class MigrationConfig {
         java.util.regex.Pattern.compile("^[a-z0-9]{20}$");
     private static final java.util.regex.Pattern POOLER_USER =
         java.util.regex.Pattern.compile("^postgres\\.([a-z0-9]{20})$");
+    /**
+     * Migration file names: {@code <digits>_<name>.sql}. Used by
+     * parseMigrationFile, which is the single source of the version and name.
+     */
+    private static final java.util.regex.Pattern MIGRATION_FILENAME =
+        java.util.regex.Pattern.compile("^([0-9]+)_([^\\s./\\\\]+)\\.sql$");
 
     /**
      * The only hostname shape a migration may target.
@@ -93,13 +99,23 @@ public final class MigrationConfig {
         public final String password;
         public final String expectedTarget;
         public final String migrationFile;
+        /** File name only, e.g. "0005_customers_payroll_hirepurchase.sql". */
+        public final String migrationFileName;
+        /** Leading digits of the file name, e.g. "0005". */
+        public final String migrationVersion;
+        /** File name without the version prefix and the .sql suffix, e.g. "customers_payroll_hirepurchase". */
+        public final String migrationName;
 
-        Config(String url, String user, String password, String expectedTarget, String migrationFile) {
+        Config(String url, String user, String password, String expectedTarget,
+               String migrationFile, MigrationFile parsed) {
             this.url = url;
             this.user = user;
             this.password = password;
             this.expectedTarget = expectedTarget;
             this.migrationFile = migrationFile;
+            this.migrationFileName = parsed.fileName;
+            this.migrationVersion = parsed.version;
+            this.migrationName = parsed.name;
         }
 
         /** Safe description for logs: no host, no password, no full URL. */
@@ -107,6 +123,23 @@ public final class MigrationConfig {
             String withoutQuery = url.contains("?") ? url.substring(0, url.indexOf('?')) : url;
             String db = withoutQuery.substring(withoutQuery.lastIndexOf('/') + 1);
             return "database=" + db + " role=<redacted>";
+        }
+    }
+
+    /**
+     * A migration file name split into the parts the CLI uses: leading digits as
+     * the version, the rest as the name. Produced by ONE parser so validation,
+     * version extraction and name extraction cannot disagree.
+     */
+    public static final class MigrationFile {
+        public final String fileName;
+        public final String version;
+        public final String name;
+
+        MigrationFile(String fileName, String version, String name) {
+            this.fileName = fileName;
+            this.version = version;
+            this.name = name;
         }
     }
 
@@ -243,6 +276,10 @@ public final class MigrationConfig {
             throw new Rejected("missing-migration-file", "REFUSED: " + FILE_ENV + " is required.");
         }
         file = file.trim();
+        // Split and validate the NAME first: a file called migration.sql,
+        // 0001.sql or 0001_.sql cannot be recorded as a CLI migration row, and
+        // the failure must happen here rather than after a connection exists.
+        MigrationFile parsed = parseMigrationFile(file);
         java.io.File f = new java.io.File(file);
         if (!f.isFile()) {
             throw new Rejected("missing-migration-file",
@@ -253,7 +290,43 @@ public final class MigrationConfig {
                 "REFUSED: " + FILE_ENV + " names a file this process cannot read.");
         }
 
-        return new Config(url, user, pass, expected, file);
+        return new Config(url, user, pass, expected, file, parsed);
+    }
+
+    /**
+     * The ONLY parser for migration file names, shared by validation, version
+     * extraction and name extraction.
+     *
+     * Accepted: {@code <digits>_<non-empty-name>.sql}, e.g.
+     * {@code 0005_customers_payroll_hirepurchase.sql}. The name may not be
+     * empty, contain whitespace, a path separator or another dot, so every
+     * accepted file maps back to exactly one {@code <version>_<name>.sql} the
+     * CLI can write out again. Rejected: {@code migration.sql} (no version),
+     * {@code 0001.sql} (no name), {@code _admin.sql} / {@code 0001_.sql} (empty
+     * parts), {@code abc_admin.sql} (non-numeric version),
+     * {@code 0001_admin.sql.bak} and {@code 0001_admin} (not a .sql file).
+     */
+    public static MigrationFile parseMigrationFile(String path) throws Rejected {
+        String fileName;
+        try {
+            java.nio.file.Path name = java.nio.file.Path.of(path).getFileName();
+            if (name == null) {
+                throw new Rejected("malformed-migration-file",
+                    "REFUSED: " + FILE_ENV + " does not name a file.");
+            }
+            fileName = name.toString();
+        } catch (java.nio.file.InvalidPathException e) {
+            throw new Rejected("malformed-migration-file",
+                "REFUSED: " + FILE_ENV + " is not a usable path.");
+        }
+        java.util.regex.Matcher m = MIGRATION_FILENAME.matcher(fileName);
+        if (!m.matches()) {
+            throw new Rejected("malformed-migration-file",
+                "REFUSED: " + FILE_ENV + " must be named <digits>_<name>.sql, for example " +
+                "0005_customers_payroll_hirepurchase.sql. The version and name are recorded " +
+                "in supabase_migrations.schema_migrations and must round-trip through the CLI.");
+        }
+        return new MigrationFile(fileName, m.group(1), m.group(2));
     }
 
     /** Reject retargeting or TLS-replacing query parameters, and unknown keys. */

@@ -33,7 +33,10 @@ import com.businessstore.pos.tools.MigrationHistory;
  *  5. A failed rollback is never followed by setAutoCommit(true), which JDBC would
  *     treat as a COMMIT: the connection is aborted so the server discards the
  *     transaction, and the run reports outcome_uncertain instead of rolled_back.
- *  5. Diagnostics are sanitized: SQLState and a short message with host, port,
+ *  6. The migration file name must be `<digits>_<name>.sql`, validated with the
+ *     same parser that supplies the recorded version and name, BEFORE any
+ *     connection is created.
+ *  7. Diagnostics are sanitized: SQLState and a short message with host, port,
  *     database and role scrubbed. No stack traces, no credentials.
  *
  * Usage:
@@ -41,8 +44,33 @@ import com.businessstore.pos.tools.MigrationHistory;
  *   CHECK_URL=jdbc:postgresql://host:port/postgres CHECK_USER=... CHECK_PASS=...
  *   java -cp ... com.businessstore.pos.tools.ApplyMigration
  *
- * Exit codes: 0 applied; 2 configuration rejected; 3 connected target is not the
- * expected one; 4 migration failed and was rolled back.
+ * Exit codes say what was PROVEN, not merely that the process stopped:
+ *
+ *   0  The migration committed. This includes a commit whose connection could
+ *      not be returned to the caller's autocommit mode: the migration is still
+ *      applied, and `migration_status=applied` is accompanied by
+ *      `connection_disposal=ABORTED|CLOSED_FALLBACK|DISPOSAL_UNCERTAIN`.
+ *   2  Configuration rejected before any connection was opened (missing or
+ *      malformed variables, unreadable file, or a file name that is not
+ *      `<digits>_<name>.sql`). Nothing was sent to a server.
+ *   3  Connected, but the session's database or role proves a different target
+ *      than MIGRATION_EXPECTED_TARGET. No migration SQL was executed.
+ *   4  Anything after configuration succeeded: a connection failure before the
+ *      migration, a migration failure, or a history-insert failure.
+ *
+ *      EXIT 4 DOES NOT MEAN THE MIGRATION WAS ROLLED BACK. Read
+ *      `migration_status` on stderr:
+ *        rolled_back        the transaction was rolled back; no schema change or
+ *                           history row was kept.
+ *        outcome_uncertain  rollback threw, so the server may still hold the
+ *                           transaction. `connection_disposal` reports how the
+ *                           connection ended; the file must be inspected by hand.
+ *        error              no migration ran (connection or pre-flight failure).
+ *
+ *      A successful commit with a failed connection reset is exit 0, never 4, so
+ *      the exit code can be trusted to distinguish "applied" from "not
+ *      applied". `migration_status` and `connection_disposal` are separate
+ *      concepts: the first describes the data, the second the connection.
  */
 public class ApplyMigration {
 
@@ -68,7 +96,7 @@ public class ApplyMigration {
 
         System.out.println("== apply migration ==");
         System.out.println("  target: " + config.describe());
-        System.out.println("  file: " + Path.of(config.migrationFile).getFileName());
+        System.out.println("  file: " + config.migrationFileName);
 
         try (Connection c = DriverManager.getConnection(config.url, config.user, config.password)) {
             // Verify the CONNECTED session before writing anything.
@@ -108,20 +136,22 @@ public class ApplyMigration {
 
             // ONE transaction for the bootstrap DDL, the migration SQL and its
             // history row; see MigrationHistory for the CLI-compatible table.
-            // The version/name split is the CLI's own: 0005_admin.sql -> 0005,
+            // The version/name split comes from MigrationConfig.parseMigrationFile,
+            // the same parser that validated the name: 0005_admin.sql -> 0005,
             // admin. Fetching the row then rewrites 0005_admin.sql, not
             // 0005_0005_admin.sql.sql.
-            String version = versionOf(config.migrationFile);
+            String version = config.migrationVersion;
             try {
-                MigrationHistory.apply(c, version, nameOf(config.migrationFile), sql);
+                MigrationHistory.apply(c, version, config.migrationName, sql);
                 System.out.println("  migration_status=applied");
+                System.out.println("  connection_disposal=none");
                 System.out.println("  version=" + version);
             } catch (MigrationHistory.CommittedButUnclean e) {
-                // The COMMIT succeeded; only resetting the connection failed, so
-                // the migration must NOT be reported as rolled back.
+                // The COMMIT succeeded; only resetting/terminating the connection
+                // failed, so the migration must NOT be reported as rolled back.
                 System.out.println("  migration_status=applied");
                 System.out.println("  version=" + version);
-                System.err.println("  connection_state=discarded");
+                System.err.println("  connection_disposal=" + e.disposal.name());
                 System.err.println("  error_detail=" + sanitize(e));
             } catch (SQLException e) {
                 if (MigrationHistory.rollbackFailed(e)) {
@@ -129,39 +159,22 @@ public class ApplyMigration {
                     // "rolled_back" here would be a claim we cannot make.
                     System.err.println("  migration_status=outcome_uncertain");
                     System.err.println("  rollback_failed=true");
-                    System.err.println(
-                        "  connection_discarded=" + !MigrationHistory.discardFailed(e));
                 } else {
                     System.err.println("  migration_status=rolled_back");
                 }
+                MigrationHistory.Disposal disposal = MigrationHistory.disposalOf(e);
+                System.err.println("  connection_disposal="
+                    + (disposal == null ? "none" : disposal.name()));
                 System.err.println("  error_detail=" + sanitize(e));
                 System.exit(4);
             }
         } catch (SQLException e) {
             System.err.println("  migration_status=error");
             System.err.println("  error_category=connection_failed");
+            System.err.println("  connection_disposal=none");
             System.err.println("  error_detail=" + sanitize(e));
             System.exit(4);
         }
-    }
-
-    /**
-     * "0003_admin_roles.sql" -> "admin_roles": the name the CLI's own file
-     * parser stores (it strips the version prefix and the .sql suffix), so a
-     * fetched row is written back as 0003_admin_roles.sql.
-     */
-    static String nameOf(String file) {
-        String name = Path.of(file).getFileName().toString();
-        int underscore = name.indexOf('_');
-        String rest = underscore > 0 ? name.substring(underscore + 1) : name;
-        return rest.endsWith(".sql") ? rest.substring(0, rest.length() - 4) : rest;
-    }
-
-    /** "0003_admin_roles.sql" -> "0003". */
-    static String versionOf(String file) {
-        String name = Path.of(file).getFileName().toString();
-        int underscore = name.indexOf('_');
-        return underscore > 0 ? name.substring(0, underscore) : name.replace(".sql", "");
     }
 
     /**

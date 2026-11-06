@@ -35,6 +35,13 @@ import java.util.concurrent.TimeUnit
  *  3. A failed rollback must never be followed by `setAutoCommit(true)` (JDBC
  *     commits an active transaction when autocommit is enabled): the connection
  *     is aborted instead and the failure is reported as an uncertain outcome.
+ *  4. Connection disposal is reported explicitly - ABORTED, CLOSED_FALLBACK or
+ *     DISPOSAL_UNCERTAIN - with each cleanup failure preserved as a suppressed
+ *     exception, including when the migration itself committed (tests A-D).
+ *
+ * The `supabase migration fetch` check is a real CLI run against the embedded
+ * server. It skips on a developer machine without the CLI but FAILS when
+ * `SUPABASE_CLI_REQUIRED=true`, which is how CI runs it.
  */
 class MigrationTransactionTest {
 
@@ -439,9 +446,26 @@ class MigrationTransactionTest {
         }
     }
 
+    /**
+     * The real CLI, or null when this machine has none. CI sets
+     * SUPABASE_CLI_REQUIRED=true (the workflow installs the pinned CLI), so a
+     * missing binary is a FAILURE there and only a skip on a developer machine.
+     * A skipped run in CI used to hide a broken fetch contract.
+     */
+    private fun requiredSupabaseCli(): String? {
+        val cli = findSupabaseCli()
+        if (cli == null && System.getenv("SUPABASE_CLI_REQUIRED") == "true") {
+            throw AssertionError(
+                "SUPABASE_CLI_REQUIRED=true but no supabase CLI was found. CI installs it " +
+                    "with supabase/setup-cli; set SUPABASE_CLI=<path> to point at a binary.",
+            )
+        }
+        return cli
+    }
+
     @Test
     fun `the supabase cli fetches the recorded migration`() {
-        val cli = findSupabaseCli()
+        val cli = requiredSupabaseCli()
         assumeTrue(
             cli != null,
             "supabase CLI not installed; set SUPABASE_CLI=<path> to run this integration check",
@@ -457,20 +481,38 @@ class MigrationTransactionTest {
             // defaults to TLS. Nothing here is remote.
             val url = "postgresql://postgres@127.0.0.1:${TestDb.port}/$db?sslmode=disable"
 
+            // Output goes to a FILE, not a pipe we read before waiting: reading
+            // a pipe to EOF blocks until the process exits, so waitFor(timeout)
+            // could never fire if the CLI hung while producing a lot of output.
+            val log = workdir.resolve("fetch.log").toFile()
             val process = ProcessBuilder(
                 cli!!, "migration", "fetch", "--db-url", url, "--workdir", workdir.toString(),
-            ).redirectErrorStream(true).start()
-            val output = process.inputStream.bufferedReader().readText()
-            val finished = process.waitFor(180, TimeUnit.SECONDS)
-            assertTrue(finished, "supabase migration fetch did not finish: $output")
+            ).redirectErrorStream(true).redirectOutput(log).start()
+
+            if (!process.waitFor(180, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                process.waitFor(30, TimeUnit.SECONDS)
+                throw AssertionError(
+                    "supabase migration fetch did not finish in 180s; output so far:\n" +
+                        log.readText(),
+                )
+            }
+            val output = log.readText()
             assertEquals(0, process.exitValue(), "supabase migration fetch failed: $output")
 
+            // The recorded name and statements must round-trip through the CLI's
+            // own file writer, not just through our reconstruction helper.
             val fetched = migrations.resolve("0011_rec.sql")
             assertTrue(Files.exists(fetched), "the CLI must write $fetched; output: $output")
             assertEquals(
                 multiStatementMigration + ";\n",
                 Files.readString(fetched),
                 "the fetched file must be the original migration",
+            )
+            assertEquals(
+                listOf("0011_rec.sql"),
+                migrations.toFile().list()!!.sorted(),
+                "the CLI must write exactly one migration file; output: $output",
             )
         } finally {
             workdir.toFile().deleteRecursively()
@@ -635,8 +677,14 @@ class MigrationTransactionTest {
         }
     }
 
+    /**
+     * Test A: migration fails, rollback fails, abort fails, close succeeds.
+     *
+     * Every step is observed through the proxy, and the database is inspected on
+     * an independent connection afterwards.
+     */
     @Test
-    fun `a failed abort is reported as an uncertain outcome`() {
+    fun `a failed rollback with a failed abort and a close fallback is reported closed fallback`() {
         val db = newDatabase()
         val real = dataSourceFor(db).connection
         try {
@@ -653,25 +701,58 @@ class MigrationTransactionTest {
                 )
             }.exceptionOrNull() as? SQLException ?: error("expected the migration to fail")
 
-            assertEquals("42P01", failure.sqlState)
-            assertTrue(MigrationHistory.rollbackFailed(failure))
-            assertTrue(
-                MigrationHistory.discardFailed(failure),
-                "an abort failure must not be dropped: ${failure.suppressed.toList()}",
+            // The migration's own error stays primary; rollback and abort are
+            // suppressed, not dropped.
+            assertEquals("42P01", failure.sqlState, "the migration error must stay primary")
+            assertEquals(
+                1,
+                failure.suppressed.count { it is MigrationHistory.RollbackFailed },
+                "suppressed: ${failure.suppressed.toList()}",
             )
-            assertTrue(failure.suppressed.any { it is MigrationHistory.DiscardFailed })
+            assertTrue(
+                failure.suppressed.any { it is MigrationHistory.DiscardFailed },
+                "the abort failure must stay observable: ${failure.suppressed.toList()}",
+            )
+
+            // Autocommit is never re-enabled and no commit follows the failure.
             assertFalse(
                 faulty.calls.any { it == "setAutoCommit[true]" },
-                "autocommit must never be enabled when cleanup failed: ${faulty.calls}",
+                "autocommit must never be enabled after a failed rollback: ${faulty.calls}",
             )
+            assertFalse(
+                faulty.calls.dropWhile { !it.startsWith("rollback") }.any { it.startsWith("commit") },
+                "no commit may follow the failed rollback: ${faulty.calls}",
+            )
+
+            // Abort was attempted, then the close fallback was attempted and won.
+            assertTrue(faulty.calls.contains("abort(failed)"), "calls: ${faulty.calls}")
+            assertTrue(faulty.calls.any { it.startsWith("close") }, "calls: ${faulty.calls}")
+            val record = failure.suppressed
+                .filterIsInstance<MigrationHistory.DisposalRecord>().single()
+            assertFalse(record.abortSucceeded)
+            assertTrue(record.closeAttempted)
+            assertTrue(record.closeSucceeded)
+            assertEquals(MigrationHistory.Disposal.CLOSED_FALLBACK, record.disposal)
+            assertEquals(
+                MigrationHistory.Disposal.CLOSED_FALLBACK,
+                MigrationHistory.disposalOf(failure),
+            )
+
+            // This is what the embedded server did with a connection closed after
+            // a failed rollback; it is an observation, not a JDBC guarantee.
+            assertTrue(faulty.proxy.isClosed, "the fallback close must have run")
+            val check = dataSourceFor(db)
+            assertFalse(tableExists(check, "mig_rb2"), "the DDL must not survive")
+            assertTrue(historyRows(check).isEmpty(), "no history row may survive")
         } finally {
             runCatching { real.close() }
             drop(db)
         }
     }
 
+    /** Test B: commit succeeds, autocommit reset fails, abort succeeds. */
     @Test
-    fun `a committed migration with an unresettable connection is reported committed`() {
+    fun `a committed migration with a failed reset and a successful abort is reported aborted`() {
         val db = newDatabase()
         val real = dataSourceFor(db).connection
         try {
@@ -681,7 +762,7 @@ class MigrationTransactionTest {
                     faulty.proxy,
                     "0092",
                     "ok",
-                    "create table mig_committed (id int)",
+                    "create table mig_committed_b (id int)",
                 )
             }.exceptionOrNull()
 
@@ -689,12 +770,106 @@ class MigrationTransactionTest {
                 thrown is MigrationHistory.CommittedButUnclean,
                 "a durable commit must not be reported as a failed migration: $thrown",
             )
-            // The commit itself stands and was not rolled back.
+            val unclean = thrown as MigrationHistory.CommittedButUnclean
+            assertEquals(MigrationHistory.Disposal.ABORTED, unclean.disposal)
+            assertEquals(MigrationHistory.Disposal.ABORTED, MigrationHistory.disposalOf(unclean))
+            // abort(Executor) records its argument, so match the prefix.
+            assertTrue(faulty.calls.any { it.startsWith("abort[") }, "calls: ${faulty.calls}")
+            assertFalse(
+                faulty.calls.any { it.startsWith("close") },
+                "a successful abort must not fall back to close: ${faulty.calls}",
+            )
+
+            // The commit stands; verified independently.
             val check = dataSourceFor(db)
-            assertTrue(tableExists(check, "mig_committed"))
+            assertTrue(tableExists(check, "mig_committed_b"))
             assertEquals(listOf("0092" to "ok"), historyRows(check))
-            assertTrue(faulty.calls.any { it.startsWith("commit") }, "calls: ${faulty.calls}")
-            assertTrue(faulty.proxy.isClosed, "the unclean connection must be discarded")
+        } finally {
+            runCatching { real.close() }
+            drop(db)
+        }
+    }
+
+    /** Test C: commit succeeds, reset fails, abort fails, close succeeds. */
+    @Test
+    fun `a committed migration with failed abort and close fallback is reported closed fallback`() {
+        val db = newDatabase()
+        val real = dataSourceFor(db).connection
+        try {
+            val faulty = FaultyConnection(real).also {
+                it.failAutoCommitReset = true
+                it.failAbort = true
+            }
+            val unclean = runCatching {
+                MigrationHistory.apply(
+                    faulty.proxy,
+                    "0093",
+                    "ok",
+                    "create table mig_committed_c (id int)",
+                )
+            }.exceptionOrNull() as? MigrationHistory.CommittedButUnclean
+                ?: error("a committed migration must be reported as applied")
+
+            assertEquals(MigrationHistory.Disposal.CLOSED_FALLBACK, unclean.disposal)
+            assertTrue(faulty.calls.contains("abort(failed)"), "calls: ${faulty.calls}")
+            assertTrue(faulty.calls.any { it.startsWith("close") }, "calls: ${faulty.calls}")
+            assertTrue(
+                unclean.suppressed.any { it is MigrationHistory.DiscardFailed },
+                "the abort failure must stay observable: ${unclean.suppressed.toList()}",
+            )
+            assertTrue(faulty.proxy.isClosed, "the close fallback must have run")
+
+            val check = dataSourceFor(db)
+            assertTrue(tableExists(check, "mig_committed_c"), "the commit must stand")
+            assertEquals(listOf("0093" to "ok"), historyRows(check))
+        } finally {
+            runCatching { real.close() }
+            drop(db)
+        }
+    }
+
+    /** Test D: commit succeeds, reset fails, abort fails, close fails. */
+    @Test
+    fun `a committed migration with no working disposal is reported disposal uncertain`() {
+        val db = newDatabase()
+        val real = dataSourceFor(db).connection
+        try {
+            val faulty = FaultyConnection(real).also {
+                it.failAutoCommitReset = true
+                it.failAbort = true
+                it.failClose = true
+            }
+            val unclean = runCatching {
+                MigrationHistory.apply(
+                    faulty.proxy,
+                    "0094",
+                    "ok",
+                    "create table mig_committed_d (id int)",
+                )
+            }.exceptionOrNull() as? MigrationHistory.CommittedButUnclean
+                ?: error("a committed migration must be reported as applied")
+
+            assertEquals(MigrationHistory.Disposal.DISPOSAL_UNCERTAIN, unclean.disposal)
+            assertTrue(faulty.calls.contains("abort(failed)"), "calls: ${faulty.calls}")
+            assertTrue(faulty.calls.contains("close(failed)"), "calls: ${faulty.calls}")
+
+            // Both cleanup failures stay attached, so "uncertain" is diagnosable.
+            val discardErrors = unclean.suppressed.filterIsInstance<MigrationHistory.DiscardFailed>()
+            assertEquals(
+                2,
+                discardErrors.size,
+                "abort and close failures must both be preserved: ${unclean.suppressed.toList()}",
+            )
+            val record = unclean.suppressed
+                .filterIsInstance<MigrationHistory.DisposalRecord>().single()
+            assertFalse(record.abortSucceeded)
+            assertTrue(record.closeAttempted)
+            assertFalse(record.closeSucceeded)
+
+            // The migration is still committed, despite the connection outcome.
+            val check = dataSourceFor(db)
+            assertTrue(tableExists(check, "mig_committed_d"))
+            assertEquals(listOf("0094" to "ok"), historyRows(check))
         } finally {
             runCatching { real.close() }
             drop(db)
@@ -709,6 +884,7 @@ class MigrationTransactionTest {
         val calls = mutableListOf<String>()
         var failRollback = false
         var failAbort = false
+        var failClose = false
         var failAutoCommitReset = false
 
         val proxy: Connection = Proxy.newProxyInstance(
@@ -724,6 +900,10 @@ class MigrationTransactionTest {
                 method.name == "abort" && failAbort -> {
                     calls += "abort(failed)"
                     throw SQLException("injected abort failure", "08003")
+                }
+                method.name == "close" && failClose -> {
+                    calls += "close(failed)"
+                    throw SQLException("injected close failure", "08003")
                 }
                 method.name == "setAutoCommit" && values.firstOrNull() == true &&
                     failAutoCommitReset -> {
@@ -743,7 +923,7 @@ class MigrationTransactionTest {
         } as Connection
     }
 
-    /** The real CLI when it is available locally; CI has no supabase binary. */
+    /** The real CLI when this machine has one (CI installs it before the tests). */
     private fun findSupabaseCli(): String? =
         listOfNotNull(System.getenv("SUPABASE_CLI"), "supabase", "supabase.cmd", "supabase.exe")
             .firstOrNull { exe ->
