@@ -2,11 +2,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.DriverManager;
-import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import com.businessstore.pos.tools.MigrationConfig;
+import com.businessstore.pos.tools.MigrationHistory;
 
 /**
  * Apply ONE migration file to an explicitly confirmed database, transactionally.
@@ -18,13 +18,16 @@ import com.businessstore.pos.tools.MigrationConfig;
  *     connection exists, and an unset URL is a hard failure.
  *  2. Explicit confirmation (MIGRATION_CONFIRM=yes) and an independently supplied
  *     expected project reference (MIGRATION_EXPECTED_TARGET) are required.
- *  3. The migration file, the supabase_migrations tracking structures it needs
- *     and its history row are written in ONE transaction: if any step fails,
- *     none of them is kept. A migration can therefore never be recorded as
- *     applied after partial execution, and a database that has never held a
- *     migration is bootstrapped atomically instead of assuming the tracking
+ *  3. The bootstrap DDL for supabase_migrations.schema_migrations, the migration
+ *     file and its history row are written in ONE transaction (MigrationHistory):
+ *     if any step fails, none of them is kept. A migration can therefore never be
+ *     recorded as applied after partial execution, and a database that has never
+ *     held a migration is bootstrapped atomically instead of assuming the tracking
  *     schema already exists.
- *  4. Diagnostics are sanitized: SQLState and a short message with host, port,
+ *  4. The history table is the one the Supabase CLI creates (`statements text[]`,
+ *     `name text`), so a CLI-managed database is written to correctly rather than
+ *     rejected on a column type.
+ *  5. Diagnostics are sanitized: SQLState and a short message with host, port,
  *     database and role scrubbed. No stack traces, no credentials.
  *
  * Usage:
@@ -98,42 +101,13 @@ public class ApplyMigration {
             }
 
             // ONE transaction for the bootstrap DDL, the migration SQL and its
-            // history row. A database that has never been migrated has no
-            // supabase_migrations schema, so the tracking structures are created
-            // here rather than assumed: without this the very first migration
-            // would fail on the history insert after its own DDL had already run.
-            // CREATE SCHEMA and CREATE TABLE are transactional in PostgreSQL, so a
-            // failure removes the tracking structures together with the migration.
-            c.setAutoCommit(false);
+            // history row; see MigrationHistory for the CLI-compatible table.
+            String fileName = Path.of(config.migrationFile).getFileName().toString();
             try {
-                try (Statement st = c.createStatement()) {
-                    st.execute("create schema if not exists supabase_migrations");
-                    st.execute(
-                            "create table if not exists supabase_migrations.schema_migrations (" +
-                            " version text primary key," +
-                            " statements jsonb," +
-                            " name text not null," +
-                            " statements_hash text," +
-                            " executed_at timestamp not null default clock_timestamp())");
-                    st.execute(sql);
-                }
-                try (PreparedStatement ps = c.prepareStatement(
-                        "insert into supabase_migrations.schema_migrations (version, name, statements) " +
-                        "values (?, ?, to_jsonb(?::text)) on conflict (version) do nothing")) {
-                    ps.setString(1, versionOf(config.migrationFile));
-                    ps.setString(2, Path.of(config.migrationFile).getFileName().toString());
-                    ps.setString(3, "applied by ApplyMigration");
-                    ps.executeUpdate();
-                }
-                c.commit();
+                MigrationHistory.apply(c, versionOf(config.migrationFile), fileName, sql);
                 System.out.println("  migration_status=applied");
                 System.out.println("  version=" + versionOf(config.migrationFile));
             } catch (SQLException e) {
-                try {
-                    c.rollback();
-                } catch (SQLException rollbackError) {
-                    e.addSuppressed(rollbackError);
-                }
                 System.err.println("  migration_status=rolled_back");
                 System.err.println("  error_detail=" + sanitize(e));
                 System.exit(4);
