@@ -224,8 +224,20 @@ public final class MigrationConfig {
         java.util.Map<String, Integer> seen = new java.util.HashMap<>();
         for (String pair : query.split("&")) {
             if (pair.isEmpty()) continue;
-            String key = pair.contains("=") ? pair.substring(0, pair.indexOf('=')) : pair;
-            key = key.trim().toLowerCase();
+            String rawKey = pair.contains("=") ? pair.substring(0, pair.indexOf('=')) : pair;
+            rawKey = rawKey.trim();
+            // pgJDBC matches query keys CASE-SENSITIVELY: "SSLMODE=verify-full" is
+            // ignored by the driver, which then falls back to its default (no
+            // certificate or hostname verification). Lowercasing the key here would
+            // accept a spelling the driver does not honour, so a case-variant key is
+            // rejected outright rather than normalised.
+            if (!rawKey.equals(rawKey.toLowerCase())) {
+                throw new Rejected("case-variant-parameter",
+                    "REFUSED: " + URL_ENV + " uses the parameter '" + rawKey + "' with " +
+                    "non-lowercase characters. pgJDBC matches parameter names case-sensitively, " +
+                    "so this spelling would be ignored by the driver. Use lowercase 'sslmode'.");
+            }
+            String key = rawKey;
             if (key.isEmpty()) {
                 throw new Rejected("malformed-url", "REFUSED: " + URL_ENV + " has an empty query parameter name.");
             }
@@ -244,7 +256,9 @@ public final class MigrationConfig {
             throw new Rejected("duplicate-sslmode",
                 "REFUSED: " + URL_ENV + " sets sslmode more than once.");
         }
-        String mode = query.toLowerCase();
+        // Read from the original-case query. Lowercasing first would find
+        // "SSLMODE=" and accept a value the driver never sees.
+        String mode = query;
         int i = mode.indexOf("sslmode=");
         if (i < 0) {
             throw new Rejected("tls-required",

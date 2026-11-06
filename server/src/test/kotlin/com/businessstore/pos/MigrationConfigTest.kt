@@ -247,4 +247,49 @@ class MigrationConfigTest {
         )
         assertNotNull(config, "a verify-full configuration must be accepted")
     }
+    // ---- parameter keys are case-sensitive, like pgJDBC -------------------
+
+    @Test
+    fun `an uppercase SSLMODE key is rejected`() {
+        // pgJDBC matches query keys case-sensitively, so "SSLMODE=verify-full" is
+        // ignored by the driver and the connection falls back to its default --
+        // opportunistic TLS with no certificate or hostname verification. The
+        // validator must not normalise this into an accepted key.
+        assertEquals(
+            "case-variant-parameter",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?SSLMODE=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `every mixed-case spelling of sslmode is rejected`() {
+        for (key in listOf("SslMode", "sslMode", "Sslmode", "SSLmode", "ssLmode")) {
+            assertEquals(
+                "case-variant-parameter",
+                rejected(valid + ("CHECK_URL" to
+                    "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?$key=verify-full")).code,
+                "key '$key' must not be accepted",
+            )
+        }
+    }
+
+    @Test
+    fun `a case-variant key is rejected even with a weak value`() {
+        // The rejection must not depend on the value: the key itself is unusable.
+        assertEquals(
+            "case-variant-parameter",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?SSLMODE=disable")).code,
+        )
+    }
+
+    @Test
+    fun `the exact lowercase key is still accepted`() {
+        val config = MigrationConfig.resolve(
+            valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-full"),
+        )
+        assertNotNull(config, "the exact lowercase key must remain accepted")
+    }
 }
