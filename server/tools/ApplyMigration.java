@@ -36,7 +36,13 @@ import com.businessstore.pos.tools.MigrationHistory;
  *  6. The migration file name must be `<digits>_<name>.sql`, validated with the
  *     same parser that supplies the recorded version and name, BEFORE any
  *     connection is created.
- *  7. Diagnostics are sanitized: SQLState and a short message with host, port,
+ *  7. A version that is ALREADY recorded is rejected before its SQL runs: the
+ *     transaction bootstraps the history table, checks
+ *     `supabase_migrations.schema_migrations` for the version, and only then
+ *     executes the file. The history insert's affected-row count is verified
+ *     too, so two runners racing on the same version cannot both commit - the
+ *     loser rolls its schema changes back instead of committing them unrecorded.
+ *  8. Diagnostics are sanitized: SQLState and a short message with host, port,
  *     database and role scrubbed. No stack traces, no credentials.
  *
  * Usage:
@@ -56,10 +62,18 @@ import com.businessstore.pos.tools.MigrationHistory;
  *   3  Connected, but the session's database or role proves a different target
  *      than MIGRATION_EXPECTED_TARGET. No migration SQL was executed.
  *   4  Anything after configuration succeeded: a connection failure before the
- *      migration, a migration failure, or a history-insert failure.
+ *      migration, a migration failure, a history-insert failure, or a version
+ *      that was already recorded. Nothing from this run was committed.
  *
  *      EXIT 4 DOES NOT MEAN THE MIGRATION WAS ROLLED BACK. Read
  *      `migration_status` on stderr:
+ *        already_applied    this version is already recorded; its SQL did not
+ *                           run and the existing history row is unchanged.
+ *                           Nothing needed to be undone.
+ *        version_conflict   another runner recorded the same version between
+ *                           this run's pre-check and its insert, so zero
+ *                           history rows were inserted; this run's migration
+ *                           SQL was rolled back and was NOT applied.
  *        rolled_back        the transaction was rolled back; no schema change or
  *                           history row was kept.
  *        outcome_uncertain  rollback threw, so the server may still hold the
@@ -154,13 +168,29 @@ public class ApplyMigration {
                 System.err.println("  connection_disposal=" + e.disposal.name());
                 System.err.println("  error_detail=" + sanitize(e));
             } catch (SQLException e) {
+                // A duplicate version is not a generic failure: say which kind so
+                // an operator does not re-run a file that was never executed, or
+                // chase a migration that a concurrent runner already applied.
+                String category = null;
+                if (e instanceof MigrationHistory.MigrationAlreadyApplied) {
+                    category = "migration_already_applied";
+                } else if (e instanceof MigrationHistory.MigrationVersionConflict) {
+                    category = "migration_version_conflict";
+                }
                 if (MigrationHistory.rollbackFailed(e)) {
                     // The transaction may still be live on the server; saying
                     // "rolled_back" here would be a claim we cannot make.
                     System.err.println("  migration_status=outcome_uncertain");
                     System.err.println("  rollback_failed=true");
+                } else if ("migration_already_applied".equals(category)) {
+                    System.err.println("  migration_status=already_applied");
+                } else if ("migration_version_conflict".equals(category)) {
+                    System.err.println("  migration_status=version_conflict");
                 } else {
                     System.err.println("  migration_status=rolled_back");
+                }
+                if (category != null) {
+                    System.err.println("  error_category=" + category);
                 }
                 MigrationHistory.Disposal disposal = MigrationHistory.disposalOf(e);
                 System.err.println("  connection_disposal="

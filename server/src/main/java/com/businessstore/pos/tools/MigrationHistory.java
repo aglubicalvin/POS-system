@@ -67,6 +67,24 @@ import java.util.concurrent.Executor;
  * of an error: a failed abort whose close() fallback worked is
  * CLOSED_FALLBACK, and two failed cleanups are DISPOSAL_UNCERTAIN. The abort and
  * close errors both remain attached as suppressed exceptions.
+ *
+ * <p>Duplicate versions. A version that is already recorded is rejected by a
+ * pre-check AFTER the bootstrap DDL and BEFORE the migration SQL runs, so a
+ * second invocation of a non-idempotent file cannot re-execute it ({@link
+ * MigrationAlreadyApplied}). The pre-check alone cannot stop two runners that
+ * both read the version as absent, so the history insert keeps
+ * {@code on conflict (version) do nothing} and its affected-row count is
+ * verified: zero rows means another runner recorded the version first and the
+ * whole transaction must roll back ({@link MigrationVersionConflict}) rather
+ * than commit schema changes that no history row vouches for.
+ *
+ * <p>Bootstrap locking. Each bootstrap statement is executed only when the
+ * object it creates is actually missing. Running {@code alter table ... add
+ * column if not exists} on a table that already has the column still takes
+ * ACCESS EXCLUSIVE for the rest of the transaction, which would serialise every
+ * concurrent runner on the history table and turn a duplicate-version race into
+ * an invisible queue. The statements themselves are unchanged, so the CLI shape
+ * is still what a fresh database ends up with.
  */
 public final class MigrationHistory {
 
@@ -96,6 +114,16 @@ public final class MigrationHistory {
      * not at all. Any failure rolls every one of them back and is rethrown, with
      * the rollback or discard failure (if any) attached as suppressed.
      *
+     * <p>Order matters and is part of the contract: read autocommit, disable it,
+     * bootstrap, check the version, run the migration, insert history, verify one
+     * row was inserted, commit. An already-recorded version never reaches the
+     * migration SQL.
+     *
+     * @throws MigrationAlreadyApplied the version was recorded before this run;
+     *     the migration SQL did not execute and the history row is unchanged.
+     * @throws MigrationVersionConflict the history insert affected zero rows
+     *     because a concurrent runner recorded the same version first; the
+     *     migration SQL is rolled back, never committed.
      * @throws CommittedButUnclean the migration WAS committed, but the connection
      *     could not be returned in a clean state; {@link CommittedButUnclean#disposal}
      *     says whether it was aborted, closed, or left in an uncertain state.
@@ -105,10 +133,11 @@ public final class MigrationHistory {
         boolean autoCommit = c.getAutoCommit();
         c.setAutoCommit(false);
         try {
+            bootstrap(c);
+            if (alreadyRecorded(c, version)) {
+                throw new MigrationAlreadyApplied(version);
+            }
             try (Statement st = c.createStatement()) {
-                for (String ddl : BOOTSTRAP) {
-                    st.execute(ddl);
-                }
                 st.execute(sql);
             }
             insert(c, version, name, sql);
@@ -268,8 +297,74 @@ public final class MigrationHistory {
     }
 
     /**
+     * Execute the CLI bootstrap inside the caller's transaction, skipping every
+     * statement whose object already exists so an up-to-date table is not locked
+     * for the duration of the migration.
+     */
+    private static void bootstrap(Connection c) throws SQLException {
+        try (Statement st = c.createStatement()) {
+            if (!queryExists(c, "select 1 from information_schema.schemata "
+                    + "where schema_name = 'supabase_migrations'")) {
+                st.execute(BOOTSTRAP[0]);
+            }
+            if (!queryExists(c, "select 1 from information_schema.tables "
+                    + "where table_schema = 'supabase_migrations' "
+                    + "and table_name = 'schema_migrations'")) {
+                st.execute(BOOTSTRAP[1]);
+            }
+            if (statementsType(c) == null) {
+                st.execute(BOOTSTRAP[2]);
+            }
+            if (!columnExists(c, "name")) {
+                st.execute(BOOTSTRAP[3]);
+            }
+        }
+    }
+
+    private static boolean queryExists(Connection c, String sql) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(sql);
+             ResultSet rs = ps.executeQuery()) {
+            return rs.next();
+        }
+    }
+
+    private static boolean columnExists(Connection c, String column) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "select 1 from information_schema.columns "
+                + "where table_schema = 'supabase_migrations' "
+                + "and table_name = 'schema_migrations' "
+                + "and column_name = ?")) {
+            ps.setString(1, column);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /**
+     * Whether {@code version} is already in supabase_migrations.schema_migrations.
+     * Read inside the caller's transaction, after the bootstrap created the table,
+     * so a duplicate is rejected before any migration SQL runs.
+     */
+    static boolean alreadyRecorded(Connection c, String version) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "select 1 from supabase_migrations.schema_migrations where version = ?")) {
+            ps.setString(1, version);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next();
+            }
+        }
+    }
+
+    /**
      * Record the migration under the column type already present. {@code sql} is
      * the migration file itself, kept as one element; see the class comment.
+     *
+     * <p>EXACTLY one row must be inserted. {@code on conflict (version) do
+     * nothing} is kept so a concurrent runner loses by row count instead of
+     * failing on a constraint, but a zero count is never accepted as success:
+     * the caller has just executed migration SQL that this row was supposed to
+     * vouch for.
      */
     private static void insert(Connection c, String version, String name, String sql)
             throws SQLException {
@@ -287,7 +382,10 @@ public final class MigrationHistory {
             } else {
                 ps.setArray(3, c.createArrayOf("text", new String[] {sql}));
             }
-            ps.executeUpdate();
+            int inserted = ps.executeUpdate();
+            if (inserted != 1) {
+                throw new MigrationVersionConflict(version, inserted);
+            }
         }
     }
 
@@ -329,6 +427,41 @@ public final class MigrationHistory {
             }
         }
         return false;
+    }
+
+    /**
+     * The requested version is already recorded. Raised after the bootstrap and
+     * before the migration SQL, so nothing is re-executed and the existing
+     * history row and its recorded SQL are untouched. The transaction is rolled
+     * back by apply().
+     */
+    public static final class MigrationAlreadyApplied extends SQLException {
+        public final String version;
+
+        MigrationAlreadyApplied(String version) {
+            super("migration version " + version + " is already recorded in "
+                + "supabase_migrations.schema_migrations; refusing to execute it again",
+                "23505");
+            this.version = version;
+        }
+    }
+
+    /**
+     * A concurrent runner recorded the same version between this run's pre-check
+     * and its history insert, so zero rows were inserted. The migration SQL in
+     * this transaction must not commit; apply() rolls it back.
+     */
+    public static final class MigrationVersionConflict extends SQLException {
+        public final String version;
+        public final int rowsInserted;
+
+        MigrationVersionConflict(String version, int rowsInserted) {
+            super("migration version " + version + " was recorded concurrently by another "
+                + "runner (rows inserted: " + rowsInserted + "); the migration was rolled back",
+                "23505");
+            this.version = version;
+            this.rowsInserted = rowsInserted;
+        }
     }
 
     /**

@@ -11,8 +11,13 @@ import java.lang.reflect.Proxy
 import java.nio.file.Files
 import java.sql.Connection
 import java.sql.SQLException
+import java.sql.Statement
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Transaction, history-content and connection-lifecycle guarantees of the
@@ -38,6 +43,9 @@ import java.util.concurrent.TimeUnit
  *  4. Connection disposal is reported explicitly - ABORTED, CLOSED_FALLBACK or
  *     DISPOSAL_UNCERTAIN - with each cleanup failure preserved as a suppressed
  *     exception, including when the migration itself committed (tests A-D).
+ *  5. A version that is already recorded never executes its SQL again, and two
+ *     runners racing on the same version cannot both commit: the loser's history
+ *     insert affects zero rows and its transaction is rolled back.
  *
  * The `supabase migration fetch` check is a real CLI run against the embedded
  * server. It skips on a developer machine without the CLI but FAILS when
@@ -617,6 +625,209 @@ class MigrationTransactionTest {
             )
         } finally {
             drop(db)
+        }
+    }
+
+    // ------------------------------------------------------ duplicate versions
+
+    @Test
+    fun `an already recorded version is rejected before its sql runs`() {
+        val db = newDatabase()
+        try {
+            val ds = dataSourceFor(db)
+            // A plain counter table, so the migration's effect is directly
+            // observable and a second execution cannot hide behind IF NOT EXISTS.
+            ds.connection.use { c ->
+                c.createStatement().use { st ->
+                    st.execute("create table migration_execution_counter (executions int not null)")
+                    st.execute("insert into migration_execution_counter (executions) values (0)")
+                }
+            }
+            val increment = "update migration_execution_counter set executions = executions + 1"
+
+            apply(ds, "0095", increment, name = "once")
+            assertEquals("1", scalar(ds, "select executions::text from migration_execution_counter"))
+            assertEquals(listOf("0095" to "once"), historyRows(ds), "one history row must be recorded")
+            assertEquals(listOf(increment), statementsElements(ds, "0095"))
+
+            // Same version, SQL that WOULD increment again if it were executed.
+            val second = runCatching {
+                apply(ds, "0095", increment, name = "once")
+            }.exceptionOrNull()
+            val rejection = second as? MigrationHistory.MigrationAlreadyApplied
+            assertTrue(
+                rejection != null,
+                "a recorded version must raise MigrationAlreadyApplied, got: $second",
+            )
+            assertEquals("0095", rejection!!.version)
+            assertFalse(
+                second is MigrationHistory.MigrationVersionConflict,
+                "an ordinary duplicate is not a concurrent conflict: $second",
+            )
+
+            // Independent connection: nothing changed on the second attempt.
+            val check = dataSourceFor(db)
+            assertEquals(
+                "1",
+                scalar(check, "select executions::text from migration_execution_counter"),
+                "the second attempt's migration SQL must never execute",
+            )
+            assertEquals(
+                listOf("0095" to "once"),
+                historyRows(check),
+                "exactly one history row must remain",
+            )
+            assertEquals(
+                listOf(increment),
+                statementsElements(check, "0095"),
+                "the recorded SQL must be unchanged",
+            )
+        } finally {
+            drop(db)
+        }
+    }
+
+    /**
+     * Two real connections, same version, both past the pre-check while the
+     * version is absent. The proxy holds each runner AFTER its migration SQL has
+     * executed and BEFORE its history insert, so the race is deterministic and
+     * neither transaction waits on an application row: the migration SQL inserts
+     * into an unconstrained table.
+     */
+    @Test
+    fun `a version recorded by a concurrent runner is rejected and rolled back`() {
+        val db = newDatabase()
+        val version = "0096"
+        val sql = "insert into mig_race_rows (note) values ('applied')"
+        try {
+            val ds = dataSourceFor(db)
+            ds.connection.use { c ->
+                c.createStatement().use { st ->
+                    // No unique constraint: both transactions can insert a row and
+                    // neither blocks the other at this stage.
+                    st.execute("create table mig_race_rows (note text)")
+                }
+            }
+            // The tracking table exists and is complete before either runner
+            // starts, so the bootstrap issues no DDL and takes no ACCESS EXCLUSIVE
+            // lock: the two transactions are free to race at the history insert.
+            // (A missing table would serialise them on CREATE TABLE instead.)
+            createCliTable(ds)
+
+            val barrier = CyclicBarrier(2)
+            val start = CountDownLatch(1)
+            val executions = AtomicInteger()
+            val pool = Executors.newFixedThreadPool(2)
+            val connections = List(2) { dataSourceFor(db).connection }
+            try {
+                val attempts = connections.map { real ->
+                    val coordinated = CoordinatedMigration(real, sql, barrier, executions)
+                    pool.submit<Throwable?> {
+                        start.await()
+                        runCatching {
+                            MigrationHistory.apply(coordinated.proxy, version, "race", sql)
+                        }.exceptionOrNull()
+                    }
+                }
+                start.countDown()
+                val outcomes = attempts.map { it.get(90, TimeUnit.SECONDS) }
+                // The exception chain matters when this fails: a broken barrier or
+                // an unexpected SQL error must be diagnosable, not just "both threw".
+                val summary = outcomes.joinToString("; ") { describe(it) }
+
+                assertEquals(
+                    2,
+                    executions.get(),
+                    "both runners must reach the history-insert stage: $summary",
+                )
+                assertEquals(1, outcomes.count { it == null }, "exactly one runner may commit: $summary")
+                val conflict = outcomes.filterIsInstance<SQLException>().singleOrNull()
+                    as? MigrationHistory.MigrationVersionConflict
+                    ?: error("the losing runner must raise MigrationVersionConflict: $summary")
+                assertEquals(version, conflict.version)
+                assertEquals(
+                    0,
+                    conflict.rowsInserted,
+                    "the loser's history insert must affect zero rows",
+                )
+
+                // Independent connection: exactly one effect, one history row, and
+                // no automatic retry by the loser.
+                val check = dataSourceFor(db)
+                assertEquals(
+                    "1",
+                    scalar(check, "select count(*)::text from mig_race_rows"),
+                    "the losing runner's migration effect must be rolled back",
+                )
+                assertEquals(
+                    listOf(version to "race"),
+                    historyRows(check),
+                    "exactly one history row must exist",
+                )
+            } finally {
+                pool.shutdownNow()
+                connections.forEach { runCatching { it.close() } }
+            }
+        } finally {
+            drop(db)
+        }
+    }
+
+    /** Outcome plus its cause chain, for an assertion message that can be acted on. */
+    private fun describe(outcome: Throwable?): String {
+        if (outcome == null) return "committed"
+        return generateSequence(outcome) { it.cause }
+            .take(6)
+            .joinToString(" <- ") { "${it.javaClass.simpleName}: ${it.message}" }
+    }
+
+    /**
+     * Wraps a real connection so the runner's migration SQL signals a barrier
+     * once it has executed. Nothing about the statement sequence is copied: the
+     * production `MigrationHistory.apply` still runs every statement itself.
+     */
+    private class CoordinatedMigration(
+        real: Connection,
+        private val migrationSql: String,
+        private val barrier: CyclicBarrier,
+        private val executions: AtomicInteger,
+    ) {
+        val proxy: Connection = Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf<Class<*>>(Connection::class.java),
+        ) { _, method, args ->
+            val values = args ?: emptyArray()
+            val result = delegate(real, method, values)
+            if (method.name == "createStatement") {
+                statement(result as Statement)
+            } else {
+                result
+            }
+        } as Connection
+
+        private fun statement(real: Statement): Statement = Proxy.newProxyInstance(
+            Statement::class.java.classLoader,
+            arrayOf<Class<*>>(Statement::class.java),
+        ) { _, method, args ->
+            val values = args ?: emptyArray()
+            val result = delegate(real, method, values)
+            if (method.name == "execute" && values.firstOrNull() == migrationSql) {
+                // Past the version pre-check and past the migration SQL; hold both
+                // runners here until each has done the same.
+                executions.incrementAndGet()
+                barrier.await(30, TimeUnit.SECONDS)
+            }
+            result
+        } as Statement
+
+        private fun delegate(
+            target: Any,
+            method: java.lang.reflect.Method,
+            args: Array<out Any?>,
+        ): Any? = try {
+            method.invoke(target, *args)
+        } catch (e: InvocationTargetException) {
+            throw e.targetException
         }
     }
 

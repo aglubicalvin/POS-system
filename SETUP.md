@@ -217,11 +217,21 @@ proven; `migration_status` on stderr says what happened to the data.
 | 0 | the migration committed. `connection_disposal=none` means the connection was returned cleanly; `ABORTED`, `CLOSED_FALLBACK` or `DISPOSAL_UNCERTAIN` means the commit still stands but the connection could not be reset | `applied` |
 | 2 | configuration rejected **before a connection existed**: bad or missing variables, unreadable file, or a file name that is not `<digits>_<name>.sql` | — |
 | 3 | connected, but the database/role proves a different target than `MIGRATION_EXPECTED_TARGET`; no migration SQL ran | — |
-| 4 | connection failure, migration failure, or history-insert failure | `rolled_back`, `outcome_uncertain` or `error` |
+| 4 | connection failure, migration failure, an already-recorded version, a concurrent version conflict, or history-insert failure | `already_applied`, `version_conflict`, `rolled_back`, `outcome_uncertain` or `error` |
 
 **Exit 4 does not mean the migration was rolled back.** It means the run did
 not commit. Read `migration_status`:
 
+- `already_applied` — the version is already in
+  `supabase_migrations.schema_migrations`. The runner checks this **after** the
+  history bootstrap and **before** the file runs, so the migration SQL was not
+  executed and the existing row (including its recorded SQL) is untouched.
+  Nothing needed to be undone; do not re-run the file blindly.
+- `version_conflict` — two runners started the same version while it was absent,
+  and another one recorded it first. This run's history insert affected zero
+  rows, so its migration SQL was rolled back and `error_category=migration_version_conflict`
+  is printed. The version is applied exactly once; the loser's failed run is
+  safe to ignore after confirming the winner committed.
 - `rolled_back` — the rollback completed; no schema change or history row was
   kept.
 - `outcome_uncertain` — the rollback itself failed (also `rollback_failed=true`),
@@ -236,6 +246,11 @@ A committed migration whose connection cleanup failed exits 0, never 4, and
 prints both `migration_status=applied` and the `connection_disposal` outcome.
 Migration status and connection-disposal status are separate: one describes the
 DATA, the other the CONNECTION.
+
+A migration is never reported as applied twice. The runner serialises on the
+history primary key: the first runner to insert the row commits, and any other
+runner with the same version fails after its insert affects zero rows, before it
+commits its own schema changes. There is no automatic retry in any outcome.
 
 ## 7. API configuration
 
