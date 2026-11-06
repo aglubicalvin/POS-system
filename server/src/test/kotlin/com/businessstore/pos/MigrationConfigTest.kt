@@ -2,6 +2,7 @@ package com.businessstore.pos
 
 import com.businessstore.pos.tools.MigrationConfig
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -22,7 +23,7 @@ class MigrationConfigTest {
 
     private val valid = mapOf(
         MigrationConfig.CONFIRM_ENV to "yes",
-        MigrationConfig.URL_ENV to "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres",
+        MigrationConfig.URL_ENV to "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-full",
         MigrationConfig.USER_ENV to "postgres.abcdefghij0123456789",
         MigrationConfig.PASS_ENV to "not-a-real-password",
         MigrationConfig.EXPECTED_ENV to "abcdefghij0123456789",
@@ -196,5 +197,54 @@ class MigrationConfigTest {
             assertFalse(m.contains("not-a-real-password"), "message leaked the password: $m")
             assertFalse(m.contains("pooler.supabase.com"), "message leaked the host: $m")
         }
+    }
+    // ---- TLS: only verify-full may reach a migration connection -----------
+
+    @Test
+    fun `a url without sslmode is rejected`() {
+        // No query string at all means no sslmode, so the driver default applies,
+        // which is not verify-full. This must be rejected, not silently accepted.
+        assertEquals(
+            "tls-required",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres")).code,
+        )
+    }
+
+    @Test
+    fun `sslmode=disable is rejected`() {
+        assertEquals(
+            "tls-weak-sslmode",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=disable")).code,
+        )
+    }
+
+    @Test
+    fun `sslmode=require is rejected because it verifies no certificate`() {
+        assertEquals(
+            "tls-weak-sslmode",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=require")).code,
+        )
+    }
+
+    @Test
+    fun `sslmode=verify-ca is rejected because it does not verify the hostname`() {
+        assertEquals(
+            "tls-weak-sslmode",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-ca")).code,
+        )
+    }
+
+    @Test
+    fun `sslmode=verify-full is accepted`() {
+        // resolve() returns a Config on success and throws Rejected otherwise.
+        val config = MigrationConfig.resolve(
+            valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-full"),
+        )
+        assertNotNull(config, "a verify-full configuration must be accepted")
     }
 }

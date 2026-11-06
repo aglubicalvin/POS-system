@@ -122,3 +122,35 @@ jobs:
 
       - name: Whitespace check
         run: git diff --check HEAD^ 2>/dev/null || git diff --check
+
+  # The admin app was never built or tested in CI, which is how its lockfile
+  # drifted from package.json (expo-secure-store 57.0.4 vs ~58.0.2) and broke
+  # `npm ci` without anyone noticing. This job installs exactly what the
+  # lockfile pins, runs the unit tests, and runs expo-doctor for SDK
+  # compatibility.
+  admin-mobile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: admin-mobile
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: admin-mobile/package-lock.json
+
+      - name: Install dependencies (lockfile must match package.json)
+        run: npm ci
+
+      - name: Unit tests
+        run: npx vitest run
+
+      - name: Expo SDK compatibility
+        run: npx expo-doctor

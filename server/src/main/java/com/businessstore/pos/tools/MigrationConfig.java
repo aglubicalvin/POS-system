@@ -59,8 +59,18 @@ public final class MigrationConfig {
         "sslcert", "sslkey", "socketfactory", "socketfactoryarg", "options");
 
     private static final Set<String> ALLOWED_QUERY_PARAMS = Set.of("sslmode");
-    private static final Set<String> KNOWN_SSL_MODES = Set.of(
-        "disable", "allow", "prefer", "require", "verify-ca", "verify-full");
+    /**
+     * The only sslmode a migration run may use.
+     *
+     * A migration sends an administrator credential and writes schema, so the
+     * connection must verify BOTH the certificate chain and the hostname:
+     *   disable/allow/prefer  no encryption at all
+     *   require               encrypted, but accepts ANY certificate, so a
+     *                         man-in-the-middle can present its own
+     *   verify-ca             chain checked, hostname NOT checked
+     *   verify-full           chain and hostname checked  <- the only accepted value
+     */
+    public static final String REQUIRED_SSL_MODE = "verify-full";
 
     private MigrationConfig() {}
 
@@ -208,7 +218,9 @@ public final class MigrationConfig {
     /** Reject retargeting or TLS-replacing query parameters, and unknown keys. */
     private static void validateQuery(String url) throws Rejected {
         String query = url.contains("?") ? url.substring(url.indexOf('?') + 1) : "";
-        if (query.isEmpty()) return;
+        // NOTE: no early return for an empty query. A URL with no query string has
+        // no sslmode, and the check below must reject it -- returning here would
+        // let an unencrypted connection through.
         java.util.Map<String, Integer> seen = new java.util.HashMap<>();
         for (String pair : query.split("&")) {
             if (pair.isEmpty()) continue;
@@ -234,15 +246,20 @@ public final class MigrationConfig {
         }
         String mode = query.toLowerCase();
         int i = mode.indexOf("sslmode=");
-        if (i >= 0) {
-            String value = mode.substring(i + "sslmode=".length());
-            int amp = value.indexOf('&');
-            if (amp >= 0) value = value.substring(0, amp);
-            value = value.trim();
-            if (!KNOWN_SSL_MODES.contains(value)) {
-                throw new Rejected("unknown-sslmode",
-                    "REFUSED: " + URL_ENV + " has an unrecognised sslmode value.");
-            }
+        if (i < 0) {
+            throw new Rejected("tls-required",
+                "REFUSED: " + URL_ENV + " must set sslmode=" + REQUIRED_SSL_MODE + ". " +
+                "A migration sends an administrator credential and writes schema, so the " +
+                "connection must verify the server certificate and hostname.");
+        }
+        String value = mode.substring(i + "sslmode=".length());
+        int amp = value.indexOf('&');
+        if (amp >= 0) value = value.substring(0, amp);
+        value = value.trim();
+        if (!REQUIRED_SSL_MODE.equals(value)) {
+            throw new Rejected("tls-weak-sslmode",
+                "REFUSED: " + URL_ENV + " sets sslmode=" + value + "; only " +
+                REQUIRED_SSL_MODE + " verifies both the certificate chain and the hostname.");
         }
     }
 }
