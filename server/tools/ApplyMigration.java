@@ -81,7 +81,7 @@ public class ApplyMigration {
             // SETUP.md: a shared pooler does not necessarily expose the original
             // login in current_user, so an UNSUFFIXED role is legitimate and is
             // not a failure. What must never pass is a role naming a DIFFERENT
-            // project than POS_EXPECTED_TARGET.
+            // project than MIGRATION_EXPECTED_TARGET.
             //
             // The project reference is still enforced: it was compared against
             // CHECK_USER during configuration validation, and here the connected
