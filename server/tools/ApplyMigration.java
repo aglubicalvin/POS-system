@@ -77,9 +77,18 @@ public class ApplyMigration {
                 System.exit(3);
                 return;
             }
+            // Identity contract, aligned with Provision.identityProblem and with
+            // SETUP.md: a shared pooler does not necessarily expose the original
+            // login in current_user, so an UNSUFFIXED role is legitimate and is
+            // not a failure. What must never pass is a role naming a DIFFERENT
+            // project than POS_EXPECTED_TARGET.
+            //
+            // The project reference is still enforced: it was compared against
+            // CHECK_USER during configuration validation, and here the connected
+            // role is compared against the same expected reference.
             java.util.regex.Matcher m =
                 java.util.regex.Pattern.compile("^postgres\\.([a-z0-9]{20})$").matcher(actualUser);
-            if (!m.matches() || !m.group(1).equals(config.expectedTarget)) {
+            if (m.matches() && !m.group(1).equals(config.expectedTarget)) {
                 System.err.println("MIGRATION_REJECTED code=target-mismatch");
                 System.exit(3);
                 return;

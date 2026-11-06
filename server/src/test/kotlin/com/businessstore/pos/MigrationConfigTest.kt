@@ -292,4 +292,90 @@ class MigrationConfigTest {
         )
         assertNotNull(config, "the exact lowercase key must remain accepted")
     }
+    // ---- pooler host validation (P2 #2) -----------------------------------
+
+    @Test
+    fun `the expected pooler host is accepted`() {
+        val config = MigrationConfig.resolve(
+            valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres?sslmode=verify-full"),
+        )
+        assertNotNull(config, "a Supabase pooler host must be accepted")
+    }
+
+    @Test
+    fun `an unexpected host is rejected`() {
+        // sslmode=verify-full only proves the certificate matches THIS hostname;
+        // it does not prove the host belongs to Supabase.
+        assertEquals(
+            "untrusted-endpoint",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://db.example.test:5432/postgres?sslmode=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `a pooler-shaped username on the wrong host is rejected`() {
+        // The username is a valid postgres.<ref> and matches POS_EXPECTED_TARGET,
+        // but the host is not a Supabase pooler endpoint.
+        assertEquals(
+            "untrusted-endpoint",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://attacker.example.test:5432/postgres?sslmode=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `a lookalike pooler host is rejected`() {
+        assertEquals(
+            "untrusted-endpoint",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com.evil.test:5432/postgres?sslmode=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `an ip literal host is rejected`() {
+        assertEquals(
+            "untrusted-endpoint",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://203.0.113.10:5432/postgres?sslmode=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `a non-pooler port is rejected`() {
+        assertEquals(
+            "untrusted-endpoint",
+            rejected(valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5433/postgres?sslmode=verify-full")).code,
+        )
+    }
+
+    @Test
+    fun `the transaction pooler port is accepted`() {
+        val config = MigrationConfig.resolve(
+            valid + ("CHECK_URL" to
+                "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=verify-full"),
+        )
+        assertNotNull(config, "port 6543 is a valid pooler port")
+    }
+
+    // ---- project reference still enforced ---------------------------------
+
+    @Test
+    fun `a mismatched project reference is rejected`() {
+        assertEquals(
+            "target-mismatch",
+            rejected(valid + ("MIGRATION_EXPECTED_TARGET" to "zyxwvutsrq9876543210")).code,
+        )
+    }
+
+    @Test
+    fun `a missing expected target is rejected`() {
+        assertEquals(
+            "missing-expected-target",
+            rejected(valid - "MIGRATION_EXPECTED_TARGET").code,
+        )
+    }
 }

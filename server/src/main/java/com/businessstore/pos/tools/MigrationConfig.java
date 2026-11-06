@@ -49,6 +49,19 @@ public final class MigrationConfig {
         java.util.regex.Pattern.compile("^postgres\\.([a-z0-9]{20})$");
 
     /**
+     * The only hostname shape a migration may target.
+     *
+     * Mirrors ProvisionTarget.SUPABASE_POOLER_HOST. A pooler host is shared by
+     * every project in a region, so it identifies the provider but not the
+     * project -- necessary, not sufficient.
+     */
+    private static final java.util.regex.Pattern SUPABASE_POOLER_HOST =
+        java.util.regex.Pattern.compile("^aws-[0-9]+-[a-z0-9-]+\\.pooler\\.supabase\\.com$");
+
+    /** Ports the pooler serves: session (5432) and transaction (6543). */
+    private static final Set<Integer> SUPABASE_POOLER_PORTS = Set.of(5432, 6543);
+
+    /**
      * Query parameters that can retarget the connection or replace its TLS
      * configuration. The URL reaches pgJDBC unchanged, so these are refused rather
      * than forwarded.
@@ -144,6 +157,34 @@ public final class MigrationConfig {
         if (hostPort.contains(",")) {
             throw new Rejected("multiple-hosts",
                 "REFUSED: " + URL_ENV + " names more than one host; the driver would fail over.");
+        }
+
+        // The host must be a Supabase pooler endpoint, mirroring
+        // ProvisionTarget.SUPABASE_POOLER_HOST. sslmode=verify-full only proves
+        // the certificate matches whatever hostname is named; it does not prove
+        // the host belongs to Supabase. Without this, a pooler-shaped username on
+        // an arbitrary dotted host would pass and receive the authentication
+        // exchange.
+        String host = hostPort.contains(":")
+            ? hostPort.substring(0, hostPort.lastIndexOf(':'))
+            : hostPort;
+        String portText = hostPort.contains(":")
+            ? hostPort.substring(hostPort.lastIndexOf(':') + 1)
+            : "5432";
+        if (!SUPABASE_POOLER_HOST.matcher(host.toLowerCase()).matches()) {
+            throw new Rejected("untrusted-endpoint",
+                "REFUSED: " + URL_ENV + " does not target a Supabase pooler endpoint " +
+                "(expected aws-<n>-<region>.pooler.supabase.com).");
+        }
+        int port;
+        try {
+            port = Integer.parseInt(portText);
+        } catch (NumberFormatException e) {
+            throw new Rejected("malformed-url", "REFUSED: " + URL_ENV + " has a non-numeric port.");
+        }
+        if (!SUPABASE_POOLER_PORTS.contains(port)) {
+            throw new Rejected("untrusted-endpoint",
+                "REFUSED: " + URL_ENV + " uses port " + port + "; a Supabase pooler serves 5432 or 6543.");
         }
         try {
             URI uri = new URI(url.substring("jdbc:".length()));
