@@ -18,9 +18,12 @@ import com.businessstore.pos.tools.MigrationConfig;
  *     connection exists, and an unset URL is a hard failure.
  *  2. Explicit confirmation (MIGRATION_CONFIRM=yes) and an independently supplied
  *     expected project reference (MIGRATION_EXPECTED_TARGET) are required.
- *  3. The migration file and its schema_migrations row are written in ONE
- *     transaction: if either fails, neither is kept. A migration can therefore
- *     never be recorded as applied after partial execution.
+ *  3. The migration file, the supabase_migrations tracking structures it needs
+ *     and its history row are written in ONE transaction: if any step fails,
+ *     none of them is kept. A migration can therefore never be recorded as
+ *     applied after partial execution, and a database that has never held a
+ *     migration is bootstrapped atomically instead of assuming the tracking
+ *     schema already exists.
  *  4. Diagnostics are sanitized: SQLState and a short message with host, port,
  *     database and role scrubbed. No stack traces, no credentials.
  *
@@ -94,10 +97,24 @@ public class ApplyMigration {
                 return;
             }
 
-            // ONE transaction for the DDL and its history row.
+            // ONE transaction for the bootstrap DDL, the migration SQL and its
+            // history row. A database that has never been migrated has no
+            // supabase_migrations schema, so the tracking structures are created
+            // here rather than assumed: without this the very first migration
+            // would fail on the history insert after its own DDL had already run.
+            // CREATE SCHEMA and CREATE TABLE are transactional in PostgreSQL, so a
+            // failure removes the tracking structures together with the migration.
             c.setAutoCommit(false);
             try {
                 try (Statement st = c.createStatement()) {
+                    st.execute("create schema if not exists supabase_migrations");
+                    st.execute(
+                            "create table if not exists supabase_migrations.schema_migrations (" +
+                            " version text primary key," +
+                            " statements jsonb," +
+                            " name text not null," +
+                            " statements_hash text," +
+                            " executed_at timestamp not null default clock_timestamp())");
                     st.execute(sql);
                 }
                 try (PreparedStatement ps = c.prepareStatement(
