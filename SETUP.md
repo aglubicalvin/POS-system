@@ -45,14 +45,24 @@ src/ server/ supabase/ admin-mobile/ scripts/ tests/ contract/ docs/
 **Server** (`server/.env` or the process environment):
 
 ```env
+# Local development: this flag is REQUIRED for the localhost defaults.
+# Without it, a missing POS_DATABASE_URL is a startup failure.
+POS_LOCAL_DEV=yes
 POS_DATABASE_URL=jdbc:postgresql://localhost:5432/business_store
 POS_DATABASE_USER=business_store
 POS_DATABASE_PASSWORD=change-me
 POS_PORT=8080
-POS_ENROLLMENT_SECRET=change-me        # unset ⇒ device registration is open
-MOMO_WEBHOOK_SECRET=change-me          # unset ⇒ webhook returns 503
+POS_ENROLLMENT_SECRET=change-me        # unset => device registration is open
+MOMO_WEBHOOK_SECRET=change-me          # unset => webhook returns 503
 MOMO_PROVIDER=mtn-momo
 ```
+
+**There is no default database target.** `POS_DATABASE_URL` is required unless
+`POS_LOCAL_DEV=yes` is set, in which case the localhost defaults above apply.
+`POS_LOCAL_DEV` is refused when the process looks hosted (Fly.io, Railway, Render,
+Heroku, Cloud Run, Azure, Kubernetes), so a deployed service can never quietly use
+a localhost database. A hosted deployment must set `POS_DATABASE_URL` and
+`POS_DATABASE_USER` explicitly and fails closed otherwise.
 
 **Scripts / E2E** (repo-root `.env`, git-ignored):
 

@@ -1,81 +1,144 @@
-import java.nio.file.*;
-import java.sql.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import com.businessstore.pos.tools.MigrationConfig;
 
 /**
- * Applies one migration file inside a single transaction, then records it in
- * supabase_migrations.schema_migrations (same bookkeeping the Supabase CLI uses).
+ * Apply ONE migration file to an explicitly confirmed database, transactionally.
  *
- * Usage: env CHECK_URL/CHECK_USER/CHECK_PASS, args: <sql-file> <version> <name>
+ * Safety contract, enforced in code:
+ *  1. No default target. The previous version fell back to a hard-coded Supabase
+ *     pooler URL when CHECK_URL was unset, so a typo could apply migrations to a
+ *     shared project. Configuration is now validated by MigrationConfig BEFORE a
+ *     connection exists, and an unset URL is a hard failure.
+ *  2. Explicit confirmation (MIGRATION_CONFIRM=yes) and an independently supplied
+ *     expected project reference (MIGRATION_EXPECTED_TARGET) are required.
+ *  3. The migration file and its schema_migrations row are written in ONE
+ *     transaction: if either fails, neither is kept. A migration can therefore
+ *     never be recorded as applied after partial execution.
+ *  4. Diagnostics are sanitized: SQLState and a short message with host, port,
+ *     database and role scrubbed. No stack traces, no credentials.
+ *
+ * Usage:
+ *   MIGRATION_CONFIRM=yes MIGRATION_EXPECTED_TARGET=<ref> MIGRATION_FILE=<path>
+ *   CHECK_URL=jdbc:postgresql://host:port/postgres CHECK_USER=... CHECK_PASS=...
+ *   java -cp ... com.businessstore.pos.tools.ApplyMigration
+ *
+ * Exit codes: 0 applied; 2 configuration rejected; 3 connected target is not the
+ * expected one; 4 migration failed and was rolled back.
  */
 public class ApplyMigration {
-    public static void main(String[] args) throws Exception {
-        if (args.length != 3) {
-            System.err.println("usage: ApplyMigration <sql-file> <version> <name>");
+
+    public static void main(String[] args) {
+        MigrationConfig.Config config;
+        try {
+            config = MigrationConfig.resolve(System.getenv());
+        } catch (MigrationConfig.Rejected rejected) {
+            System.err.println("MIGRATION_REJECTED code=" + rejected.code);
+            System.err.println("  " + rejected.getMessage());
             System.exit(2);
+            return;
         }
-        String file = args[0], version = args[1], name = args[2];
-        String sql = Files.readString(Path.of(file));
 
-        // Semantics-neutral normalization only. The migration SQL is sent to
-        // PostgreSQL exactly as written — no quote escaping, no dollar-quote
-        // rewriting. A previous tool run corrupted the migration files by
-        // doubling every apostrophe and stripping $$ delimiters; the guard
-        // below makes that failure mode loud at replay time instead of
-        // silently breaking the apply.
-        if (sql.startsWith("\uFEFF")) {
-            sql = sql.substring(1);
+        String sql;
+        try {
+            sql = Files.readString(Path.of(config.migrationFile));
+        } catch (java.io.IOException e) {
+            System.err.println("MIGRATION_REJECTED code=unreadable-migration-file");
+            System.exit(2);
+            return;
         }
-        sql = sql.replace("\r\n", "\n").replace('\r', '\n');
 
-        if (sql.contains("''''")) {
-            System.err.println("REFUSED: " + file + " looks quote-corrupted (quadrupled apostrophes).");
-            for (String line : sql.split("\n", -1)) {
-                if (line.contains("''''")) {
-                    System.err.println("  offending line: " + line.trim());
+        System.out.println("== apply migration ==");
+        System.out.println("  target: " + config.describe());
+        System.out.println("  file: " + Path.of(config.migrationFile).getFileName());
+
+        try (Connection c = DriverManager.getConnection(config.url, config.user, config.password)) {
+            // Verify the CONNECTED session before writing anything.
+            String actualUser;
+            String actualDatabase;
+            try (Statement st = c.createStatement();
+                 ResultSet rs = st.executeQuery("select current_user, current_database()")) {
+                if (!rs.next()) {
+                    System.err.println("MIGRATION_REJECTED code=identity-unavailable");
+                    System.exit(3);
+                    return;
                 }
+                actualUser = rs.getString(1);
+                actualDatabase = rs.getString(2);
             }
-            System.exit(3);
-        }
+            if (!"postgres".equals(actualDatabase)) {
+                System.err.println("MIGRATION_REJECTED code=unexpected-database");
+                System.exit(3);
+                return;
+            }
+            java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("^postgres\\.([a-z0-9]{20})$").matcher(actualUser);
+            if (!m.matches() || !m.group(1).equals(config.expectedTarget)) {
+                System.err.println("MIGRATION_REJECTED code=target-mismatch");
+                System.exit(3);
+                return;
+            }
 
-        String url = System.getenv().getOrDefault("CHECK_URL",
-            "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres");
-        String user = System.getenv("CHECK_USER");
-        String pass = System.getenv("CHECK_PASS");
-
-        try (Connection c = DriverManager.getConnection(url, user, pass)) {
+            // ONE transaction for the DDL and its history row.
             c.setAutoCommit(false);
             try {
                 try (Statement st = c.createStatement()) {
                     st.execute(sql);
                 }
-                try (Statement st = c.createStatement()) {
-                    st.execute(
-                        "create schema if not exists supabase_migrations");
-                    st.execute(
-                        "create table if not exists supabase_migrations.schema_migrations (" +
-                        " version text primary key," +
-                        " statements jsonb," +
-                        " name text not null," +
-                        " statements_hash text," +
-                        " executed_at timestamp not null default clock_timestamp())");
-                    try (PreparedStatement ps = c.prepareStatement(
-                        "insert into supabase_migrations.schema_migrations (version, name, statements)" +
-                        " values (?, ?, to_jsonb(?::text))" +
-                        " on conflict (version) do nothing")) {
-                        ps.setString(1, version);
-                        ps.setString(2, name);
-                        ps.setString(3, "applied via JDBC by ApplyMigration.java");
-                        ps.executeUpdate();
-                    }
+                try (PreparedStatement ps = c.prepareStatement(
+                        "insert into supabase_migrations.schema_migrations (version, name, statements) " +
+                        "values (?, ?, to_jsonb(?::text)) on conflict (version) do nothing")) {
+                    ps.setString(1, versionOf(config.migrationFile));
+                    ps.setString(2, Path.of(config.migrationFile).getFileName().toString());
+                    ps.setString(3, "applied by ApplyMigration");
+                    ps.executeUpdate();
                 }
                 c.commit();
-                System.out.println("APPLIED AND COMMITTED: version " + version + " (" + name + ") from " + file);
-            } catch (Throwable t) {
-                c.rollback();
-                System.out.println("ROLLED BACK — nothing was applied. Error:");
-                t.printStackTrace();
-                System.exit(1);
+                System.out.println("  migration_status=applied");
+                System.out.println("  version=" + versionOf(config.migrationFile));
+            } catch (SQLException e) {
+                try {
+                    c.rollback();
+                } catch (SQLException rollbackError) {
+                    e.addSuppressed(rollbackError);
+                }
+                System.err.println("  migration_status=rolled_back");
+                System.err.println("  error_detail=" + sanitize(e));
+                System.exit(4);
             }
+        } catch (SQLException e) {
+            System.err.println("  migration_status=error");
+            System.err.println("  error_category=connection_failed");
+            System.err.println("  error_detail=" + sanitize(e));
+            System.exit(4);
         }
+    }
+
+    /** "0003_admin_roles.sql" -> "0003". */
+    static String versionOf(String file) {
+        String name = Path.of(file).getFileName().toString();
+        int underscore = name.indexOf('_');
+        return underscore > 0 ? name.substring(0, underscore) : name.replace(".sql", "");
+    }
+
+    /**
+     * SQLState plus a short message with host, port, database and role scrubbed.
+     * Never the raw driver text, which can carry connection details.
+     */
+    static String sanitize(SQLException e) {
+        String state = e.getSQLState() == null ? "unknown" : e.getSQLState();
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        msg = msg.replaceAll("[\\w.-]+\\.(supabase\\.com|com|net|org)", "<host>");
+        msg = msg.replaceAll("\\b\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?", "<host>");
+        msg = msg.replaceAll("\\b(postgres|authenticator)\\.[a-z0-9]{20}\\b", "<role>");
+        msg = msg.replaceAll("\\s+", " ").trim();
+        if (msg.length() > 120) msg = msg.substring(0, 120) + "...";
+        return "sqlstate=" + state + " message=" + msg;
     }
 }

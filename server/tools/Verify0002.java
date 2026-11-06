@@ -2,8 +2,14 @@ import java.sql.*;
 
 public class Verify0002 {
     public static void main(String[] args) throws Exception {
-        String url = System.getenv().getOrDefault("CHECK_URL",
-            "jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres");
+        // No default target: a hard-coded Supabase pooler URL here meant a typo in
+        // the environment silently pointed a verification run at a shared project.
+        String url = System.getenv("CHECK_URL");
+        if (url == null || url.isBlank()) {
+            System.err.println("REFUSED: CHECK_URL is not set. This tool has no default target.");
+            System.exit(2);
+            return;
+        }
         try (Connection c = DriverManager.getConnection(url,
                 System.getenv("CHECK_USER"), System.getenv("CHECK_PASS"))) {
 
