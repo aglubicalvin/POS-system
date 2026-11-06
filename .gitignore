@@ -14,3 +14,6 @@ build/
 
 # Kotlin build artifact directory (not source)
 server/.kotlin/
+
+# Supabase CLI local cache (not source, machine-specific)
+supabase/.temp/
