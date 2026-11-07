@@ -147,10 +147,14 @@ case `jdbc:postgresql://attacker.example:5432/business@127.0.0.1` is refused
 authority. Two further consequences of the same rule: user-info in the authority
 (`user:password@host`) is refused rather than stripped, because credentials come
 from `CHECK_USER` and `CHECK_PASS`, and a comma is refused because pgJDBC reads
-it as a failover host list. Because the driver also honours connection properties
-in the query string, `host`, `hostaddr`, `port`, `socketFactory` and
-`socketFactoryArg` are refused there as well. The loopback URL passed to the
-driver is rebuilt from the validated parts, not forwarded as received.
+it as a failover host list. Because pgJDBC parses the query string into the same
+connection properties that carry the authority — including its own `PGHOST` and
+`PGPORT` names, which replace the classified host and port — no query string is
+accepted at all: any `?` or `#` is refused with exit 8, rather than filtering a
+list of names that belongs to the driver. The probe appends the one property it
+needs itself and takes TLS settings from the staged material. The loopback URL
+passed to the driver is rebuilt from the validated parts, not forwarded as
+received.
 
 **ProbeState exit codes:** 2 missing `CHECK_URL` or credentials, 3 missing
 `PROBE_CONFIRM=yes`, 4 production-looking host, 5 connection failed, 6 read-only

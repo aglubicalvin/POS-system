@@ -333,20 +333,50 @@ class ProbeStateHostValidationTest {
     }
 
     @Test
-    fun `query parameters that could move the socket are refused`() {
-        // pgJDBC turns query parameters into connection properties, so a loopback
-        // authority with 'host' or 'socketFactory' set would still leave the
-        // destination the guard classified.
+    fun `driver host and port properties in the query string are refused`() {
+        // pgJDBC parses query parameters into the same property map that carries
+        // the authority, and its own canonical names (PGHOST, PGPORT) override
+        // that authority. The 42.7.14 driver is the authority on which names
+        // exist, so the probe refuses every caller query parameter instead of
+        // tracking the name list.
         for (url in listOf(
-            "jdbc:postgresql://127.0.0.1:1/postgres?host=attacker.example",
-            "jdbc:postgresql://127.0.0.1:1/postgres?hostaddr=203.0.113.9",
-            "jdbc:postgresql://127.0.0.1:1/postgres?socketFactory=com.example.Factory",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?PGHOST=attacker.example",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?pghost=attacker.example",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?PGHOST=attacker.example&PGPORT=6543",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?PGPORT=6543",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?port=6543",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?host=attacker.example",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?hostaddr=203.0.113.9",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?socketFactory=com.example.Factory",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?socketFactoryArg=attacker.example",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?sslrootcert=attacker.pem",
+            "jdbc:postgresql://127.0.0.1:5432/postgres?",
+            "jdbc:postgresql://127.0.0.1:5432/postgres#PGHOST=attacker.example",
         )) {
             val result = runProbe(url, "probe_local")
             assertEquals(8, result.exitCode, "$url must be refused:\n${result.output}")
-            assertTrue(result.output.contains("connection overrides"), result.output)
+            assertTrue(result.output.contains("query string"), result.output)
             assertFalse(result.output.contains("read-only state probe"), result.output)
+            assertFalse(result.output.contains("read_only_transaction="), result.output)
         }
+    }
+
+    @Test
+    fun `a query string cannot turn an accepted loopback target into another host`() {
+        // The same URL without the query is accepted (and fails to connect,
+        // exit 5), so the refusal above is caused by the query alone and not by
+        // the authority or the port.
+        val accepted = runProbe("jdbc:postgresql://127.0.0.1:1/postgres", "probe_local")
+        assertEquals(5, accepted.exitCode, accepted.output)
+        assertTrue(accepted.output.contains("read-only state probe"), accepted.output)
+
+        val refused = runProbe(
+            "jdbc:postgresql://127.0.0.1:1/postgres?PGHOST=attacker.example",
+            "probe_local",
+        )
+        assertEquals(8, refused.exitCode, refused.output)
+        assertTrue(refused.output.contains("query string"), refused.output)
+        assertFalse(refused.output.contains("read-only state probe"), refused.output)
     }
 
     @Test

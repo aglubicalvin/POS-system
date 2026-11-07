@@ -119,15 +119,6 @@ public class ProbeState {
     private static final Pattern AUTHORITY_CHARS = Pattern.compile("^[0-9A-Za-z.:_\\[\\]-]+$");
 
     /**
-     * Query parameter names that can move the socket away from the authority the
-     * guard classified. pgJDBC turns query parameters into connection properties,
-     * so a URL whose authority says loopback could still name another destination
-     * here. No supported target needs these.
-     */
-    private static final java.util.Set<String> REDIRECTING_QUERY_PARAMS =
-        java.util.Set.of("host", "hostaddr", "port", "socketfactory", "socketfactoryarg");
-
-    /**
      * References that are known NOT to be staging: the documented development
      * project and the former verification project. Mirrors
      * KNOWN_NON_STAGING_REFS in src/config/staging-target.ts and the
@@ -586,19 +577,23 @@ public class ProbeState {
                     + "hyphen, underscore, colon and IPv6 brackets. Percent-encoding, whitespace and "
                     + "control characters are refused rather than decoded or ignored.");
         }
-        // pgJDBC turns query parameters into connection properties, so the
-        // authority is not the only text that can decide where the socket goes.
-        int queryStart = pathAndQuery.indexOf('?');
-        if (queryStart >= 0) {
-            for (String parameter : pathAndQuery.substring(queryStart + 1).split("&", -1)) {
-                String name = parameter.split("=", 2)[0].trim().toLowerCase(Locale.ROOT);
-                if (REDIRECTING_QUERY_PARAMS.contains(name)) {
-                    return ParsedUrl.refused(
-                        "CHECK_URL must not carry connection overrides in its query string: only "
-                            + "the authority may name the host and port, or the driver would be "
-                            + "sent to an endpoint this probe never classified.");
-                }
-            }
+        // pgJDBC parses the query string into the same property map that carries
+        // the authority, and that map is the connection: a property named PGHOST
+        // or PGPORT replaces the host and port classified here, while the driver
+        // also accepts its own aliases and any number of properties that change
+        // how the socket is created. Which names exist is the driver's business,
+        // not this file's, so denying individual names would only describe the
+        // version pinned today. Nothing legitimately needs one: the probe appends
+        // prepareThreshold=0 itself, and TLS settings come from the staged
+        // material and the properties it sets. The whole query string and any
+        // fragment are therefore refused rather than filtered.
+        if (pathAndQuery.indexOf('?') >= 0 || pathAndQuery.indexOf('#') >= 0) {
+            return ParsedUrl.refused(
+                "CHECK_URL must not carry a query string or fragment. pgJDBC turns query "
+                    + "parameters into connection properties, and a driver-defined name such as "
+                    + "PGHOST or PGPORT replaces the host or port this probe classified. The probe "
+                    + "sets the properties it needs itself, so only the authority may name the "
+                    + "endpoint.");
         }
 
         if (authority.charAt(0) == '[') {
