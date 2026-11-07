@@ -120,7 +120,8 @@ function installStubDocker(
       'try { input = readFileSync(0, "utf8"); } catch {}',
       'writeFileSync(stdinFile, input, "utf8");',
       'writeFileSync(argsFile, dockerArgs.join(" ") + String.fromCharCode(10), "utf8");',
-      'writeFileSync(envFile, process.env.PROBE_PW === undefined ? "<absent>" : "PRESENT:" + process.env.PROBE_PW, "utf8");',
+      'const show = (value) => value === undefined ? "<absent>" : "PRESENT:" + value;',
+      'writeFileSync(envFile, ["PROBE_PW=" + show(process.env.PROBE_PW), "PROBE_ADMIN_PASS=" + show(process.env.PROBE_ADMIN_PASS), "PGPASSWORD=" + show(process.env.PGPASSWORD)].join(String.fromCharCode(10)) + String.fromCharCode(10), "utf8");',
       'const tempRoot = process.env.TMPDIR || process.env.TMP || "";',
       'let mode = "";',
       'if (process.platform !== "win32" && tempRoot) {',
@@ -832,12 +833,20 @@ describe('probe-readonly.ps1 password environment and transcript handling', () =
   const cleanLines = CLEAN_TRANSCRIPT.trimEnd().split('\n');
   const FAILED_TRANSCRIPT = ['psql: error: connection to server at "db.internal:5432" failed'];
 
+  /** Read one NAME=value line captured from the Docker CLI's environment. */
+  function dockerEnvValue(env: string | null, name: string): string {
+    const entry = (env ?? '')
+      .split(/\r?\n/)
+      .find((line) => line.startsWith(`${name}=`));
+    return entry === undefined ? '<missing>' : entry.slice(name.length + 1);
+  }
+
   itPS('removes PROBE_PW from the environment the Docker CLI inherits', () => {
     const outcome = runApply(cleanLines, 0);
     expect(outcome.status, outcome.output).toBe(0);
     // The child process reports its own environment, not what the wrapper meant
     // to do: the password must be gone before Docker exists.
-    expect(outcome.dockerEnv, 'the Docker CLI inherited PROBE_PW').toBe('<absent>');
+    expect(dockerEnvValue(outcome.dockerEnv, 'PROBE_PW'), 'the Docker CLI inherited PROBE_PW').toBe('<absent>');
     // Delivery is still stdin-only, one line per \password prompt.
     expect(outcome.stdin?.replace(/\r\n/g, '\n')).toBe('probe-pass\nprobe-pass\n');
     expect(outcome.args).not.toContain('probe-pass');
@@ -848,7 +857,7 @@ describe('probe-readonly.ps1 password environment and transcript handling', () =
   itPS('keeps PROBE_PW out of the Docker environment on the failure path', () => {
     const outcome = runApply(FAILED_TRANSCRIPT, 3);
     expect(outcome.status, outcome.output).toBe(3);
-    expect(outcome.dockerEnv).toBe('<absent>');
+    expect(dockerEnvValue(outcome.dockerEnv, 'PROBE_PW')).toBe('<absent>');
     expect(outcome.stdin?.replace(/\r\n/g, '\n')).toBe('probe-pass\nprobe-pass\n');
   });
 
@@ -858,6 +867,46 @@ describe('probe-readonly.ps1 password environment and transcript handling', () =
     // `-e PGPASSWORD` names a variable; the value is never an argument.
     expect(outcome.args).toContain('-e PGPASSWORD');
     expect(outcome.args).not.toContain('admin-pass');
+    // The named source variable is gone; the value exists only under the one
+    // name Docker's `-e PGPASSWORD` resolves.
+    expect(dockerEnvValue(outcome.dockerEnv, 'PROBE_ADMIN_PASS')).toBe('<absent>');
+    expect(dockerEnvValue(outcome.dockerEnv, 'PGPASSWORD')).toBe('PRESENT:admin-pass');
+  });
+
+  itPS('removes PROBE_ADMIN_PASS from the environment the Docker CLI inherits', () => {
+    const outcome = runApply(cleanLines, 0);
+    expect(outcome.status, outcome.output).toBe(0);
+    expect(
+      dockerEnvValue(outcome.dockerEnv, 'PROBE_ADMIN_PASS'),
+      'the Docker CLI inherited PROBE_ADMIN_PASS',
+    ).toBe('<absent>');
+    // The credential still reaches the intended consumer: Docker resolves
+    // `-e PGPASSWORD` from its own environment, and psql inside the container
+    // reads PGPASSWORD. Neither requires the source variable's name.
+    expect(dockerEnvValue(outcome.dockerEnv, 'PGPASSWORD')).toBe('PRESENT:admin-pass');
+    expect(outcome.args).not.toContain('admin-pass');
+    expect(outcome.output).not.toContain('admin-pass');
+    expect(JSON.stringify(outcome.evidence)).not.toContain('admin-pass');
+  });
+
+  itPS('keeps PROBE_ADMIN_PASS out of the Docker environment on the failure path', () => {
+    const outcome = runApply(FAILED_TRANSCRIPT, 5);
+    expect(outcome.status, outcome.output).toBe(5);
+    // Authentication failure stays a failure, and the credential is still
+    // delivered only through the variable psql reads.
+    expect(dockerEnvValue(outcome.dockerEnv, 'PROBE_ADMIN_PASS')).toBe('<absent>');
+    expect(dockerEnvValue(outcome.dockerEnv, 'PGPASSWORD')).toBe('PRESENT:admin-pass');
+  });
+
+  itPS('fails closed before Docker when the administrator password is missing', () => {
+    const outcome = runApply(cleanLines, 0, { PROBE_ADMIN_PASS: '' });
+    expect(outcome.status, outcome.output).not.toBe(0);
+    expect(outcome.output).toContain('PROBE_ADMIN_PASS and PROBE_PW must be set');
+    // No child process existed, so nothing inherited anything and no password
+    // line was written to a stdin pipe.
+    expect(outcome.dockerEnv).toBeNull();
+    expect(outcome.stdin).toBeNull();
+    expect(outcome.args).toBeNull();
   });
 
   itPS('creates the raw transcript owner-only before psql writes to it', () => {

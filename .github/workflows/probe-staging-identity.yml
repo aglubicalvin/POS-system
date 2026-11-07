@@ -150,6 +150,16 @@ jobs:
           # own exit status.
           set -uo pipefail
 
+          # ProbeState reads CHECK_PASS from its own environment, so the value
+          # must be exported to the Gradle probe. This shell, the evidence helper
+          # and every readback command after it do not need it: snapshot it,
+          # remove it from the exported environment so no later child inherits
+          # the administrator password, and pass it only to the one command
+          # that requires it. `unset` removes the variable itself, not just this
+          # shell's view of it.
+          PROBE_PASS_VALUE="$CHECK_PASS"
+          unset CHECK_PASS
+
           cd server
 
           # ProbeState reads CHECK_URL / CHECK_USER / CHECK_PASS from the environment
@@ -163,11 +173,14 @@ jobs:
           # read-only transaction, and only ever issues SELECTs against catalogs
           # and views. It never invokes probe-readonly.ps1 and has no provisioning
           # path.
-          if ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
+          if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
             STATUS=0
           else
             STATUS=$?
           fi
+
+          # The credential is not needed by anything below this point.
+          unset PROBE_PASS_VALUE
 
           # Every evidence rule lives in tools/probe-evidence.sh so it can be
           # tested without GitHub. The script reads the raw output once and

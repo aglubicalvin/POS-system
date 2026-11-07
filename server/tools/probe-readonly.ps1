@@ -200,6 +200,20 @@ if ([string]::IsNullOrEmpty($ProbePw)) {
 }
 Remove-Item Env:PROBE_PW -ErrorAction SilentlyContinue
 
+# The administrator credential is only needed to seed PGPASSWORD for Docker's
+# `-e PGPASSWORD` pass-through, which libpq inside the container reads. Read it
+# into this process, then REMOVE PROBE_ADMIN_PASS from the environment before
+# the Docker CLI exists: the CLI inherits the environment, and neither it nor
+# anything it starts needs the credential under that name. PGPASSWORD itself
+# must stay set because `-e PGPASSWORD` names a variable rather than carrying a
+# value; that is the intended channel. The local copy is cleared with PGPASSWORD
+# in the finally block.
+$AdminPass = $env:PROBE_ADMIN_PASS
+if ([string]::IsNullOrEmpty($AdminPass)) {
+    throw 'Refusing to run: PROBE_ADMIN_PASS must be set in the environment.'
+}
+Remove-Item Env:PROBE_ADMIN_PASS -ErrorAction SilentlyContinue
+
 # The CA must exist INSIDE the container: a host path means nothing to libpq in
 # Docker. Copy it into a private temp directory and mount that directory read-only
 # at a fixed container path, so sslrootcert is a constant rather than an
@@ -237,7 +251,7 @@ $dockerArgs = @(
     '-f', '/work/pos_probe_readonly_assert.sql'
 )
 
-$env:PGPASSWORD = $env:PROBE_ADMIN_PASS
+$env:PGPASSWORD = $AdminPass
 $code = 1
 try {
     # Create the transcript owner-only BEFORE its first byte. A permissive umask
@@ -299,6 +313,7 @@ try {
 } finally {
     $ErrorActionPreference = 'Stop'
     $ProbePw = $null
+    $AdminPass = $null
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $CertDir -Recurse -Force -ErrorAction SilentlyContinue
 }

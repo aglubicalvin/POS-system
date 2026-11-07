@@ -305,3 +305,49 @@ describe('staging identity job is restricted to main', () => {
     expect(yml).toMatch(/name: probe-staging-identity-evidence/);
   });
 });
+
+/**
+ * Follow-up review: the administrator credential may be inherited only by the
+ * process that genuinely needs it. ProbeState (started by Gradle) reads
+ * CHECK_PASS, so that binding is required; the evidence helper and every later
+ * command are not, so the step removes the variable from its exported
+ * environment and passes it to the probe command alone. These assertions read
+ * the workflow text; no workflow is dispatched.
+ */
+describe('staging identity administrator credential is scoped to the probe', () => {
+  const yml = read(IDENTITY);
+  const step = (() => {
+    const start = yml.indexOf('Run read-only staging identity probe');
+    const end = yml.indexOf('Publish sanitized evidence');
+    expect(start, 'the probe step is missing').toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    return yml.slice(start, end);
+  })();
+
+  it('removes CHECK_PASS from the exported environment before any later child', () => {
+    const snapshot = step.indexOf('PROBE_PASS_VALUE="$CHECK_PASS"');
+    const unset = step.indexOf('unset CHECK_PASS');
+    const probe = step.indexOf('CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew');
+    const helper = step.indexOf('bash tools/probe-evidence.sh');
+    expect(snapshot).toBeGreaterThan(-1);
+    expect(unset).toBeGreaterThan(snapshot);
+    expect(probe).toBeGreaterThan(unset);
+    expect(helper).toBeGreaterThan(probe);
+    const drop = step.indexOf('unset PROBE_PASS_VALUE');
+    expect(drop).toBeGreaterThan(probe);
+    expect(drop).toBeLessThan(helper);
+  });
+
+  it('binds the credential to the probe command only, never to argv', () => {
+    expect(step).toContain(
+      'if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew -q execProbeState > probe-raw.txt 2>&1; then',
+    );
+    expect(step).not.toMatch(/--(pass|password)[= ]/i);
+    expect(step).not.toContain('admin-pass');
+  });
+
+  it('keeps the secret reference on this step alone', () => {
+    expect(yml.match(/secrets\.PROBE_ADMIN_PASS/g)).toHaveLength(1);
+    expect(yml.match(/^\s*CHECK_PASS:/gm)).toHaveLength(1);
+  });
+});

@@ -186,7 +186,7 @@ describe('identity probe exit-status and evidence handling', () => {
     // The conditional-execution pattern required by the audit: the failing
     // command is an if-condition, not a bare statement.
     expect(probeStep).toMatch(
-      /if \.\/gradlew -q execProbeState > probe-raw\.txt 2>&1; then\s*\n\s*STATUS=0\s*\n\s*else\s*\n\s*STATUS=\$\?/,);
+      /if (?:CHECK_PASS="\$PROBE_PASS_VALUE" )?\.\/gradlew -q execProbeState > probe-raw\.txt 2>&1; then\s*\n\s*STATUS=0\s*\n\s*else\s*\n\s*STATUS=\$\?/,);
     // errexit is not disabled to make the capture possible. Matched against
     // command lines only, so mentions of the pattern in comments don't trip it.
     expect(probeStep).not.toMatch(/^\s*(?:set \+e|set \+o errexit)\b/m);
@@ -377,6 +377,9 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       env: {
         PATH: `${dirname(bash as string)}${delimiter}${process.env.PATH ?? ''}`,
         HOME: process.env.HOME ?? '',
+        // Actions supplies CHECK_PASS to this step; the harness must too, or
+        // the step's set -u snapshot aborts before the probe starts.
+        CHECK_PASS: 'stub-check-pass',
       },
       // A wedged child must not hang the suite forever.
       timeout: 60_000,
