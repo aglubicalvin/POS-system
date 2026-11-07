@@ -74,7 +74,8 @@ old hardcoded `aws-0-eu-west-2.pooler.supabase.com` default in
 | --- | --- | --- | --- |
 | `POS_STAGING_PROJECT_REF` | Yes | 20-char `[a-z0-9]{20}` | Human-confirmed staging project reference. Project identity is still established by the administrator username suffix `postgres.<ref>` compared against this value; the pooler hostname is shared by every project in a region and identifies only the provider. |
 | `POS_STAGING_POOLER_HOST` | Yes | `aws-<n>-<region>.pooler.supabase.com` (exactly one) | The shared pooler hostname, the only value consumed by both connection paths. It is validated against the same contract in the Kotlin module, in `ProbeState.java`, and in PowerShell. **Region must be confirmed by a human against the staging project's Supabase dashboard; it is never inferred from the project reference or from any previously used endpoint.** |
-| `POS_STAGING_DB_ROOT_CERT` | Yes | readable PEM file path | Staged root certificate material. |
+| `POS_STAGING_DB_ROOT_CERT` | Yes | readable PEM file path | Staged root certificate material. On a workflow runner this path is produced by `server/tools/materialize-staging-root-cert.sh`; it is never read from stored configuration, because hosted runners are ephemeral. |
+| `POS_STAGING_DB_ROOT_CERT_B64` | Yes (workflows) | base64 of the PEM | The certificate material the workflows materialize. Kept separate from the fingerprint so neither value can stand in for the other. |
 | `POS_STAGING_DB_ROOT_CERT_SHA256` | Yes | 64-hex (SHA-256) | **Independently supplied** fingerprint of that certificate's DER encoding. Obtained from a source other than the file itself (release notes, certificate record, provisioner output); never computed by trusting the file. |
 
 Both TLS values mirror the provisioning contract:
@@ -86,6 +87,22 @@ the PEM into its DER encoding and compare `sha256(DER(cert))` to the independent
 supplied value. A mismatch, a missing value, or an unreadable file refuses the
 target. There is no filesystem-only check: trusting the file alone would accept
 *any* CA with the right name.
+
+**How the certificate reaches each runtime.** Both staging workflows run on
+ephemeral hosted runners, so no stored file path can be assumed to exist:
+
+1. `server/tools/materialize-staging-root-cert.sh` decodes
+   `POS_STAGING_DB_ROOT_CERT_B64` into `$RUNNER_TEMP/staging-root-ca.pem` (mode
+   0600), verifies `sha256(DER)` against `POS_STAGING_DB_ROOT_CERT_SHA256`, and
+   exports only the path (`POS_STAGING_DB_ROOT_CERT`) through `$GITHUB_ENV`.
+2. The JDBC probe reads that path and copies it to private temp material.
+3. The PowerShell path copies it into a private temp directory mounted read-only
+   at `/certs`, and connects with `sslrootcert=/certs/ca.pem` — a fixed container
+   path, never a host path libpq could not see.
+4. An `if: always()` workflow step deletes the materialized file, and the
+   PowerShell script deletes its copy in a `finally` block.
+
+The certificate bytes, the base64 value and the fingerprint are never printed.
 
 **TLS and pooler rules used everywhere:**
 
@@ -100,6 +117,22 @@ target. There is no filesystem-only check: trusting the file alone would accept
 Exactly one `sslmode` is accepted. A URL may not carry two `sslmode` values, and
 `sslfactory`, `sslcert`, `sslkey`, `socketfactory` and similar keys are rejected,
 not stripped. A comma-separated multi-host authority is rejected.
+
+**Which targets the JDBC probe accepts.** Only two: the validated pooler host,
+and a disposable loopback test database. Loopback means the exact name
+`localhost`, a bracketed IPv6 loopback literal `[::1]`, or a strict dotted-quad in
+`127.0.0.0/8` with every octet in range and no leading zeros. It is never decided
+by a string prefix and never by DNS, so `127.db.attacker.example`,
+`127.attacker.example`, `localhost.attacker.example` and `0.0.0.0` are all remote
+targets and are refused before a connection is attempted. Everything else is
+refused with exit 8.
+
+**ProbeState exit codes:** 2 missing `CHECK_URL` or credentials, 3 missing
+`PROBE_CONFIRM=yes`, 4 production-looking host, 5 connection failed, 6 read-only
+not confirmed, 7 probe failed, 8 unrecognised or mismatched target, 9 missing or
+unreadable staged certificate, 10 missing/malformed/mismatching fingerprint, 11
+project identity missing, malformed, non-staging, or disagreeing with
+`CHECK_USER`.
 
 ### Scripts / E2E
 
@@ -216,6 +249,17 @@ merely present.
   staging project. It is gated by `-Apply`, requires the operator's explicit
   approval, and must never run against the development or the former verification
   project even by name.
+
+`pos_probe_readonly.sql` is scoped to the designated staging project. Its header
+previously said "development project only"; that instruction is superseded,
+because the role exists to read the staging database. The DDL is
+environment-agnostic: a LOGIN role with no elevated attributes, role defaults,
+`CONNECT` on `postgres`, `USAGE` on `supabase_migrations`, and column `SELECT` on
+`schema_migrations.version`/`name`. Nothing in `public` or `auth` is granted, so
+the role cannot read business data. The wrapper runs all three files in a single
+transaction with `ON_ERROR_STOP=1`, so a project where `supabase_migrations` does
+not exist aborts with no role left behind. Nothing in the file executes on its
+own: the repository, CI and both workflows never run it without `-Apply`.
 
 Both paths require human approval before they touch a live database. The
 provisioner, the probe, and the role-creation step are **separate operations**:

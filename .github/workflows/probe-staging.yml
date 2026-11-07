@@ -8,11 +8,26 @@
 # supplies POS_STAGING_PROJECT_REF and the administrator username suffix matches
 # it exactly. The shared pooler hostname is not project identity.
 #
+# Both staging workflows consume the SAME connection contract, through the same
+# variables:
+#   POS_STAGING_PROJECT_REF          designated staging project reference
+#   POS_STAGING_POOLER_HOST          the only source of the pooler hostname
+#   POS_STAGING_DB_ROOT_CERT         path of the materialized CA on THIS runner
+#   POS_STAGING_DB_ROOT_CERT_SHA256  independently supplied DER SHA-256
+# The CA is materialized from POS_STAGING_DB_ROOT_CERT_B64 by
+# server/tools/materialize-staging-root-cert.sh, verified against the fingerprint,
+# and removed again by an `if: always()` step. Hosted runners are ephemeral, so a
+# certificate path stored in configuration can never be assumed to exist.
+#
 # Environment requirements (owner must configure in GitHub; see
 # artifacts/pos-free-tier-staging-transition/e-github-owner-checklist.md):
 #   - required reviewers, with "Prevent self-review" enabled
 #   - deployment branch policy: main only
 #   - staging-only credentials (never shared with development/production)
+#   - vars: POS_STAGING_PROJECT_REF, POS_STAGING_POOLER_HOST,
+#           POS_STAGING_DB_ROOT_CERT_B64, POS_STAGING_DB_ROOT_CERT_SHA256,
+#           PROBE_ADMIN_USER
+#   - secrets: PROBE_ADMIN_PASS, PROBE_PW
 name: probe-staging-role
 
 on:
@@ -35,10 +50,19 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize staged root certificate
+        shell: bash
+        env:
+          POS_STAGING_DB_ROOT_CERT_B64: ${{ vars.POS_STAGING_DB_ROOT_CERT_B64 }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
+        run: bash server/tools/materialize-staging-root-cert.sh
+
       - name: Dry run or apply
         shell: pwsh
         env:
           POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
+          POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
           PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
           PROBE_ADMIN_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
           PROBE_PW: ${{ secrets.PROBE_PW }}
@@ -54,3 +78,10 @@ jobs:
           name: probe-staging-log
           path: server/build/probe-readonly-*.log
           if-no-files-found: ignore
+
+      - name: Remove staged certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "${RUNNER_TEMP:-/tmp}/staging-root-ca.pem"

@@ -2,8 +2,12 @@ package com.businessstore.pos.tools;
 
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Locale;
 import java.util.Properties;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermission;
@@ -31,7 +35,8 @@ import java.io.InputStream;
  *     any catalog query the probe asks PostgreSQL itself
  *     (`SHOW transaction_read_only`) and requires `on`.
  *
- * Staging transport contract (shared with probe-readonly.ps1):
+ * Staging transport contract (shared with probe-readonly.ps1 and
+ * src/config/staging-target.ts):
  *
  *  - When CHECK_URL nominates a Supabase pooler endpoint, this is a STAGING
  *    connection. The hostname actually connected to is taken from
@@ -39,6 +44,11 @@ import java.io.InputStream;
  *    shape (aws-<n>-<region>.pooler.supabase.com) and must agree with the host
  *    nominated by CHECK_URL. There is no default, no region inference and no
  *    fallback to a previously used endpoint.
+ *  - Project identity is established separately: POS_STAGING_PROJECT_REF must
+ *    be set, must not be a known non-staging project, and CHECK_USER must be
+ *    exactly postgres.<that reference>. A valid pooler hostname never stands in
+ *    for project identity, because the pooler is shared by every project in a
+ *    region.
  *  - The staging connection uses sslmode=verify-full with a staged root
  *    certificate, whose SHA-256 over its DER encoding must equal the
  *    independently supplied POS_STAGING_DB_ROOT_CERT_SHA256. A missing or
@@ -46,16 +56,60 @@ import java.io.InputStream;
  *    is copied to private temp material, outside the caller's path, and deleted
  *    on exit.
  *  - A loopback CHECK_URL is a disposable local test database and is the only
- *    target allowed without TLS. Every other host is refused.
+ *    target allowed without TLS. Loopback is decided by exact name or by strict
+ *    literal parsing, never by DNS resolution and never by a string prefix, so
+ *    a name such as 127.db.attacker.example is a remote host and is refused.
+ *    Every other host is refused.
+ *
+ * Exit codes:
+ *   2  CHECK_URL missing, or staging credentials missing
+ *   3  PROBE_CONFIRM is not yes
+ *   4  the nominated host looks like production
+ *   5  the connection failed
+ *   6  the server did not confirm a read-only transaction
+ *   7  the probe itself failed
+ *   8  the target is not a recognised pooler or loopback host, or the pooler
+ *      host and CHECK_URL disagree
+ *   9  the staged root certificate is missing or unreadable
+ *   10 the fingerprint is missing, malformed or does not match the certificate
+ *   11 project identity is missing, malformed, non-staging, or disagrees with
+ *      CHECK_USER
  */
 public class ProbeState {
 
     private static final String POOLER_HOST_ENV = "POS_STAGING_POOLER_HOST";
     private static final String ROOT_CERT_ENV = "POS_STAGING_DB_ROOT_CERT";
     private static final String ROOT_CERT_SHA256_ENV = "POS_STAGING_DB_ROOT_CERT_SHA256";
-    /** The exact Supabase pooler shape. Anchored; no suffix, port or path allowed. */
+    private static final String PROJECT_REF_ENV = "POS_STAGING_PROJECT_REF";
+    private static final String NON_STAGING_REFS_ENV = "POS_NON_STAGING_REFS";
+
+    /**
+     * The exact Supabase pooler shape, identical to SUPABASE_POOLER_HOST_PATTERN
+     * in src/config/staging-target.ts, to StagingPoolerHost.PATTERN and to the
+     * pattern in probe-readonly.ps1. Anchored; the value is trimmed and
+     * lower-cased before matching, so no suffix, port, path or casing variant
+     * can pass.
+     */
     private static final String POOLER_HOST_PATTERN =
-        "^aws-[0-9]+-[a-z0-9-]+\\.pooler\\.supabase\\.com$";
+        "^aws-[0-9]{1,3}-[a-z]{2,}(?:-[a-z0-9]+)*\\.pooler\\.supabase\\.com$";
+
+    /** The pooler administrator login: postgres.<20 lowercase alphanumerics>. */
+    private static final Pattern ADMIN_USER_PATTERN =
+        Pattern.compile("^postgres\\.([a-z0-9]{20})$");
+    /** Supabase project references are 20 lowercase alphanumerics. */
+    private static final Pattern PROJECT_REF_PATTERN = Pattern.compile("^[a-z0-9]{20}$");
+
+    /**
+     * References that are known NOT to be staging: the documented development
+     * project and the former verification project. Mirrors
+     * KNOWN_NON_STAGING_REFS in src/config/staging-target.ts and the
+     * $KnownNonStaging list in probe-readonly.ps1. Overridable with a
+     * comma-separated POS_NON_STAGING_REFS, exactly like the TypeScript module.
+     */
+    private static final String[] KNOWN_NON_STAGING_REFS = {
+        "uemdrtrzlvhdtonccczt", // development
+        "numwzjogaanfhlrfgrqk", // former verification project
+    };
 
     public static void main(String[] args) throws Exception {
         String url = System.getenv("CHECK_URL");
@@ -73,27 +127,31 @@ public class ProbeState {
             System.exit(3);
         }
         String nominatedHost = hostOf(url);
-        if (nominatedHost.toLowerCase().contains("prod")) {
+        if (nominatedHost.toLowerCase(Locale.ROOT).contains("prod")) {
             System.err.println("REFUSED: " + nominatedHost + " looks like a production host.");
             System.err.println("  This probe must never run against production.");
             System.exit(4);
         }
-        String bareHost = hostName(url).toLowerCase();
+
+        String bareHost = hostName(url).toLowerCase(Locale.ROOT);
         boolean stagingTarget = bareHost.endsWith(".pooler.supabase.com");
+
+        // A pooler administrator login names a project. If that project is known
+        // not to be staging, refuse before looking at the target: identity is
+        // never allowed to ride on a hostname.
+        String adminRef = adminUserProjectRef(user);
+        if (adminRef != null && nonStagingRefs().contains(adminRef)) {
+            System.err.println(
+                "REFUSED: CHECK_USER belongs to project " + adminRef + ", which is configured as a "
+                    + "known non-staging project. The probe will not read a development or former "
+                    + "verification database.");
+            System.exit(11);
+        }
 
         Properties props = null;
         String connectUrl;
         if (stagingTarget) {
-            // Credentials are mandatory for a real staging connection. A loopback
-            // test database may legitimately be passwordless.
-            if (user == null || user.isBlank() || pass == null || pass.isBlank()) {
-                System.err.println("REFUSED: CHECK_USER/CHECK_PASS are required for a staging connection.");
-                System.exit(2);
-            }
-            props = new Properties();
-            props.put("user", user);
-            props.put("password", pass);
-            // Staging: the connected hostname comes from POS_STAGING_POOLER_HOST only.
+            // --- 1. the pooler hostname, from one place only -----------------
             String poolerHost = System.getenv(POOLER_HOST_ENV);
             if (poolerHost == null || poolerHost.isBlank()) {
                 System.err.println(
@@ -102,12 +160,14 @@ public class ProbeState {
                         + "region inference and no fallback to a previously used endpoint.");
                 System.exit(8);
             }
-            poolerHost = poolerHost.trim().toLowerCase();
+            poolerHost = poolerHost.trim().toLowerCase(Locale.ROOT);
             if (!poolerHost.matches(POOLER_HOST_PATTERN)) {
                 System.err.println(
                     "REFUSED: " + POOLER_HOST_ENV + " is not a Supabase pooler endpoint. Expected "
-                        + "exactly aws-<n>-<region>.pooler.supabase.com; IP literals, loopback names, "
-                        + "other DNS names, URIs, paths, credentials, query strings and ports are refused.");
+                        + "exactly aws-<n>-<region>.pooler.supabase.com, with <n> one to three digits "
+                        + "and <region> one or more lowercase letters followed by optional "
+                        + "letter/digit/hyphen groups. IP literals, loopback names, other DNS names, "
+                        + "URIs, paths, credentials, query strings and ports are refused.");
                 System.exit(8);
             }
             if (!poolerHost.equals(bareHost)) {
@@ -117,6 +177,45 @@ public class ProbeState {
                 System.exit(8);
             }
 
+            // --- 2. project identity, independently of the hostname -----------
+            String configuredRef = System.getenv(PROJECT_REF_ENV);
+            if (configuredRef == null || configuredRef.isBlank()) {
+                System.err.println(
+                    "REFUSED: " + PROJECT_REF_ENV + " is not set. The pooler hostname identifies the "
+                        + "provider, not the project; the staging project must be designated explicitly.");
+                System.exit(11);
+            }
+            configuredRef = configuredRef.trim();
+            if (!PROJECT_REF_PATTERN.matcher(configuredRef).matches()) {
+                System.err.println(
+                    "REFUSED: " + PROJECT_REF_ENV + " is not a valid Supabase project reference "
+                        + "(expected 20 lowercase letters or digits).");
+                System.exit(11);
+            }
+            if (nonStagingRefs().contains(configuredRef)) {
+                System.err.println(
+                    "REFUSED: " + configuredRef + " is configured as a known non-staging project. "
+                        + "Set a dedicated staging reference.");
+                System.exit(11);
+            }
+            String expectedUser = "postgres." + configuredRef;
+            if (user == null || !user.trim().equals(expectedUser)) {
+                System.err.println(
+                    "REFUSED: CHECK_USER does not belong to the designated staging project. Expected "
+                        + expectedUser + "; a valid pooler hostname is not project identity.");
+                System.exit(11);
+            }
+
+            // --- 3. credentials ----------------------------------------------
+            if (pass == null || pass.isBlank()) {
+                System.err.println("REFUSED: CHECK_USER/CHECK_PASS are required for a staging connection.");
+                System.exit(2);
+            }
+            props = new Properties();
+            props.put("user", user.trim());
+            props.put("password", pass);
+
+            // --- 4. staged TLS material --------------------------------------
             String rootCert = System.getenv(ROOT_CERT_ENV);
             if (rootCert == null || rootCert.isBlank()) {
                 System.err.println(
@@ -131,7 +230,7 @@ public class ProbeState {
                         + "independently supplied fingerprint would accept any CA the caller names.");
                 System.exit(10);
             }
-            rootCertSha256 = rootCertSha256.trim().replace(":", "").toLowerCase();
+            rootCertSha256 = rootCertSha256.trim().replace(":", "").toLowerCase(Locale.ROOT);
             if (!rootCertSha256.matches("[a-f0-9]{64}")) {
                 System.err.println(
                     "REFUSED: " + ROOT_CERT_SHA256_ENV + " is not a 64-character hex SHA-256 digest. "
@@ -305,6 +404,31 @@ public class ProbeState {
     }
 
     /**
+     * Known non-staging project references. Mirrors the TypeScript deny-list:
+     * POS_NON_STAGING_REFS replaces the built-in list when it is set.
+     */
+    static List<String> nonStagingRefs() {
+        String raw = System.getenv(NON_STAGING_REFS_ENV);
+        List<String> refs = new ArrayList<>();
+        if (raw == null || raw.isBlank()) {
+            refs.addAll(Arrays.asList(KNOWN_NON_STAGING_REFS));
+            return refs;
+        }
+        for (String part : raw.split(",")) {
+            String value = part.trim().toLowerCase(Locale.ROOT);
+            if (!value.isEmpty()) refs.add(value);
+        }
+        return refs;
+    }
+
+    /** The project reference named by a pooler administrator login, or null. */
+    static String adminUserProjectRef(String user) {
+        if (user == null) return null;
+        Matcher m = ADMIN_USER_PATTERN.matcher(user.trim());
+        return m.matches() ? m.group(1) : null;
+    }
+
+    /**
      * Ask PostgreSQL whether THIS transaction is read-only. Returns the server's
      * own answer (`on` / `off`), or null when the server gave no answer.
      */
@@ -347,22 +471,64 @@ public class ProbeState {
         return s;
     }
 
-    /** Bare hostname of a JDBC/libpq URL: no userinfo, port, path or query. */
+    /**
+     * Bare hostname of a JDBC/libpq URL: no userinfo, port, path or query.
+     *
+     * IPv6 literals are only accepted in bracket notation (`[::1]:5432`). An
+     * unbracketed host with more than one colon is ambiguous and is reported as
+     * unparseable (empty), which every caller refuses rather than guesses.
+     */
     static String hostName(String url) {
         String s = hostOf(url);
         int slash = s.indexOf('/');
         if (slash >= 0) s = s.substring(0, slash);
-        int colon = s.indexOf(':');
-        if (colon >= 0) s = s.substring(0, colon);
-        return s;
+        if (s.startsWith("[")) {
+            int close = s.indexOf(']');
+            return close < 0 ? "" : s.substring(1, close);
+        }
+        int first = s.indexOf(':');
+        if (first < 0) return s;
+        if (s.indexOf(':', first + 1) >= 0) return "";
+        return s.substring(0, first);
     }
 
-    /** True only for a disposable loopback test database. */
+    /**
+     * True only for a disposable loopback test database.
+     *
+     * Loopback is decided by exact name or by strict literal parsing. No DNS
+     * lookup is performed, and no string prefix is treated as an address, so
+     * `127.db.attacker.example` and `127.attacker.example` are remote hosts.
+     * `0.0.0.0` is not a loopback destination and is refused.
+     */
     static boolean isLoopback(String host) {
-        return host.equals("localhost")
-            || host.equals("::1")
-            || host.equals("0.0.0.0")
-            || host.startsWith("127.");
+        if (host == null) return false;
+        String h = host.trim();
+        if (h.isEmpty()) return false;
+        if (h.equalsIgnoreCase("localhost")) return true;
+        if (h.equals("::1") || h.equalsIgnoreCase("0:0:0:0:0:0:0:1")) return true;
+        return isIpv4LoopbackLiteral(h);
+    }
+
+    /** Strict dotted-quad in 127.0.0.0/8. Rejects leading zeros and out-of-range octets. */
+    static boolean isIpv4LoopbackLiteral(String host) {
+        String[] parts = host.split("\\.", -1);
+        if (parts.length != 4) return false;
+        int[] octets = new int[4];
+        for (int i = 0; i < 4; i++) {
+            String part = parts[i];
+            if (part.isEmpty() || part.length() > 3) return false;
+            if (part.length() > 1 && part.charAt(0) == '0') return false;
+            int value = 0;
+            for (int j = 0; j < part.length(); j++) {
+                char ch = part.charAt(j);
+                if (ch < '0' || ch > '9') return false;
+                value = value * 10 + (ch - '0');
+            }
+            if (value > 255) return false;
+            octets[i] = value;
+        }
+        // 127.0.0.0/8 only. 0.0.0.0 is deliberately excluded.
+        return octets[0] == 127;
     }
 
     /**

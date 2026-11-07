@@ -14,14 +14,29 @@
 #   probe-staging.yml          → can apply role/grant DDL with -Apply
 #   probe-staging-identity.yml → read-only verification only, no apply path
 #
+# Both staging workflows consume the SAME connection contract:
+#   POS_STAGING_PROJECT_REF, POS_STAGING_POOLER_HOST,
+#   POS_STAGING_DB_ROOT_CERT (path materialized on this runner) and
+#   POS_STAGING_DB_ROOT_CERT_SHA256.
+#
 # Environment requirements (owner-configured on pos-staging-admin):
 #   vars:
-#     POS_STAGING_PROJECT_REF  = <designated staging project reference>
-#     PROBE_ADMIN_USER         = postgres.<same reference>
+#     POS_STAGING_PROJECT_REF         = <designated staging project reference>
+#     POS_STAGING_POOLER_HOST         = the approved pooler hostname
+#     POS_STAGING_DB_ROOT_CERT_B64    = base64 of the staged CA (PEM)
+#     POS_STAGING_DB_ROOT_CERT_SHA256 = SHA-256 of that CA's DER encoding
+#     PROBE_ADMIN_USER                = postgres.<same reference>
 #   secrets (never logged, never artifacted):
 #     PROBE_ADMIN_PASS         = admin password for that role; the workflow maps it
 #                                into ProbeState as CHECK_PASS, so no separate
 #                                CHECK_PASS secret is required
+#
+# The CA is materialized by server/tools/materialize-staging-root-cert.sh into a
+# 0600 file under $RUNNER_TEMP, verified against the independent fingerprint, and
+# exposed to the Java probe only as a path. It is removed by an `if: always()`
+# step, so nothing survives the run. Hosted runners are ephemeral: a certificate
+# path stored in configuration can never be assumed to exist, and a missing value
+# fails the job before the probe starts rather than falling back to system trust.
 #
 # Evidence policy: the probe's full output is database inventory and is treated as
 # sensitive. It is written to a scratch file that is NEVER uploaded. Only the
@@ -59,6 +74,15 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # The runner is ephemeral, so the staged CA is written here, verified here
+      # and removed at the end of the job. Only the resulting path is exported.
+      - name: Materialize staged root certificate
+        shell: bash
+        env:
+          POS_STAGING_DB_ROOT_CERT_B64: ${{ vars.POS_STAGING_DB_ROOT_CERT_B64 }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
+        run: bash server/tools/materialize-staging-root-cert.sh
+
       - name: Validate staging target reference
         shell: bash
         env:
@@ -67,10 +91,10 @@ jobs:
           # POS_STAGING_ADMIN_USER. Map it rather than renaming the stored variable.
           POS_STAGING_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
           # Shared staging connection contract, consumed by both ProbeState (JDBC)
-          # and probe-readonly.ps1 (PowerShell). Both paths validate these three
-          # values against the same staging contract before any connection is made.
+          # and probe-readonly.ps1 (PowerShell). Both paths validate these values
+          # against the same staging contract before any connection is made.
+          # POS_STAGING_DB_ROOT_CERT arrives from the materialization step above.
           POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
-          POS_STAGING_DB_ROOT_CERT: ${{ vars.POS_STAGING_DB_ROOT_CERT }}
           POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
         run: |
           set -euo pipefail
@@ -100,7 +124,6 @@ jobs:
         env:
           POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
           POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
-          POS_STAGING_DB_ROOT_CERT: ${{ vars.POS_STAGING_DB_ROOT_CERT }}
           POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
           CHECK_URL: jdbc:postgresql://${{ vars.POS_STAGING_POOLER_HOST }}:5432/postgres
           CHECK_USER: ${{ vars.PROBE_ADMIN_USER }}
@@ -126,9 +149,12 @@ jobs:
           # appears in a process listing.
           #
           # ProbeState is read-only: it refuses an unset CHECK_URL, refuses without
-          # PROBE_CONFIRM=yes, refuses hosts containing "prod", opens a read-only
-          # transaction, and only ever issues SELECTs against catalogs and views.
-          # It never invokes probe-readonly.ps1 and has no provisioning path.
+          # PROBE_CONFIRM=yes, refuses hosts containing "prod", refuses any target
+          # that is neither the configured pooler nor a loopback test database,
+          # verifies that POS_STAGING_PROJECT_REF matches CHECK_USER, opens a
+          # read-only transaction, and only ever issues SELECTs against catalogs
+          # and views. It never invokes probe-readonly.ps1 and has no provisioning
+          # path.
           if ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
             STATUS=0
           else
@@ -223,3 +249,10 @@ jobs:
           path: server/probe-evidence.txt
           if-no-files-found: ignore
           retention-days: 5
+
+      - name: Remove staged certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "${RUNNER_TEMP:-/tmp}/staging-root-ca.pem"

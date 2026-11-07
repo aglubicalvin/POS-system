@@ -20,8 +20,12 @@ import java.util.regex.Pattern
  *
  *   aws-<n>-<region>.pooler.supabase.com
  *
- * where <n> is one or more digits and <region> is one or more lowercase letters,
- * digits or hyphens. The entire hostname is anchored to the Supabase pooler DNS
+ * where <n> is one to three digits and <region> is two or more lowercase letters
+ * optionally followed by letter/digit/hyphen groups. This is byte-for-byte the
+ * grammar used by SUPABASE_POOLER_HOST_PATTERN, ProbeState.java and
+ * probe-readonly.ps1: the shared vector table in
+ * server/tools/staging-pooler-host-vectors.txt is asserted against all four
+ * implementations. The entire hostname is anchored to the Supabase pooler DNS
  * domain, so arbitrary DNS names, attacker-controlled suffixes, IP literals,
  * loopback names, URIs, paths, credentials, query strings, ports and whitespace
  * are all refused.
@@ -43,9 +47,13 @@ object StagingPoolerHost {
 
     const val ENV = "POS_STAGING_POOLER_HOST"
 
+    /**
+     * The exact shared grammar. Matching happens after trimming and lower-casing,
+     * so the pattern itself is lower-case only and needs no CASE_INSENSITIVE flag
+     * (which would otherwise accept a casing variant of the TLD as well).
+     */
     private val PATTERN: Pattern = Pattern.compile(
-        """^aws-([0-9]+)-([a-z0-9-]+)\.pooler\.supabase\.com$""",
-        Pattern.CASE_INSENSITIVE,
+        """^aws-([0-9]{1,3})-([a-z]{2,}(?:-[a-z0-9]+)*)\.pooler\.supabase\.com$""",
     )
 
     /** Thrown by require when the configuration is missing or malformed. */
@@ -102,8 +110,9 @@ object StagingPoolerHost {
                 code = "malformed-staging-pooler-host",
                 message = "BLOCKED: $ENV does not name a Supabase pooler endpoint. " +
                     "Expected exactly aws-<n>-<region>.pooler.supabase.com " +
-                    "(for example aws-0-eu-west-2.pooler.supabase.com), with <n> one or more " +
-                    "digits and <region> one or more lowercase letters, digits or hyphens. " +
+                    "(for example aws-0-eu-west-2.pooler.supabase.com), with <n> one to three " +
+                    "digits and <region> two or more lowercase letters followed by optional " +
+                    "letter/digit/hyphen groups. " +
                     "IP literals, loopback names, arbitrary DNS names, URIs, paths, " +
                     "credentials, query strings and ports are refused. The project region must " +
                     "be confirmed by a human against the staging project's Supabase dashboard " +

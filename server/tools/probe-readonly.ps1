@@ -21,11 +21,12 @@
 #     exactly one approved pooler endpoint and no region is inferred from the
 #     project reference or from any previously used endpoint.
 #   - sslmode=verify-full only. There is no prefer/require/allow/disable fallback.
-#   - The staged root certificate is written to private temp material and is
-#     deleted before exit on success and failure, so it is never left on disk or
-#     printed. The independently supplied SHA-256 over the certificate's DER
-#     encoding must match the certificate we actually write; a mismatch refuses
-#     the target before anything is run.
+#   - The staged root certificate is verified against the independently supplied
+#     SHA-256 over its DER encoding before anything is run; a mismatch refuses the
+#     target. libpq inside Docker then reads the certificate from a fixed
+#     container path (/certs/ca.pem) backed by a read-only mount of a private temp
+#     copy, never from a host path, so the staged CA is the one libpq trusts. The
+#     copy is deleted before exit on success and failure and is never printed.
 
 param([switch]$Apply)
 
@@ -54,8 +55,12 @@ if ([string]::IsNullOrWhiteSpace($PoolerHost)) {
     throw 'BLOCKED: POS_STAGING_POOLER_HOST has not been explicitly configured. The staging connection must use an approved Supabase pooler hostname; there is no default, no region inference, and no fallback to a previously used endpoint.'
 }
 $Normalized = $PoolerHost.Trim().ToLowerInvariant()
-if ($Normalized -notmatch '^aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com$') {
-    throw 'BLOCKED: POS_STAGING_POOLER_HOST does not name an approved Supabase pooler endpoint. Expected exactly aws-<n>-<region>.pooler.supabase.com, with <n> one or more digits and <region> one or more lowercase letters, digits or hyphens. IP literals, loopback names, arbitrary DNS names, URIs, paths, credentials, query strings and ports are refused.'
+# Exactly the shared grammar: identical to SUPABASE_POOLER_HOST_PATTERN in
+# src/config/staging-target.ts, StagingPoolerHost.PATTERN in Kotlin and
+# POOLER_HOST_PATTERN in ProbeState.java. The vector table in
+# server/tools/staging-pooler-host-vectors.txt is asserted against all four.
+if ($Normalized -notmatch '^aws-[0-9]{1,3}-[a-z]{2,}(?:-[a-z0-9]+)*\.pooler\.supabase\.com$') {
+    throw 'BLOCKED: POS_STAGING_POOLER_HOST does not name an approved Supabase pooler endpoint. Expected exactly aws-<n>-<region>.pooler.supabase.com, with <n> one to three digits and <region> two or more lowercase letters followed by optional letter/digit/hyphen groups. IP literals, loopback names, arbitrary DNS names, URIs, paths, credentials, query strings and ports are refused.'
 }
 
 $RootCert = $env:POS_STAGING_DB_ROOT_CERT
@@ -121,14 +126,25 @@ if ($env:PROBE_PW -match '[\r\n\x00]') {
     throw 'Refusing to run: PROBE_PW must not contain line breaks or NUL.'
 }
 
+# The CA must exist INSIDE the container: a host path means nothing to libpq in
+# Docker. Copy it into a private temp directory and mount that directory read-only
+# at a fixed container path, so sslrootcert is a constant rather than an
+# interpolated host path.
+$CertDir = Join-Path ([System.IO.Path]::GetTempPath()) ('pos-staging-ca-' + [Guid]::NewGuid().ToString('N'))
+$ContainerCertDir = '/certs'
+$ContainerCert = "$ContainerCertDir/ca.pem"
+$LocalCert = Join-Path $CertDir 'ca.pem'
+New-Item -ItemType Directory -Path $CertDir | Out-Null
+
 # Build the pooler connection string from the validated staging contract only.
-# No hardcoded host, no credentials, sslmode=verify-full + sslrootcert, libpq.
-$uri = "host=$Normalized port=5432 dbname=postgres user=$($env:PROBE_ADMIN_USER) sslmode=verify-full sslrootcert=$RootCert"
+# No hardcoded host, no credentials, sslmode=verify-full, fixed container CA path.
+$uri = "host=$Normalized port=5432 dbname=postgres user=$($env:PROBE_ADMIN_USER) sslmode=verify-full sslrootcert=$ContainerCert"
 
 $dockerArgs = @(
     'run', '--rm', '-i',
     '-e', 'PGPASSWORD',
     '-v', "$PSScriptRoot`:/work:ro",
+    '-v', "$($CertDir):$($ContainerCertDir):ro",
     'postgres:17',
     'psql', $uri, '--single-transaction', '-v', 'ON_ERROR_STOP=1',
     '-f', '/work/pos_probe_readonly.sql',
@@ -138,6 +154,16 @@ $dockerArgs = @(
 
 $env:PGPASSWORD = $env:PROBE_ADMIN_PASS
 try {
+    Copy-Item -LiteralPath $RootCert -Destination $LocalCert -Force
+    # The CA is a public trust anchor and the container runs unprivileged, so the
+    # copy must be readable inside the mount. It is never writable, holds no
+    # secret, and the directory is removed in the finally block.
+    if ($IsLinux -or $IsMacOS) {
+        & chmod 0755 $CertDir
+        & chmod 0444 $LocalCert
+        if ($LASTEXITCODE -ne 0) { throw 'BLOCKED: could not set permissions on the staged certificate copy.' }
+    }
+
     # Windows PowerShell turns native stderr into errors. Keep it non-terminating
     # and check the native exit code explicitly.
     $ErrorActionPreference = 'Continue'
@@ -146,6 +172,7 @@ try {
 } finally {
     $ErrorActionPreference = 'Stop'
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $CertDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($code -ne 0) { throw "psql failed with exit code $code. See $Log" }
 Write-Host "Completed. Log: $Log"

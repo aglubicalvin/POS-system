@@ -1,8 +1,36 @@
 -- pos_probe_readonly: least-privilege role for server/tools/ProbeState.java
 --
 -- STATUS: PROPOSED. NOT EXECUTED. Requires explicit manual approval.
--- Run once by a project administrator, in the DEVELOPMENT project only.
--- Target project reference must be confirmed before running (see step 0).
+--
+-- TARGET SCOPE (revised): the DESIGNATED STAGING project only, run by an
+-- administrator of that project. This file previously said "DEVELOPMENT project
+-- only"; that instruction is superseded because the probe role now exists to
+-- read the staging database. Development is no longer a supported target for
+-- this role.
+--
+-- Why this DDL is valid on staging, statement by statement:
+--   * step 1 creates a LOGIN role owned by the executing administrator. It names
+--     no schema, database or environment; Supabase's postgres role may create
+--     roles on any project it administers.
+--   * step 2 sets role defaults only (read-only transactions, statement timeout).
+--   * step 3 grants CONNECT on the postgres database, which exists on every
+--     Supabase project.
+--   * steps 4-5 grant USAGE on supabase_migrations and column SELECT on
+--     supabase_migrations.schema_migrations, both created and owned by Supabase
+--     itself. Nothing in public or auth is granted, so the role cannot read
+--     business data.
+--   * steps 6-8 are read-only verification queries.
+-- There is no environment-specific object, no extension, no data and no
+-- destructive statement anywhere in this file.
+--
+-- FAIL-CLOSED: the wrapper (probe-readonly.ps1) runs all three files in ONE
+-- transaction with ON_ERROR_STOP=1. If supabase_migrations or its table is absent
+-- (for example on a project where migrations were never run), the grant fails,
+-- the transaction rolls back and no role is left behind.
+--
+-- The target project reference must be confirmed before running (see step 0), and
+-- the wrapper refuses unless POS_STAGING_PROJECT_REF, the validated pooler host,
+-- the staged CA and the administrator login all agree.
 -- Never run against production.
 --
 -- The password is NOT in this file. Set it separately in psql so the secret
