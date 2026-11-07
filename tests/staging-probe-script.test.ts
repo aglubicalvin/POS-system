@@ -85,8 +85,14 @@ function readEvidence(): Record<string, string> {
 }
 
 /**
- * Install a stub `docker` that records its argv, optionally prints a transcript,
- * and exits with `exitCode`. No container, no database, no network.
+ * Install a stub `docker` that records its argv and its stdin separately,
+ * optionally prints a transcript, and exits with `exitCode`. No container, no
+ * database, no network.
+ *
+ * stdin is captured to `docker-stdin.txt` verbatim (bytes, not lines) so the
+ * real wrapper's password delivery can be asserted rather than assumed. On
+ * Windows a .cmd shim cannot read stdin without mangling it (`more` paginates),
+ * so the shim delegates to a tiny Node stub that drains the inherited pipe.
  */
 function installStubDocker(
   dir: string,
@@ -96,19 +102,34 @@ function installStubDocker(
 ): string {
   const bin = join(dir, 'bin');
   mkdirSync(bin, { recursive: true });
+  const stdinFile = join(dir, 'docker-stdin.txt');
   if (process.platform === 'win32') {
+    const stub = join(bin, 'docker-stub.mjs');
+    writeFileSync(
+      stub,
+      [
+        "import { readFileSync, writeFileSync } from 'node:fs';",
+        'const [stdinFile, argsFile, transcriptFile, code, ...dockerArgs] = process.argv.slice(2);',
+        "let input = '';",
+        'try { input = readFileSync(0, "utf8"); } catch {}',
+        'writeFileSync(stdinFile, input, "utf8");',
+        'writeFileSync(argsFile, dockerArgs.join(" ") + "\\n", "utf8");',
+        'if (transcriptFile) { try { process.stdout.write(readFileSync(transcriptFile, "utf8")); } catch {} }',
+        'process.exit(Number(code));',
+        '',
+      ].join('\n'),
+      'utf8',
+    );
     writeFileSync(
       join(bin, 'docker.cmd'),
-      `@echo off\r\necho %* > "${argsFile}"\r\n` +
-        (transcriptFile ? `type "${transcriptFile}"\r\n` : '') +
-        `exit /b ${exitCode}\r\n`,
+      `@echo off\r\nnode "%~dp0docker-stub.mjs" "${stdinFile}" "${argsFile}" "${transcriptFile ?? ''}" ${exitCode} %*\r\n`,
       'utf8',
     );
   } else {
     const shim = join(bin, 'docker');
     writeFileSync(
       shim,
-      `#!/bin/sh\nprintf '%s\\n' "$*" > "${argsFile}"\n` +
+      `#!/bin/sh\ncat > "${stdinFile}"\nprintf '%s\\n' "$*" > "${argsFile}"\n` +
         (transcriptFile ? `cat "${transcriptFile}"\n` : '') +
         `exit ${exitCode}\n`,
       'utf8',
@@ -564,6 +585,11 @@ describe('probe-readonly.ps1 sanitized evidence', () => {
     return {
       result,
       argsFile,
+      dir,
+      // Exactly the bytes the wrapper sent down Docker's inherited stdin pipe.
+      stdin: existsSync(join(dir, 'docker-stdin.txt'))
+        ? readFileSync(join(dir, 'docker-stdin.txt'), 'utf8')
+        : null,
       evidence: existsSync(EVIDENCE_FILE) ? readEvidence() : null,
     };
   }
@@ -667,5 +693,58 @@ describe('probe-readonly.ps1 sanitized evidence', () => {
     });
     expect(result.status).not.toBe(0);
     expect(result.output).toContain('POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS');
+  });
+
+  // ---- non-interactive password delivery (\password reads two lines) -------
+
+  itPS('delivers exactly two password lines on stdin, never in argv', () => {
+    const { result, argsFile, stdin } = runApply(cleanLines, 0);
+    expect(result.status, result.output).toBe(0);
+    // One line per \password prompt. The trailing newline terminates the second
+    // line; a CR before it is the Windows host's line ending, not extra input.
+    expect(stdin?.replace(/\r\n/g, '\n')).toBe('probe-pass\nprobe-pass\n');
+    // The value is not in the Docker argument vector...
+    expect(readFileSync(argsFile, 'utf8')).not.toContain('probe-pass');
+    // ...and not in the job log, the sanitized summary, or anything left behind.
+    expect(result.output).not.toContain('probe-pass');
+    expect(JSON.stringify(readEvidence())).not.toContain('probe-pass');
+    expect(rawLogs()).toEqual([]);
+  });
+
+  itPS('delivers the password twice on the failure path too', () => {
+    const { result, stdin } = runApply(
+      ['psql: error: connection to server at "db.internal:5432" failed'],
+      3,
+    );
+    expect(result.status, result.output).toBe(3);
+    expect(stdin?.replace(/\r\n/g, '\n')).toBe('probe-pass\nprobe-pass\n');
+  });
+
+  itPS('refuses a password with an embedded line break before Docker is invoked', () => {
+    for (const password of ['probe-pass\nsecond-line', 'probe-pass\rsecond-line']) {
+      const { result, argsFile, stdin } = runApply(cleanLines, 0, { PROBE_PW: password });
+      expect(result.status, result.output).not.toBe(0);
+      expect(result.output).toContain('PROBE_PW must not contain line breaks or NUL');
+      // No process was started: no input lines were written and no args exist.
+      expect(stdin).toBeNull();
+      expect(existsSync(argsFile)).toBe(false);
+    }
+  });
+
+  itPS('refuses a missing password before Docker is invoked', () => {
+    const { result, argsFile, stdin } = runApply(cleanLines, 0, { PROBE_PW: '' });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('PROBE_ADMIN_PASS and PROBE_PW must be set');
+    expect(stdin).toBeNull();
+    expect(existsSync(argsFile)).toBe(false);
+  });
+
+  itPS('rejects a transcript that carries the password instead of uploading it', () => {
+    const { result, evidence } = runApply([...cleanLines, 'password=probe-pass'], 0);
+    expect(result.status, result.output).not.toBe(0);
+    expect(evidence?.evidence_status).toBe('rejected');
+    expect(JSON.stringify(evidence)).not.toContain('probe-pass');
+    expect(result.output).not.toContain('probe-pass');
+    expect(rawLogs()).toEqual([]);
   });
 });

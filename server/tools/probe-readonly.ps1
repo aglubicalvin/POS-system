@@ -240,8 +240,16 @@ try {
     # Windows PowerShell turns native stderr into errors. Capture it without
     # terminating, check the native exit code explicitly, and never write the
     # transcript to the workflow log.
+    #
+    # pos_probe_readonly_password.sql is `\password pos_probe_readonly`, which
+    # reads TWO lines from psql's stdin. Docker runs with -i, so the inherited
+    # stdin pipe is psql's stdin. Piping the password twice
+    # delivers exactly one line per \password prompt and never puts it in the
+    # argument vector or in a Docker -e value. PROBE_PW was rejected above if it
+    # contained CR, LF or NUL, so no password value can add or remove a line.
     $ErrorActionPreference = 'Continue'
-    & docker @dockerArgs 2>&1 |
+    @($env:PROBE_PW, $env:PROBE_PW) |
+        & docker @dockerArgs 2>&1 |
         ForEach-Object {
             if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message }
             else { [string]$_ }
