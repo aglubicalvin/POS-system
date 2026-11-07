@@ -726,3 +726,54 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     expect(deleteIdx).toBeGreaterThan(probeIdx);
   });
 });
+
+
+/**
+ * Finding 4 (independent review): the staging workflow must not depend solely on
+ * an external Environment setting the reviewer could not inspect. The job that
+ * consumes staging credentials is pinned to refs/heads/main, so a manual
+ * dispatch that selects another branch is skipped before the environment, its
+ * vars or its secrets are resolved.
+ */
+describe('staging workflow main-only release gate', () => {
+  const yml = read(STAGING_WORKFLOW).replace(/\r\n/g, '\n');
+
+  it('keeps the manual-only trigger', () => {
+    expect(yml).toMatch(/^on:\s*\n\s*workflow_dispatch:/m);
+    expect(yml).not.toMatch(/^\s+(push|pull_request|schedule|workflow_run):/m);
+  });
+
+  it('restricts the job that holds staging credentials to refs/heads/main', () => {
+    // Job-level condition: evaluated before the environment, its secrets and any
+    // step. A late script check after secrets are consumed would not satisfy this.
+    expect(yml).toMatch(/^    if: github\.ref == 'refs\/heads\/main'$/m);
+    const jobIdx = yml.indexOf('\n  apply:\n');
+    const gateIdx = yml.indexOf("    if: github.ref == 'refs/heads/main'");
+    const stepsIdx = yml.indexOf('\n    steps:\n');
+    expect(jobIdx).toBeGreaterThan(-1);
+    expect(gateIdx).toBeGreaterThan(jobIdx);
+    expect(gateIdx).toBeLessThan(stepsIdx);
+    // The restriction is the job condition, not a shell test inside a step.
+    expect(yml).not.toMatch(/if \[+ "\$GITHUB_REF"/);
+  });
+
+  it('keeps the staging environment on the restricted job only', () => {
+    expect(yml).toContain('environment: pos-staging-admin');
+    expect(yml).not.toContain('environment: pos-dev-admin');
+    expect(read(DEV_WORKFLOW)).not.toContain('pos-staging-admin');
+  });
+
+  it('uploads only sanitized evidence, never a raw transcript', () => {
+    expect(yml).toContain('path: server/build/probe-readonly-evidence.txt');
+    expect(yml).not.toMatch(/probe-readonly-\*\.log/);
+    expect(yml).not.toMatch(/Tee-Object/);
+    expect(read(DEV_WORKFLOW)).toContain('path: server/build/probe-readonly-evidence.txt');
+  });
+
+  it('documents that the GitHub Environment protections are externally verified', () => {
+    // The YAML cannot prove required reviewers, prevent-self-review, the
+    // deployment branch policy or secret scoping: those live in GitHub settings.
+    expect(yml).toMatch(/NOT verified by this file/);
+    expect(yml).toMatch(/repository administrator must confirm them independently/);
+  });
+});

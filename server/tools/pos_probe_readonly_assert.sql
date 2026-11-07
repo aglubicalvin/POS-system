@@ -5,7 +5,12 @@
 do $$
 declare
   r record;
+  f record;
   bad text[] := '{}';
+  reviewed text[] := '{}';
+  entry text;
+  reviewed_count int := 0;
+  offenders text[] := '{}';
 begin
   select * into r from pg_roles where rolname = 'pos_probe_readonly';
   if not found then
@@ -112,21 +117,46 @@ begin
     bad := array_append(bad, 'direct EXECUTE grant on a function');
   end if;
 
-  -- SECURITY DEFINER functions are the residual risk this SQL cannot remove:
-  -- they run with their owner's privileges, so anything such a function
-  -- exposes is reachable even though the role holds no table privilege. The
-  -- probe session is read-only, so writes inside them still fail, but a
-  -- reader function could return data. Report them (names only) instead of
-  -- asserting a property the platform does not provide.
-  raise notice 'SECURITY DEFINER functions executable by pos_probe_readonly (inherited; review, not an assertion): %',
-    coalesce((
-      select string_agg(n.nspname || '.' || p.proname, ', ' order by n.nspname, p.proname)
-      from pg_proc p
-      join pg_namespace n on n.oid = p.pronamespace
-      where p.prosecdef
-        and n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
-        and has_function_privilege('pos_probe_readonly', p.oid, 'EXECUTE')
-    ), 'none');
+  -- SECURITY DEFINER review gate, post-creation. The preflight already refused
+  -- the run before the account existed; this repeats the comparison with the
+  -- role that actually exists, so PUBLIC-inherited EXECUTE and a direct grant
+  -- are both judged as effective privileges. Printing the function names was
+  -- never a control; this fails the assertions instead. The reviewed allowlist
+  -- is the same POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS value, passed as the
+  -- reviewed_security_definer psql variable.
+  foreach entry in array string_to_array(
+      coalesce(current_setting('pos.reviewed_security_definer', true), ''), ';')
+  loop
+    entry := btrim(entry);
+    if entry <> '' then
+      reviewed := array_append(reviewed, entry);
+    end if;
+  end loop;
+
+  for f in
+    select n.nspname || '.' || p.proname
+             || '(' || pg_get_function_identity_arguments(p.oid) || ')' as identity
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where p.prosecdef
+      and n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
+      and has_function_privilege('pos_probe_readonly', p.oid, 'EXECUTE')
+    order by 1
+  loop
+    if f.identity = any(reviewed) then
+      reviewed_count := reviewed_count + 1;
+    else
+      offenders := array_append(offenders, f.identity);
+    end if;
+  end loop;
+
+  if coalesce(array_length(offenders, 1), 0) > 0 then
+    bad := array_append(bad,
+      'unreviewed SECURITY DEFINER function executable by pos_probe_readonly: '
+      || array_to_string(offenders[1:5], ', '));
+  end if;
+
+  raise notice 'SECURITY DEFINER functions reviewed for pos_probe_readonly: %', reviewed_count;
 
   if array_length(bad, 1) is not null then
     raise exception 'pos_probe_readonly assertions failed: %', array_to_string(bad, '; ');

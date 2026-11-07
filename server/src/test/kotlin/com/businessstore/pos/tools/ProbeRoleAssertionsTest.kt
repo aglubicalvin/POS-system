@@ -5,7 +5,7 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
-import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -15,24 +15,32 @@ import java.sql.SQLException
 import java.util.UUID
 
 /**
- * Executes the proposed role SQL and its assertion script against a disposable
- * local PostgreSQL fixture. No Supabase project, staging or production database is
- * contacted, and the role is dropped afterwards.
+ * Executes the proposed role SQL, its SECURITY DEFINER preflight and its
+ * assertion script against a disposable local PostgreSQL fixture. No Supabase
+ * project, staging or production database is contacted, and the role is dropped
+ * afterwards.
  *
- * The fixture reproduces the one platform property that made the old assertion
- * wrong: PostgreSQL/Supabase grant USAGE on the `public` schema to PUBLIC, so every
- * login inherits it. The fixture therefore also proves the positive control --
- * `has_schema_privilege(..., 'public', 'USAGE')` is true and the assertions still
- * pass -- rather than deleting the check and calling it fixed.
+ * The fixture reproduces the platform properties that matter here:
+ *  - PostgreSQL grants USAGE on the `public` schema to PUBLIC, so every login
+ *    inherits it, and grants EXECUTE on new functions to PUBLIC by default; the
+ *    positive control therefore proves inherited USAGE is still accepted.
+ *  - A SECURITY DEFINER function is executable through that default grant, which
+ *    is exactly what the new preflight must stop until it has been reviewed.
  *
- * The only edit to the SQL under test is the database name in `GRANT CONNECT`,
- * because the fixture database is not called `postgres`. Everything else in both
- * files runs verbatim.
+ * The only edits to the SQL under test are:
+ *  - the database name in `GRANT CONNECT`, because the fixture database is not
+ *    named `postgres`;
+ *  - psql variable substitution (`:'admin_user'`,
+ *    `:'reviewed_security_definer'`), which psql performs but JDBC does not.
+ * Everything else runs verbatim, and the preflight-then-role helper reproduces
+ * `psql --single-transaction -v ON_ERROR_STOP=1 -f preflight -f role`: a failure
+ * in the first file aborts before the role is created.
  */
 class ProbeRoleAssertionsTest {
 
     private val role = "pos_probe_readonly"
     private val roleSqlFile = File("tools/pos_probe_readonly.sql")
+    private val preflightSqlFile = File("tools/pos_probe_readonly_preflight.sql")
     private val assertSqlFile = File("tools/pos_probe_readonly_assert.sql")
 
     private lateinit var dbName: String
@@ -70,8 +78,7 @@ class ProbeRoleAssertionsTest {
     /** Where a script raises, keep the exception and the notice text for assertions. */
     private data class ScriptRun(val failure: SQLException?, val notices: String)
 
-    private fun runScript(file: File, transform: (String) -> String = { it }): ScriptRun {
-        val sql = transform(file.readText())
+    private fun runSql(sql: String): ScriptRun {
         connect().use { conn ->
             conn.createStatement().use { st ->
                 val failure = runCatching { st.execute(sql) }.exceptionOrNull() as? SQLException
@@ -87,19 +94,66 @@ class ProbeRoleAssertionsTest {
         }
     }
 
-    private fun createRole() {
-        val run = runScript(roleSqlFile) { sql ->
-            sql.replace(
+    private fun runScript(file: File, transform: (String) -> String = { it }): ScriptRun =
+        runSql(transform(file.readText()))
+
+    /** psql would expand :'admin_user'; the fixture runs as the connected login. */
+    private fun roleSql(adminUser: String = dbUser): String =
+        roleSqlFile.readText()
+            .replace(
                 "grant connect on database postgres to",
                 "grant connect on database $dbName to",
             )
-        }
+            .replace(":'admin_user'", "'${adminUser.replace("'", "''")}'")
+
+    private fun preflightSql(reviewed: String): String =
+        preflightSqlFile.readText()
+            .replace(":'reviewed_security_definer'", "'${reviewed.replace("'", "''")}'")
+
+    private fun assertionsSql(reviewed: String): String =
+        "select set_config('pos.reviewed_security_definer', " +
+            "'${reviewed.replace("'", "''")}', false);\n" +
+            assertSqlFile.readText()
+
+    private fun createRole() {
+        val run = runSql(roleSql())
         assertEquals(null, run.failure, "the proposed role SQL must apply cleanly")
     }
 
-    private fun runAssertions(): ScriptRun = runScript(assertSqlFile)
+    private fun runAssertions(reviewed: String = ""): ScriptRun =
+        runSql(assertionsSql(reviewed))
+
+    private fun runPreflight(reviewed: String): SQLException? =
+        runSql(preflightSql(reviewed)).failure
+
+    /**
+     * `psql --single-transaction ... -f preflight -f role`: a refusal in the first
+     * file means the second never runs and the transaction rolls back.
+     */
+    private fun preflightThenRole(reviewed: String): SQLException? {
+        connect().use { conn ->
+            conn.autoCommit = false
+            val failure = try {
+                conn.createStatement().use { it.execute(preflightSql(reviewed)) }
+                conn.createStatement().use { it.execute(roleSql()) }
+                conn.commit()
+                null
+            } catch (e: SQLException) {
+                conn.rollback()
+                e
+            }
+            return failure
+        }
+    }
 
     private fun failureText(run: ScriptRun): String = run.failure?.message.orEmpty()
+
+    private fun roleExists(): Boolean =
+        connect().use { conn ->
+            conn.createStatement().use { st ->
+                st.executeQuery("select 1 from pg_roles where rolname = '$role'").use { it.next() }
+            }
+        }
 
     private fun dropRole() {
         TestDb.dataSource.connection.use { conn ->
@@ -119,6 +173,7 @@ class ProbeRoleAssertionsTest {
     /** Supabase's baseline: PUBLIC can use `public` but cannot create in it. */
     private fun fixtureDdl(): String {
         assertTrue(roleSqlFile.isFile, "missing ${roleSqlFile.absolutePath}")
+        assertTrue(preflightSqlFile.isFile, "missing ${preflightSqlFile.absolutePath}")
         assertTrue(assertSqlFile.isFile, "missing ${assertSqlFile.absolutePath}")
         return """
             CREATE SCHEMA IF NOT EXISTS auth;
@@ -165,6 +220,146 @@ class ProbeRoleAssertionsTest {
         val run = runAssertions()
         assertEquals(null, run.failure, "assertions must pass on the proposed role:\n${run.notices}")
         assertTrue(run.notices.contains("assertions passed"), run.notices)
+        assertTrue(
+            run.notices.contains("SECURITY DEFINER functions reviewed for pos_probe_readonly: 0"),
+            run.notices,
+        )
+    }
+
+    // ---- SECURITY DEFINER review gate, before creation --------------------
+
+    @Test
+    fun `the preflight refuses an unreviewed PUBLIC-executable SECURITY DEFINER function`() {
+        execute(
+            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+        )
+
+        val failure = preflightThenRole("")
+        assertNotNull(failure, "an unreviewed SECURITY DEFINER function must abort the run")
+        assertTrue(failureText(ScriptRun(failure, "")).contains("unreviewed SECURITY DEFINER function"), failure!!.message)
+        assertTrue(failure.message.orEmpty().contains("public.reader()"), failure.message)
+        assertTrue(
+            failure.message.orEmpty().contains("inherited EXECUTE from PUBLIC"),
+            failure.message,
+        )
+        assertFalse(roleExists(), "a refused preflight must not create the role")
+    }
+
+    @Test
+    fun `an allowlisted SECURITY DEFINER function passes the preflight and the assertions`() {
+        execute(
+            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+        )
+
+        val failure = preflightThenRole("public.reader()")
+        assertNull(failure, "an individually reviewed function must pass: ${failure?.message}")
+        assertTrue(roleExists(), "the role must be created once the gate passes")
+
+        val run = runAssertions("public.reader()")
+        assertEquals(null, run.failure, run.notices)
+        assertTrue(
+            run.notices.contains("SECURITY DEFINER functions reviewed for pos_probe_readonly: 1"),
+            run.notices,
+        )
+    }
+
+    @Test
+    fun `an ordinary function is not classified as SECURITY DEFINER`() {
+        execute("CREATE FUNCTION public.helper() RETURNS int LANGUAGE sql AS 'SELECT 1'")
+
+        val failure = preflightThenRole("")
+        assertNull(failure, "a SECURITY INVOKER function needs no review: ${failure?.message}")
+        assertTrue(roleExists())
+
+        val run = runAssertions("")
+        assertEquals(null, run.failure, run.notices)
+        assertTrue(
+            run.notices.contains("SECURITY DEFINER functions reviewed for pos_probe_readonly: 0"),
+            run.notices,
+        )
+    }
+
+    @Test
+    fun `a direct EXECUTE grant is refused even when the function is allowlisted`() {
+        createRole()
+        execute(
+            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+        )
+        execute("GRANT EXECUTE ON FUNCTION public.reader() TO $role")
+
+        val failure = runPreflight("public.reader()")
+        assertNotNull(failure, "a direct function grant is not covered by the allowlist")
+        assertTrue(
+            failure!!.message.orEmpty().contains("direct grant to pos_probe_readonly"),
+            failure.message,
+        )
+    }
+
+    @Test
+    fun `an explicit PUBLIC grant is reported as inherited EXECUTE`() {
+        execute(
+            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+        )
+        execute("REVOKE ALL ON FUNCTION public.reader() FROM PUBLIC")
+        execute("GRANT EXECUTE ON FUNCTION public.reader() TO PUBLIC")
+
+        val failure = preflightThenRole("")
+        assertNotNull(failure)
+        assertTrue(
+            failure!!.message.orEmpty().contains("inherited EXECUTE from PUBLIC"),
+            failure.message,
+        )
+    }
+
+    @Test
+    fun `a SECURITY DEFINER function with no executable grant is not blocked`() {
+        execute(
+            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+        )
+        execute("REVOKE ALL ON FUNCTION public.reader() FROM PUBLIC")
+
+        val failure = preflightThenRole("")
+        assertNull(failure, "nothing executable means nothing to review: ${failure?.message}")
+        assertTrue(roleExists())
+    }
+
+    @Test
+    fun `an allowlist entry that matches no executable function is refused`() {
+        createRole()
+
+        val failure = runPreflight("public.absent()")
+        assertNotNull(failure, "a stale allowlist entry must not pass silently")
+        assertTrue(
+            failure!!.message.orEmpty().contains("match no executable SECURITY DEFINER function"),
+            failure.message,
+        )
+    }
+
+    @Test
+    fun `an unreviewed inherited SECURITY DEFINER function fails the post-creation assertions`() {
+        createRole()
+        execute(
+            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
+        )
+
+        val run = runAssertions("")
+        assertNotNull(run.failure, "the post-creation gate must fail closed too")
+        assertTrue(
+            failureText(run).contains("unreviewed SECURITY DEFINER function executable by pos_probe_readonly"),
+            failureText(run),
+        )
+        assertTrue(failureText(run).contains("public.reader()"), failureText(run))
+    }
+
+    // ---- identity and sequencing -----------------------------------------
+
+    @Test
+    fun `the role SQL refuses a session that is not the validated administrator`() {
+        val run = runSql(roleSql(adminUser = "postgres.someoneelse00000000"))
+
+        assertNotNull(run.failure, "a different login must not create the role")
+        assertTrue(failureText(run).contains("project identity refused"), failureText(run))
+        assertFalse(roleExists())
     }
 
     // ---- regressions the assertions must still catch ----------------------
@@ -221,21 +416,8 @@ class ProbeRoleAssertionsTest {
         )
         execute("GRANT EXECUTE ON FUNCTION public.reader() TO $role")
 
-        val run = runAssertions()
+        val run = runAssertions("public.reader()")
         assertNotNull(run.failure, "a direct EXECUTE grant must fail the assertions")
         assertTrue(failureText(run).contains("direct EXECUTE grant on a function"), failureText(run))
-    }
-
-    @Test
-    fun `inherited SECURITY DEFINER functions are reported, not asserted away`() {
-        createRole()
-        execute(
-            "CREATE FUNCTION public.reader() RETURNS int LANGUAGE sql SECURITY DEFINER AS 'SELECT 1'",
-        )
-
-        val run = runAssertions()
-        assertEquals(null, run.failure, "inherited EXECUTE is the platform baseline here:\n${run.notices}")
-        assertTrue(run.notices.contains("SECURITY DEFINER functions"), run.notices)
-        assertTrue(run.notices.contains("public.reader"), run.notices)
     }
 }

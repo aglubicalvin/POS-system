@@ -11,9 +11,14 @@
 #   POS_STAGING_POOLER_HOST  pooler hostname from the shared staging contract
 #   POS_STAGING_DB_ROOT_CERT the staged root certificate (file path)
 #   POS_STAGING_DB_ROOT_CERT_SHA256  SHA-256 of that certificate's DER encoding
-#   PROBE_ADMIN_USER         e.g. postgres.<ref> (must match the reference)
+#   PROBE_ADMIN_USER         e.g. postgres.<ref> (must match the reference, case-sensitively)
 #   PROBE_ADMIN_PASS         admin password
 #   PROBE_PW                 password to set for pos_probe_readonly
+#   POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS  optional; ';'-separated exact
+#       identities (schema.function(argtypes)) of individually reviewed
+#       SECURITY DEFINER functions. Blank means nothing is reviewed, which makes
+#       the preflight refuse any executable SECURITY DEFINER function. There is
+#       no built-in allowlist and no platform exemption.
 #
 # TLS and pooler rules (enforced here and in the Java ProbeState path):
 #   - The pooler hostname is the SAME value the JDBC identity-probe path consumes;
@@ -27,6 +32,20 @@
 #     container path (/certs/ca.pem) backed by a read-only mount of a private temp
 #     copy, never from a host path, so the staged CA is the one libpq trusts. The
 #     copy is deleted before exit on success and failure and is never printed.
+#
+# EXECUTION ORDER (one psql --single-transaction, ON_ERROR_STOP=1):
+#   pos_probe_readonly_preflight.sql  refuses unreviewed SECURITY DEFINER functions
+#   pos_probe_readonly.sql            creates the role and its least privileges
+#   pos_probe_readonly_password.sql   \password, hashed client-side by psql
+#   pos_probe_readonly_assert.sql     post-creation assertions, including the gate
+# A refusal in any file aborts the transaction, so no role is left behind.
+#
+# EVIDENCE: the raw psql transcript is sensitive and is NOT teed to the workflow
+# log or uploaded. It is captured to a private temp file, reduced to the
+# allowlisted summary in server/tools/probe-role-evidence.ps1
+# (server/build/probe-readonly-evidence.txt), and the transcript is deleted on
+# success and failure. Unexpected transcript output is rejected, not forwarded.
+# The original psql exit status is preserved so a failed run cannot look green.
 
 param([switch]$Apply)
 
@@ -34,6 +53,9 @@ $ErrorActionPreference = 'Stop'
 $ServerDir = Split-Path -Parent $PSScriptRoot
 $Sql = Join-Path $PSScriptRoot 'pos_probe_readonly.sql'
 $Assert = Join-Path $PSScriptRoot 'pos_probe_readonly_assert.sql'
+$Preflight = Join-Path $PSScriptRoot 'pos_probe_readonly_preflight.sql'
+$EvidenceFile = Join-Path $ServerDir 'build/probe-readonly-evidence.txt'
+. (Join-Path $PSScriptRoot 'probe-role-evidence.ps1')
 
 # Fail closed: the staging project must be designated explicitly, and the three
 # shared-staging values must be present. Known non-staging projects are refused.
@@ -123,20 +145,35 @@ if ($actualSha256 -ne $RootCertSha256.Trim().Replace(':', '').ToLowerInvariant()
     throw 'BLOCKED: the SHA-256 of the staged root certificate does not match POS_STAGING_DB_ROOT_CERT_SHA256. The certificate may have been rotated, or this is not the approved staging target.'
 }
 
-if ($env:PROBE_ADMIN_USER -ne "postgres.$StagingRef") {
+# Case-sensitive: PowerShell's -ne is case-insensitive, so `POSTGRES.<ref>` or an
+# upper-case reference suffix would have been accepted here while ProbeState and
+# the SQL identity check compare exactly. -cne keeps every implementation on the
+# same exact-match semantics.
+if ($env:PROBE_ADMIN_USER -cne "postgres.$StagingRef") {
     throw 'BLOCKED: PROBE_ADMIN_USER does not belong to the designated staging project. Expected postgres.<POS_STAGING_PROJECT_REF>.'
 }
 if (-not $env:PROBE_ADMIN_PASS -or -not $env:PROBE_PW) {
     throw 'Refusing to run: PROBE_ADMIN_PASS and PROBE_PW must be set in the environment.'
 }
 
-$Log = Join-Path $ServerDir "build/probe-readonly-$(Get-Date -Format yyyyMMdd-HHmmss).log"
-New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
+# The reviewed SECURITY DEFINER allowlist. Absent, blank or whitespace-only means
+# nothing has been individually reviewed, which fails closed on the first
+# executable SECURITY DEFINER function. Quotes and line breaks are refused
+# because this value is passed as one psql variable, not SQL.
+$ReviewedSecurityDefiner = $env:POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS
+if ($null -eq $ReviewedSecurityDefiner) { $ReviewedSecurityDefiner = '' }
+if ($ReviewedSecurityDefiner -match '[\r\n\x00'']') {
+    throw 'Refusing to run: POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS must be a single line without quotes.'
+}
+if ($ReviewedSecurityDefiner.Length -gt 8192) {
+    throw 'Refusing to run: POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS is implausibly long.'
+}
+$ReviewedSecurityDefiner = $ReviewedSecurityDefiner.Trim()
 
 # The pooler hostname is the ONLY host ever printed. No cert contents, no secrets.
 Write-Host "Target pooler host: $Normalized  staging project: $StagingRef  database: postgres"
-Write-Host "Scripts: $Sql , $Assert"
-Write-Host "Log: $Log"
+Write-Host "Scripts: $Preflight , $Sql , $Assert"
+Write-Host "Sanitized evidence: $EvidenceFile"
 
 if (-not $Apply) {
     Write-Host 'DRY RUN. Re-run with -Apply to execute against the designated staging project.'
@@ -158,24 +195,36 @@ $ContainerCertDir = '/certs'
 $ContainerCert = "$ContainerCertDir/ca.pem"
 $LocalCert = Join-Path $CertDir 'ca.pem'
 New-Item -ItemType Directory -Path $CertDir | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $EvidenceFile) | Out-Null
+
+# The transcript never has a predictable name and never lives under the
+# repository, so no artifact path or later step can pick it up by accident.
+$RawLog = Join-Path ([System.IO.Path]::GetTempPath()) ('pos-probe-raw-' + [Guid]::NewGuid().ToString('N') + '.log')
 
 # Build the pooler connection string from the validated staging contract only.
 # No hardcoded host, no credentials, sslmode=verify-full, fixed container CA path.
 $uri = "host=$Normalized port=5432 dbname=postgres user=$($env:PROBE_ADMIN_USER) sslmode=verify-full sslrootcert=$ContainerCert"
 
+# -q -A -t: no command tags, no headers, no padding, so every line is a labelled
+# evidence line the sanitizer can accept or reject exactly. The preflight runs
+# first, in the same transaction, so a refusal aborts before CREATE ROLE.
 $dockerArgs = @(
     'run', '--rm', '-i',
     '-e', 'PGPASSWORD',
     '-v', "$PSScriptRoot`:/work:ro",
     '-v', "$($CertDir):$($ContainerCertDir):ro",
     'postgres:17',
-    'psql', $uri, '--single-transaction', '-v', 'ON_ERROR_STOP=1',
+    'psql', $uri, '--single-transaction', '-q', '-A', '-t', '-v', 'ON_ERROR_STOP=1',
+    '-v', "reviewed_security_definer=$ReviewedSecurityDefiner",
+    '-v', "admin_user=$($env:PROBE_ADMIN_USER)",
+    '-f', '/work/pos_probe_readonly_preflight.sql',
     '-f', '/work/pos_probe_readonly.sql',
     '-f', '/work/pos_probe_readonly_password.sql',
     '-f', '/work/pos_probe_readonly_assert.sql'
 )
 
 $env:PGPASSWORD = $env:PROBE_ADMIN_PASS
+$code = 1
 try {
     # Exactly the verified bytes, not a fresh read of the caller's path.
     [System.IO.File]::WriteAllBytes($LocalCert, $PemBytes)
@@ -188,15 +237,57 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'BLOCKED: could not set permissions on the staged certificate copy.' }
     }
 
-    # Windows PowerShell turns native stderr into errors. Keep it non-terminating
-    # and check the native exit code explicitly.
+    # Windows PowerShell turns native stderr into errors. Capture it without
+    # terminating, check the native exit code explicitly, and never write the
+    # transcript to the workflow log.
     $ErrorActionPreference = 'Continue'
-    @($env:PROBE_PW, $env:PROBE_PW) | & docker @dockerArgs 2>&1 | Tee-Object -FilePath $Log
+    & docker @dockerArgs 2>&1 |
+        ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message }
+            else { [string]$_ }
+        } |
+        Out-File -LiteralPath $RawLog -Encoding utf8
     $code = $LASTEXITCODE
 } finally {
     $ErrorActionPreference = 'Stop'
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $CertDir -Recurse -Force -ErrorAction SilentlyContinue
 }
-if ($code -ne 0) { throw "psql failed with exit code $code. See $Log" }
-Write-Host "Completed. Log: $Log"
+
+# Reduce the transcript, then delete it whether or not the reduction succeeded.
+$sanitizerFailure = $null
+$summary = $null
+try {
+    if (-not (Test-Path -LiteralPath $RawLog -PathType Leaf)) {
+        throw 'the psql transcript is missing, so this run cannot be evidenced.'
+    }
+    $summary = ConvertTo-ProbeRoleEvidence -Path $RawLog -ExitCode $code
+} catch {
+    $sanitizerFailure = $_
+} finally {
+    Remove-Item -LiteralPath $RawLog -Force -ErrorAction SilentlyContinue
+}
+
+if ($null -ne $sanitizerFailure) {
+    # A refused transcript still leaves a controlled record, never raw output.
+    Set-Content -LiteralPath $EvidenceFile -Encoding ASCII -Value @(
+        'evidence_schema=probe-role/v1'
+        'evidence_status=rejected'
+        "psql_exit=$code"
+    )
+    throw "BLOCKED: the psql transcript could not be reduced to allowlisted evidence, so the run is refused and nothing raw was written to the log or uploaded. $($sanitizerFailure.Exception.Message)"
+}
+
+Set-Content -LiteralPath $EvidenceFile -Encoding ASCII -Value $summary
+
+# Preserve psql's own status: a failed run must never look like a green one, and
+# sanitizing the output must not rewrite the code.
+if ($code -ne 0) {
+    Write-Host "::error::psql failed with exit code $code. Sanitized evidence: $EvidenceFile"
+    exit $code
+}
+if (-not ($summary -contains 'evidence_status=ok')) {
+    Write-Host "::error::the psql run did not produce a verified evidence summary. See $EvidenceFile"
+    exit 1
+}
+Write-Host "Completed. Sanitized evidence: $EvidenceFile"

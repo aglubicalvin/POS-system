@@ -1,6 +1,15 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -34,6 +43,80 @@ const STAGING_KEYS = [
 
 const STAGING_REF = 'stagingref0000000001';
 const POOLER_HOST = 'aws-0-eu-west-2.pooler.supabase.com';
+const EVIDENCE_FILE = resolve(repoRoot, 'server/build/probe-readonly-evidence.txt');
+const BUILD_DIR = resolve(repoRoot, 'server/build');
+
+/**
+ * The labelled lines `psql -q -A -t` prints for a clean, asserting run: the
+ * project-identity check, the privilege evidence, the two \password prompts and
+ * the notices. No headers, no table names, no function inventory.
+ */
+const CLEAN_TRANSCRIPT = `${[
+  'project_identity=confirmed',
+  'auth_schema_usage=false',
+  'public_schema_usage=true',
+  'auth_users_select=false',
+  'auth_identities_select=false',
+  'profiles_select=false',
+  'customers_select=false',
+  'sales_select=false',
+  'payments_select=false',
+  'migration_statements_select=false',
+  'public_create=false',
+  'elevated_attribute=false',
+  'can_login=true',
+  'membership_count=0',
+  'table_grant_count=0',
+  'NOTICE:  pos_probe_readonly preflight passed: 0 reviewed SECURITY DEFINER function(s) executable',
+  'Enter new password for user "pos_probe_readonly": ',
+  'Enter it again: ',
+  'NOTICE:  SECURITY DEFINER functions reviewed for pos_probe_readonly: 0',
+  'NOTICE:  pos_probe_readonly assertions passed',
+].join('\n')}\n`;
+
+/** Parse the sanitized evidence file into key/value pairs. */
+function readEvidence(): Record<string, string> {
+  const evidence: Record<string, string> = {};
+  for (const line of readFileSync(EVIDENCE_FILE, 'utf8').split(/\r?\n/)) {
+    const index = line.indexOf('=');
+    if (index > 0) evidence[line.slice(0, index)] = line.slice(index + 1);
+  }
+  return evidence;
+}
+
+/**
+ * Install a stub `docker` that records its argv, optionally prints a transcript,
+ * and exits with `exitCode`. No container, no database, no network.
+ */
+function installStubDocker(
+  dir: string,
+  argsFile: string,
+  transcriptFile?: string,
+  exitCode = 0,
+): string {
+  const bin = join(dir, 'bin');
+  mkdirSync(bin, { recursive: true });
+  if (process.platform === 'win32') {
+    writeFileSync(
+      join(bin, 'docker.cmd'),
+      `@echo off\r\necho %* > "${argsFile}"\r\n` +
+        (transcriptFile ? `type "${transcriptFile}"\r\n` : '') +
+        `exit /b ${exitCode}\r\n`,
+      'utf8',
+    );
+  } else {
+    const shim = join(bin, 'docker');
+    writeFileSync(
+      shim,
+      `#!/bin/sh\nprintf '%s\\n' "$*" > "${argsFile}"\n` +
+        (transcriptFile ? `cat "${transcriptFile}"\n` : '') +
+        `exit ${exitCode}\n`,
+      'utf8',
+    );
+    chmodSync(shim, 0o755);
+  }
+  return bin;
+}
 
 function findPowerShell(): string | null {
   const candidates = process.platform === 'win32' ? ['powershell', 'pwsh'] : ['pwsh', 'powershell'];
@@ -298,20 +381,11 @@ describe('probe-readonly.ps1 docker configuration', () => {
    * end to end without starting a container or opening a connection.
    */
   function installDockerShim(dir: string, argsFile: string): string {
-    const bin = join(dir, 'bin');
-    mkdirSync(bin, { recursive: true });
-    if (process.platform === 'win32') {
-      writeFileSync(
-        join(bin, 'docker.cmd'),
-        `@echo off\r\necho %* > "${argsFile}"\r\nexit /b 0\r\n`,
-        'utf8',
-      );
-    } else {
-      const shim = join(bin, 'docker');
-      writeFileSync(shim, `#!/bin/sh\nprintf '%s\\n' "$*" > "${argsFile}"\nexit 0\n`, 'utf8');
-      chmodSync(shim, 0o755);
-    }
-    return bin;
+    // A clean transcript: the sanitized-evidence contract requires the run to
+    // prove its assertions, not merely exit 0.
+    const transcript = join(dir, 'transcript.txt');
+    writeFileSync(transcript, CLEAN_TRANSCRIPT, 'utf8');
+    return installStubDocker(dir, argsFile, transcript, 0);
   }
 
   itPS('mounts the staged CA read-only at a fixed container path', () => {
@@ -382,5 +456,216 @@ describe('probe-readonly.ps1 docker configuration', () => {
     expect(result.status).toBe(0);
     expect(result.output).toContain('DRY RUN');
     expect(existsSync(argsFile), 'docker must not run without -Apply').toBe(false);
+  });
+});
+
+/**
+ * Finding 1 (independent review): the administrator identity must be compared
+ * exactly. PowerShell's `-ne` is case-insensitive, so `POSTGRES.<ref>` and an
+ * upper-case reference suffix were accepted here while ProbeState.java and the
+ * SQL identity check compare exactly. The check runs before any Docker or psql
+ * invocation, so a refused login cannot open a connection.
+ */
+describe('probe-readonly.ps1 administrator identity is exact', () => {
+  function envWith(user: string | null): Record<string, string> {
+    const dir = scratchDir('ps-identity-');
+    const cert = certificate(dir, 11);
+    const env: Record<string, string> = {
+      POS_STAGING_PROJECT_REF: STAGING_REF,
+      POS_STAGING_POOLER_HOST: POOLER_HOST,
+      POS_STAGING_DB_ROOT_CERT: cert.path,
+      POS_STAGING_DB_ROOT_CERT_SHA256: cert.fingerprint,
+      PROBE_ADMIN_PASS: 'admin-pass',
+      PROBE_PW: 'probe-pass',
+    };
+    if (user !== null) env.PROBE_ADMIN_USER = user;
+    return env;
+  }
+
+  itPS('accepts the exact postgres.<reference> login', () => {
+    const result = runScript(envWith(`postgres.${STAGING_REF}`));
+    expect(result.status, result.output).toBe(0);
+    expect(result.output).toContain('DRY RUN');
+  });
+
+  const rejected: Array<[string, string | null]> = [
+    ['an upper-case postgres prefix', `POSTGRES.${STAGING_REF}`],
+    ['an upper-case reference suffix', `postgres.${STAGING_REF.toUpperCase()}`],
+    ['a different project reference', 'postgres.otherref00000000000z'],
+    ['a login without a project reference', 'postgres'],
+    ['a missing login', null],
+  ];
+
+  for (const [name, user] of rejected) {
+    itPS(`refuses ${name}`, () => {
+      const result = runScript(envWith(user));
+      expect(result.status, result.output).not.toBe(0);
+      expect(result.output).toContain('does not belong to the designated staging project');
+      // Nothing is built, so no connection string can exist for a refused login.
+      expect(result.output).not.toContain('sslmode=');
+    });
+  }
+
+  itPS('refuses the login before any connection attempt', () => {
+    rmSync(EVIDENCE_FILE, { force: true });
+    const dir = scratchDir('ps-identity-noconnect-');
+    const cert = certificate(dir, 13);
+    const argsFile = join(dir, 'docker-args.txt');
+    const bin = installStubDocker(dir, argsFile);
+    const result = runScript(
+      {
+        ...envWith(`POSTGRES.${STAGING_REF}`),
+        POS_STAGING_DB_ROOT_CERT: cert.path,
+        POS_STAGING_DB_ROOT_CERT_SHA256: cert.fingerprint,
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
+      },
+      ['-Apply'],
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('does not belong to the designated staging project');
+    expect(existsSync(argsFile), 'docker must not run before the identity check').toBe(false);
+    expect(existsSync(EVIDENCE_FILE)).toBe(false);
+  });
+});
+
+/**
+ * Finding 3 (independent review): the role-creation path must not upload the
+ * raw psql transcript. The wrapper captures it privately, reduces it to
+ * allowlisted fields, deletes it on success and failure, and crashes the step
+ * when anything unexpected, secret or metadata-like appears.
+ */
+describe('probe-readonly.ps1 sanitized evidence', () => {
+  function runApply(
+    lines: string[],
+    exitCode: number,
+    extraEnv: Record<string, string> = {},
+  ) {
+    const dir = scratchDir('ps-evidence-');
+    const cert = certificate(dir, 17);
+    rmSync(EVIDENCE_FILE, { force: true });
+    const transcript = join(dir, 'transcript.txt');
+    writeFileSync(transcript, `${lines.join('\n')}\n`, 'utf8');
+    const argsFile = join(dir, 'docker-args.txt');
+    const bin = installStubDocker(dir, argsFile, transcript, exitCode);
+    const result = runScript(
+      {
+        POS_STAGING_PROJECT_REF: STAGING_REF,
+        POS_STAGING_POOLER_HOST: POOLER_HOST,
+        POS_STAGING_DB_ROOT_CERT: cert.path,
+        POS_STAGING_DB_ROOT_CERT_SHA256: cert.fingerprint,
+        PROBE_ADMIN_USER: `postgres.${STAGING_REF}`,
+        PROBE_ADMIN_PASS: 'admin-pass',
+        PROBE_PW: 'probe-pass',
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
+        ...extraEnv,
+      },
+      ['-Apply'],
+    );
+    return {
+      result,
+      argsFile,
+      evidence: existsSync(EVIDENCE_FILE) ? readEvidence() : null,
+    };
+  }
+
+  const cleanLines = CLEAN_TRANSCRIPT.trimEnd().split('\n');
+  const rawLogs = () =>
+    existsSync(BUILD_DIR)
+      ? readdirSync(BUILD_DIR).filter(
+          (name) => name.startsWith('probe-readonly-') && name.endsWith('.log'),
+        )
+      : [];
+
+  itPS('uploads only allowlisted fields and deletes the raw transcript', () => {
+    const { result, evidence } = runApply(cleanLines, 0);
+    expect(result.status, result.output).toBe(0);
+    expect(evidence).not.toBeNull();
+    expect(evidence!).toMatchObject({
+      evidence_schema: 'probe-role/v1',
+      psql_exit: '0',
+      project_identity: 'confirmed',
+      public_schema_usage: 'true',
+      elevated_attribute: 'false',
+      can_login: 'true',
+      membership_count: '0',
+      assertions_passed: 'true',
+      evidence_status: 'ok',
+    });
+    // No raw .log survives in the uploaded directory.
+    expect(rawLogs()).toEqual([]);
+    // The transcript is never echoed to the job log.
+    expect(result.output).not.toContain('public_schema_usage');
+    expect(result.output).not.toContain('NOTICE');
+  });
+
+  itPS('rejects unexpected transcript output instead of forwarding it', () => {
+    const { result, evidence } = runApply(
+      [...cleanLines, 'public | profiles | SELECT'],
+      0,
+    );
+    expect(result.status, result.output).not.toBe(0);
+    expect(evidence?.evidence_status).toBe('rejected');
+    expect(result.output).not.toContain('profiles');
+    expect(rawLogs()).toEqual([]);
+  });
+
+  itPS('never emits password-like or certificate material', () => {
+    const { result, evidence } = runApply(
+      ['project_identity=confirmed', 'password=sup3rs3cret', '-----BEGIN CERTIFICATE-----'],
+      0,
+    );
+    expect(result.status).not.toBe(0);
+    expect(evidence?.evidence_status).toBe('rejected');
+    expect(result.output).not.toContain('sup3rs3cret');
+    expect(result.output).not.toContain('BEGIN CERTIFICATE');
+  });
+
+  itPS('preserves a non-zero psql exit and still writes evidence', () => {
+    const { result, evidence } = runApply(
+      [
+        'psql: error: connection to server at "db.internal:5432" failed: password authentication failed for user "postgres"',
+      ],
+      3,
+    );
+    expect(result.status, result.output).toBe(3);
+    expect(evidence?.psql_exit).toBe('3');
+    expect(evidence?.evidence_status).toBe('incomplete');
+    expect(evidence?.assertions_passed).toBe('false');
+    expect(result.output).not.toContain('db.internal');
+    expect(result.output).not.toContain('password authentication failed');
+    expect(rawLogs()).toEqual([]);
+  });
+
+  itPS('fails a zero psql exit whose transcript never asserted', () => {
+    const withoutAssert = cleanLines.filter((line) => !line.includes('assertions passed'));
+    const { result, evidence } = runApply(withoutAssert, 0);
+    expect(result.status).toBe(1);
+    expect(evidence?.evidence_status).toBe('incomplete');
+    expect(result.output).toContain('::error::');
+  });
+
+  itPS('runs the preflight first and passes the reviewed allowlist', () => {
+    const { result, argsFile } = runApply(cleanLines, 0, {
+      POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS: 'public.reader(integer)',
+    });
+    expect(result.status, result.output).toBe(0);
+    const args = readFileSync(argsFile, 'utf8');
+    expect(args).toContain('-v reviewed_security_definer=public.reader(integer)');
+    const preflightIdx = args.indexOf('/work/pos_probe_readonly_preflight.sql');
+    const roleIdx = args.indexOf('/work/pos_probe_readonly.sql');
+    const assertIdx = args.indexOf('/work/pos_probe_readonly_assert.sql');
+    expect(preflightIdx).toBeGreaterThan(-1);
+    expect(preflightIdx).toBeLessThan(roleIdx);
+    expect(roleIdx).toBeLessThan(assertIdx);
+    expect(args).toContain('--single-transaction');
+    expect(args).toContain('ON_ERROR_STOP=1');
+  });
+
+  itPS('refuses an allowlist value that is not one plain line', () => {
+    const { result } = runApply(cleanLines, 0, {
+      POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS: "public.reader(); public.other('x')",
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS');
   });
 });
