@@ -53,6 +53,19 @@ interface ScriptRun {
   output: string;
 }
 
+/**
+ * PowerShell renders a thrown exception with ANSI colour and wraps long messages
+ * at the host's width, so the same refusal is one line locally and several on a
+ * CI runner. Strip the escapes and collapse whitespace before asserting, so the
+ * assertions describe the message rather than the host's formatting.
+ */
+function normaliseOutput(text: string): string {
+  return text
+    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** Run the script with an environment that contains no inherited staging config. */
 function runScript(env: Record<string, string>, args: string[] = []): ScriptRun {
   const base: Record<string, string> = {};
@@ -65,7 +78,10 @@ function runScript(env: Record<string, string>, args: string[] = []): ScriptRun 
     ['-NoProfile', '-NonInteractive', '-File', scriptPath, ...args],
     { env: { ...base, ...env }, encoding: 'utf8', timeout: 120_000 },
   );
-  return { status: result.status, output: `${result.stdout ?? ''}${result.stderr ?? ''}` };
+  return {
+    status: result.status,
+    output: normaliseOutput(`${result.stdout ?? ''}${result.stderr ?? ''}`),
+  };
 }
 
 /** A synthetic PEM certificate plus the SHA-256 of its DER encoding. */
