@@ -5,7 +5,12 @@
 do $$
 declare
   r record;
+  f record;
   bad text[] := '{}';
+  reviewed text[] := '{}';
+  entry text;
+  reviewed_count int := 0;
+  offenders text[] := '{}';
 begin
   select * into r from pg_roles where rolname = 'pos_probe_readonly';
   if not found then
@@ -50,17 +55,27 @@ begin
   ) then
     bad := array_append(bad, 'table-level ACL entry on public, auth or supabase_migrations');
   end if;
-  if has_schema_privilege('pos_probe_readonly', 'public', 'USAGE') then
-    bad := array_append(bad, 'USAGE on public schema');
+  -- Supabase grants USAGE on the public schema to PUBLIC, so the role inherits
+  -- it. That is the platform baseline, not a grant made by this role's SQL,
+  -- and it grants no access to any object by itself. Accepting it is not a
+  -- weakened assertion: what this SQL must not do is create a DIRECT grant
+  -- that would outlive a change to the baseline, or let the role create
+  -- anything in the schema.
+  if has_schema_privilege('pos_probe_readonly', 'public', 'CREATE') then
+    bad := array_append(bad, 'CREATE on public schema');
+  end if;
+  if exists (
+    select 1
+    from pg_namespace n, aclexplode(n.nspacl) a
+    where n.nspname = 'public' and a.grantee = r.oid
+  ) then
+    bad := array_append(bad, 'direct ACL entry for the role on public schema');
   end if;
   if has_schema_privilege('pos_probe_readonly', 'auth', 'USAGE') then
     bad := array_append(bad, 'USAGE on auth schema');
   end if;
   if not has_schema_privilege('pos_probe_readonly', 'supabase_migrations', 'USAGE') then
     bad := array_append(bad, 'USAGE on supabase_migrations schema missing');
-  end if;
-  if has_schema_privilege('pos_probe_readonly', 'public', 'CREATE') then
-    bad := array_append(bad, 'CREATE on public schema');
   end if;
   -- Check effective privileges, including grants to PUBLIC, on all non-system
   -- tables and views. Table-level SELECT is not allowed even on migrations.
@@ -88,6 +103,60 @@ begin
   ) then
     bad := array_append(bad, 'unexpected effective column privilege');
   end if;
+
+  -- Functions: PostgreSQL grants EXECUTE to PUBLIC on every new function, so
+  -- the role inherits EXECUTE on the platform's functions. Supabase cannot
+  -- revoke that without breaking the services that depend on it, so inherited
+  -- EXECUTE is accepted. A DIRECT grant to this role is not.
+  if exists (
+    select 1
+    from pg_proc p
+    cross join aclexplode(p.proacl) a
+    where a.grantee = r.oid and a.privilege_type = 'EXECUTE'
+  ) then
+    bad := array_append(bad, 'direct EXECUTE grant on a function');
+  end if;
+
+  -- SECURITY DEFINER review gate, post-creation. The preflight already refused
+  -- the run before the account existed; this repeats the comparison with the
+  -- role that actually exists, so PUBLIC-inherited EXECUTE and a direct grant
+  -- are both judged as effective privileges. Printing the function names was
+  -- never a control; this fails the assertions instead. The reviewed allowlist
+  -- is the same POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS value, passed as the
+  -- reviewed_security_definer psql variable.
+  foreach entry in array string_to_array(
+      coalesce(current_setting('pos.reviewed_security_definer', true), ''), ';')
+  loop
+    entry := btrim(entry);
+    if entry <> '' then
+      reviewed := array_append(reviewed, entry);
+    end if;
+  end loop;
+
+  for f in
+    select n.nspname || '.' || p.proname
+             || '(' || pg_get_function_identity_arguments(p.oid) || ')' as identity
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where p.prosecdef
+      and n.nspname <> 'information_schema' and n.nspname !~ '^pg_'
+      and has_function_privilege('pos_probe_readonly', p.oid, 'EXECUTE')
+    order by 1
+  loop
+    if f.identity = any(reviewed) then
+      reviewed_count := reviewed_count + 1;
+    else
+      offenders := array_append(offenders, f.identity);
+    end if;
+  end loop;
+
+  if coalesce(array_length(offenders, 1), 0) > 0 then
+    bad := array_append(bad,
+      'unreviewed SECURITY DEFINER function executable by pos_probe_readonly: '
+      || array_to_string(offenders[1:5], ', '));
+  end if;
+
+  raise notice 'SECURITY DEFINER functions reviewed for pos_probe_readonly: %', reviewed_count;
 
   if array_length(bad, 1) is not null then
     raise exception 'pos_probe_readonly assertions failed: %', array_to_string(bad, '; ');

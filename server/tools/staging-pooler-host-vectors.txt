@@ -1,0 +1,57 @@
+# Shared staging pooler-hostname vectors.
+#
+# Format: <accept|reject><TAB><value>
+# Blank value means "the variable is set to an empty string".
+#
+# Every runtime that validates POS_STAGING_POOLER_HOST reads THIS file in test:
+#   tests/staging-pooler-vectors.test.ts                  (TypeScript reference)
+#   server/src/test/kotlin/.../StagingPoolerHostVectorsTest.kt        (Kotlin)
+#   server/src/test/kotlin/.../ProbeStateHostValidationTest.kt        (real ProbeState binary)
+#   tests/staging-probe-script.test.ts                    (real probe-readonly.ps1)
+#
+# No value names a real project or host. All are synthetic.
+#
+# --- accepted: the one approved staging pooler shape -------------------------
+accept	aws-0-eu-west-2.pooler.supabase.com
+accept	aws-1-us-east-1.pooler.supabase.com
+accept	aws-123-ap-southeast-1.pooler.supabase.com
+# normalised before validation: casing and surrounding whitespace
+accept	AWS-0-EU-WEST-2.POOLER.SUPABASE.COM
+accept	  aws-0-eu-west-2.pooler.supabase.com  
+# --- rejected: missing value -----------------------------------------------
+reject	
+# --- rejected: numeric component out of range or empty ---------------------
+reject	aws-0000-eu-west-2.pooler.supabase.com
+reject	aws-9999-eu-west-2.pooler.supabase.com
+reject	aws--eu-west-2.pooler.supabase.com
+# --- rejected: malformed region labels -------------------------------------
+reject	aws-0-.pooler.supabase.com
+reject	aws-0-e.pooler.supabase.com
+reject	aws-0-1.pooler.supabase.com
+reject	aws-0-eu--west.pooler.supabase.com
+reject	aws-0-eu-west-.pooler.supabase.com
+reject	aws-0-eu_west-2.pooler.supabase.com
+reject	aws-0-eu west-2.pooler.supabase.com
+# --- rejected: attacker-controlled suffixes --------------------------------
+reject	aws-0-eu-west-2.pooler.supabase.com.attacker.example
+reject	aws-0-eu-west-2.pooler.supabase.com.
+reject	aws-0-eu-west-2.pooler.supabase.co
+reject	pooler.supabase.com
+reject	attacker.example/aws-0-eu-west-2.pooler.supabase.com
+# --- rejected: ports, paths, query strings, credentials, URIs --------------
+reject	aws-0-eu-west-2.pooler.supabase.com:5432
+reject	aws-0-eu-west-2.pooler.supabase.com/postgres
+reject	aws-0-eu-west-2.pooler.supabase.com?sslmode=require
+reject	jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres
+reject	postgres://aws-0-eu-west-2.pooler.supabase.com/postgres
+reject	postgres.abcdefghijklmnopqrst@aws-0-eu-west-2.pooler.supabase.com
+# --- rejected: IP literals and loopback names ------------------------------
+reject	127.0.0.1
+reject	127.0.0.1:5432
+reject	0.0.0.0
+reject	::1
+reject	localhost
+reject	127.db.attacker.example
+reject	127.attacker.example
+# --- rejected: a project reference is not a hostname ----------------------
+reject	stagingref0000000001

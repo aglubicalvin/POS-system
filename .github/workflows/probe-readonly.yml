@@ -33,10 +33,11 @@ jobs:
           if ($apply) { ./server/tools/probe-readonly.ps1 -Apply }
           else { ./server/tools/probe-readonly.ps1 }
 
-      - name: Upload log
+      - name: Upload sanitized evidence
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: probe-readonly-log
-          path: server/build/probe-readonly-*.log
+          # Only the allowlisted summary: the raw psql transcript never leaves the runner.
+          name: probe-readonly-evidence
+          path: server/build/probe-readonly-evidence.txt
           if-no-files-found: ignore

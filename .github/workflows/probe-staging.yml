@@ -8,11 +8,35 @@
 # supplies POS_STAGING_PROJECT_REF and the administrator username suffix matches
 # it exactly. The shared pooler hostname is not project identity.
 #
+# Both staging workflows consume the SAME connection contract, through the same
+# variables:
+#   POS_STAGING_PROJECT_REF          designated staging project reference
+#   POS_STAGING_POOLER_HOST          the only source of the pooler hostname
+#   POS_STAGING_DB_ROOT_CERT         path of the materialized CA on THIS runner
+#   POS_STAGING_DB_ROOT_CERT_SHA256  independently supplied DER SHA-256
+# The CA is materialized from POS_STAGING_DB_ROOT_CERT_B64 by
+# server/tools/materialize-staging-root-cert.sh, verified against the fingerprint,
+# and removed again by an `if: always()` step. Hosted runners are ephemeral, so a
+# certificate path stored in configuration can never be assumed to exist.
+#
+# Main-only, before credentials: the apply job carries
+# `if: github.ref == 'refs/heads/main'`, so a manual dispatch from any other
+# branch is skipped before the environment (and its secrets) is resolved.
+# This is the in-repository restriction. The environment's own protections
+# below are configured in GitHub and are NOT verified by this file or by any
+# test: the repository administrator must confirm them independently.
+#
 # Environment requirements (owner must configure in GitHub; see
 # artifacts/pos-free-tier-staging-transition/e-github-owner-checklist.md):
 #   - required reviewers, with "Prevent self-review" enabled
 #   - deployment branch policy: main only
 #   - staging-only credentials (never shared with development/production)
+#   - vars: POS_STAGING_PROJECT_REF, POS_STAGING_POOLER_HOST,
+#           POS_STAGING_DB_ROOT_CERT_B64, POS_STAGING_DB_ROOT_CERT_SHA256,
+#           PROBE_ADMIN_USER, POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS
+#           (';'-separated reviewed SECURITY DEFINER identities; empty = none
+#           reviewed, which fails closed)
+#   - secrets: PROBE_ADMIN_PASS, PROBE_PW
 name: probe-staging-role
 
 on:
@@ -28,6 +52,9 @@ permissions:
 
 jobs:
   apply:
+    # The staging operation runs only from main. Job-level, so a dispatch that
+    # selects another branch never reaches the environment or its credentials.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: pos-staging-admin
     steps:
@@ -35,11 +62,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Materialize staged root certificate
+        shell: bash
+        env:
+          POS_STAGING_DB_ROOT_CERT_B64: ${{ vars.POS_STAGING_DB_ROOT_CERT_B64 }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
+        run: bash server/tools/materialize-staging-root-cert.sh
+
       - name: Dry run or apply
         shell: pwsh
         env:
           POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
+          POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
           PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+          POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS: ${{ vars.POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS }}
           PROBE_ADMIN_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
           PROBE_PW: ${{ secrets.PROBE_PW }}
         run: |
@@ -47,10 +84,18 @@ jobs:
           if ($apply) { ./server/tools/probe-readonly.ps1 -Apply }
           else { ./server/tools/probe-readonly.ps1 }
 
-      - name: Upload log
+      - name: Upload sanitized evidence
         if: always()
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: probe-staging-log
-          path: server/build/probe-readonly-*.log
+          # Only the allowlisted summary: the raw psql transcript never leaves the runner.
+          name: probe-staging-evidence
+          path: server/build/probe-readonly-evidence.txt
           if-no-files-found: ignore
+
+      - name: Remove staged certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "${RUNNER_TEMP:-/tmp}/staging-root-ca.pem"

@@ -14,14 +14,29 @@
 #   probe-staging.yml          → can apply role/grant DDL with -Apply
 #   probe-staging-identity.yml → read-only verification only, no apply path
 #
+# Both staging workflows consume the SAME connection contract:
+#   POS_STAGING_PROJECT_REF, POS_STAGING_POOLER_HOST,
+#   POS_STAGING_DB_ROOT_CERT (path materialized on this runner) and
+#   POS_STAGING_DB_ROOT_CERT_SHA256.
+#
 # Environment requirements (owner-configured on pos-staging-admin):
 #   vars:
-#     POS_STAGING_PROJECT_REF  = <designated staging project reference>
-#     PROBE_ADMIN_USER         = postgres.<same reference>
+#     POS_STAGING_PROJECT_REF         = <designated staging project reference>
+#     POS_STAGING_POOLER_HOST         = the approved pooler hostname
+#     POS_STAGING_DB_ROOT_CERT_B64    = base64 of the staged CA (PEM)
+#     POS_STAGING_DB_ROOT_CERT_SHA256 = SHA-256 of that CA's DER encoding
+#     PROBE_ADMIN_USER                = postgres.<same reference>
 #   secrets (never logged, never artifacted):
 #     PROBE_ADMIN_PASS         = admin password for that role; the workflow maps it
 #                                into ProbeState as CHECK_PASS, so no separate
 #                                CHECK_PASS secret is required
+#
+# The CA is materialized by server/tools/materialize-staging-root-cert.sh into a
+# 0600 file under $RUNNER_TEMP, verified against the independent fingerprint, and
+# exposed to the Java probe only as a path. It is removed by an `if: always()`
+# step, so nothing survives the run. Hosted runners are ephemeral: a certificate
+# path stored in configuration can never be assumed to exist, and a missing value
+# fails the job before the probe starts rather than falling back to system trust.
 #
 # Evidence policy: the probe's full output is database inventory and is treated as
 # sensitive. It is written to a scratch file that is NEVER uploaded. Only the
@@ -30,6 +45,8 @@
 # The summary is derived from the probe's own output wherever it describes the
 # probe: `read_only_transaction` is copied from the probe's server-side
 # confirmation line and falls back to `not_confirmed` when that line is absent.
+# That summary is then read back: a zero probe exit with anything other than
+# `probe_completion=ok` fails the job, so invalid evidence can never be green.
 
 name: probe-staging-identity
 
@@ -41,6 +58,12 @@ permissions:
 
 jobs:
   verify-identity:
+    # Main-only, job-level: a manual dispatch that selects any other branch is
+    # skipped before the environment -- and its staging administrator secret --
+    # is resolved. This repository guard is separate from, and does not replace,
+    # the environment's own deployment branch policy and required reviewers:
+    # those live in GitHub and are NOT verified by this file or by any test.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: pos-staging-admin
     steps:
@@ -59,6 +82,15 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      # The runner is ephemeral, so the staged CA is written here, verified here
+      # and removed at the end of the job. Only the resulting path is exported.
+      - name: Materialize staged root certificate
+        shell: bash
+        env:
+          POS_STAGING_DB_ROOT_CERT_B64: ${{ vars.POS_STAGING_DB_ROOT_CERT_B64 }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
+        run: bash server/tools/materialize-staging-root-cert.sh
+
       - name: Validate staging target reference
         shell: bash
         env:
@@ -66,6 +98,12 @@ jobs:
           # The environment calls this PROBE_ADMIN_USER; the validator module reads
           # POS_STAGING_ADMIN_USER. Map it rather than renaming the stored variable.
           POS_STAGING_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+          # Shared staging connection contract, consumed by both ProbeState (JDBC)
+          # and probe-readonly.ps1 (PowerShell). Both paths validate these values
+          # against the same staging contract before any connection is made.
+          # POS_STAGING_DB_ROOT_CERT arrives from the materialization step above.
+          POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
         run: |
           set -euo pipefail
 
@@ -92,7 +130,10 @@ jobs:
       - name: Run read-only staging identity probe
         shell: bash
         env:
-          CHECK_URL: jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres
+          POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
+          POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
+          CHECK_URL: jdbc:postgresql://${{ vars.POS_STAGING_POOLER_HOST }}:5432/postgres
           CHECK_USER: ${{ vars.PROBE_ADMIN_USER }}
           CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
           PROBE_CONFIRM: "yes"
@@ -109,6 +150,16 @@ jobs:
           # own exit status.
           set -uo pipefail
 
+          # ProbeState reads CHECK_PASS from its own environment, so the value
+          # must be exported to the Gradle probe. This shell, the evidence helper
+          # and every readback command after it do not need it: snapshot it,
+          # remove it from the exported environment so no later child inherits
+          # the administrator password, and pass it only to the one command
+          # that requires it. `unset` removes the variable itself, not just this
+          # shell's view of it.
+          PROBE_PASS_VALUE="$CHECK_PASS"
+          unset CHECK_PASS
+
           cd server
 
           # ProbeState reads CHECK_URL / CHECK_USER / CHECK_PASS from the environment
@@ -116,91 +167,71 @@ jobs:
           # appears in a process listing.
           #
           # ProbeState is read-only: it refuses an unset CHECK_URL, refuses without
-          # PROBE_CONFIRM=yes, refuses hosts containing "prod", opens a read-only
-          # transaction, and only ever issues SELECTs against catalogs and views.
-          # It never invokes probe-readonly.ps1 and has no provisioning path.
-          if ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
+          # PROBE_CONFIRM=yes, refuses hosts containing "prod", refuses any target
+          # that is neither the configured pooler nor a loopback test database,
+          # verifies that POS_STAGING_PROJECT_REF matches CHECK_USER, opens a
+          # read-only transaction, and only ever issues SELECTs against catalogs
+          # and views. It never invokes probe-readonly.ps1 and has no provisioning
+          # path.
+          if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
             STATUS=0
           else
             STATUS=$?
           fi
 
-          if [ "$STATUS" -eq 0 ]; then
-            COMPLETION=ok
-          else
-            COMPLETION=failed
-          fi
+          # The credential is not needed by anything below this point.
+          unset PROBE_PASS_VALUE
 
-          # Preserve a safe Java probe category when one was emitted. If Gradle
-          # failed before ProbeState could classify the problem, classify only
-          # well-known toolchain/dependency failures from fixed patterns. Never
-          # copy Gradle's raw error text, paths, environment, or stack trace.
-          ERROR_CATEGORY="$(awk '
-            /^[[:space:]]+error_category=[a-z_]+$/ {
-              sub(/^[[:space:]]+error_category=/, "")
-              print
-              exit
-            }
-          ' probe-raw.txt)"
-
-          if [ "$STATUS" -ne 0 ] && [ -z "$ERROR_CATEGORY" ]; then
-            if grep -Eqi 'invalid source release: 21|invalid target release: 21|Could not target platform.*Java SE 21|No matching toolchains found.*21' probe-raw.txt; then
-              ERROR_CATEGORY=java_toolchain_mismatch
-            elif grep -Eqi 'Could not resolve|Could not GET|Could not HEAD|Could not download|Could not find .*artifact' probe-raw.txt; then
-              ERROR_CATEGORY=gradle_dependency_resolution
-            elif grep -Eqi "JAVA_HOME.*(not set|invalid)|java(:| ) (command )?not found" probe-raw.txt; then
-              ERROR_CATEGORY=java_runtime_unavailable
-            else
-              ERROR_CATEGORY=execution_failed_without_probe_category
-            fi
-          fi
-
-          # Read-only mode is a property of the probe SESSION, not of this
-          # workflow. ProbeState asks PostgreSQL itself
-          # (`SHOW transaction_read_only`) before any catalog query and prints
-          # `read_only_transaction=server_confirmed` only when the server says
-          # `on`, so the value is read back from the probe's own output: an
-          # exact match confirms the session, anything else (including a refused
-          # target, a failed connection, or a server that reported `off`) is
-          # recorded as not_confirmed. `enforced` is still accepted for the
-          # pre-server-check build, so a stale binary cannot silently downgrade
-          # a confirmed run. The value written to evidence is always
-          # `server_confirmed` (the tool's current vocabulary), regardless of
-          # which exact line was found. Asserting the field unconditionally
-          # would publish evidence that claims a protection never applied.
-          if grep -qxE '[[:space:]]*read_only_transaction=(server_confirmed|enforced)' probe-raw.txt; then
-            READ_ONLY=read_only_transaction=server_confirmed
-          else
-            READ_ONLY=read_only_transaction=not_confirmed
-          fi
-
-          # --- allowlisted evidence only -------------------------------------
-          # Written on BOTH outcomes: a failed probe must still leave sanitized
-          # evidence rather than a bare exit code. A strict field allowlist: no
-          # table lists, no policy names, no role names, no counts, no JDBC
-          # URLs, no stack traces.
-          {
-            echo "target_project_reference=${MATCHED_REF:-unset}"
-            echo "username_suffix_validation=PASS"
-            echo "${READ_ONLY}"
-            grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history|probe_status)=' probe-raw.txt \
-              | sed -E 's/^[[:space:]]+//' || true
-            if [ -n "$ERROR_CATEGORY" ]; then
-              echo "error_category=${ERROR_CATEGORY}"
-            fi
-            echo "probe_completion=${COMPLETION}"
-          } | tee probe-evidence.txt
+          # Every evidence rule lives in tools/probe-evidence.sh so it can be
+          # tested without GitHub. The script reads the raw output once and
+          # requires, independently: the probe's exit status is 0; EXACTLY ONE
+          # `read_only_transaction=server_confirmed` line and no other
+          # read_only_transaction line (enforced, on, off, missing, duplicates and
+          # unexpected values are all not_confirmed); and EXACTLY ONE
+          # `probe_status=ok` line. A previous version accepted `enforced` and
+          # rewrote it to `server_confirmed`, which published confirmation for a
+          # protection the binary never checked.
+          bash tools/probe-evidence.sh probe-raw.txt probe-evidence.txt "$STATUS" "${MATCHED_REF:-unset}"
 
           # The full probe output is inventory; it must never be published.
           # Deleted BEFORE this step can exit, on both the success and the
           # failure path below.
           rm -f probe-raw.txt
 
+          # Writing the evidence file is not the same as accepting it. The helper
+          # records `probe_completion=failed` for anything it cannot confirm but
+          # still exits 0, so a failed run keeps its sanitized summary. The step
+          # therefore reads the helper's result back out of the evidence file
+          # (never out of the probe's output, and without re-deriving it here)
+          # and requires exactly one accepted line of each kind.
+          readback() {
+            grep -cE "$1" probe-evidence.txt || true
+          }
+
+          completion_lines=$(readback '^probe_completion=')
+          completion_ok=$(readback '^probe_completion=ok$')
+          evidence_read_only_lines=$(readback '^read_only_transaction=')
+          evidence_read_only_confirmed=$(readback '^read_only_transaction=server_confirmed$')
+          evidence_probe_status_lines=$(readback '^probe_status=')
+          evidence_probe_status_ok=$(readback '^probe_status=ok$')
+
           # The step's exit status mirrors the probe's, so a failed connection
           # can never be reported as a green workflow.
           if [ "$STATUS" -ne 0 ]; then
             echo "::error::Read-only identity probe failed (exit ${STATUS}). Sanitized evidence: server/probe-evidence.txt"
             exit "$STATUS"
+          fi
+
+          # A successful probe process is not sufficient evidence. `enforced`,
+          # `on`, `off`, an unexpected value, a missing line and duplicates all
+          # produce probe_completion=failed, and a duplicate or contradictory
+          # line anywhere makes the evidence ambiguous. Every one of those is a
+          # failed review, so the step fails instead of publishing a green job.
+          if [ "$completion_lines" -ne 1 ] || [ "$completion_ok" -ne 1 ] ||
+             [ "$evidence_read_only_lines" -ne 1 ] || [ "$evidence_read_only_confirmed" -ne 1 ] ||
+             [ "$evidence_probe_status_lines" -ne 1 ] || [ "$evidence_probe_status_ok" -ne 1 ]; then
+            echo "::error::Read-only evidence rejected: the probe exited 0 but the sanitized evidence does not contain exactly one server-confirmed read-only transaction, one accepted probe_status=ok and one probe_completion=ok. Sanitized evidence: server/probe-evidence.txt"
+            exit 1
           fi
 
       - name: Publish sanitized evidence
@@ -213,3 +244,10 @@ jobs:
           path: server/probe-evidence.txt
           if-no-files-found: ignore
           retention-days: 5
+
+      - name: Remove staged certificate
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f -- "${RUNNER_TEMP:-/tmp}/staging-root-ca.pem"
