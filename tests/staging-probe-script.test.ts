@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
+import { normalisePowerShellOutput } from './helpers/ps-output.ts';
 
 /**
  * Behavioural tests for the PowerShell role-creation path.
@@ -56,15 +57,10 @@ interface ScriptRun {
 /**
  * PowerShell renders a thrown exception with ANSI colour and wraps long messages
  * at the host's width, so the same refusal is one line locally and several on a
- * CI runner. Strip the escapes and collapse whitespace before asserting, so the
- * assertions describe the message rather than the host's formatting.
+ * CI runner. See ./helpers/ps-output.ts for the normalisation and its regression
+ * test below.
  */
-function normaliseOutput(text: string): string {
-  return text
-    .replace(/\u001b\[[0-9;]*[A-Za-z]/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+const normaliseOutput = normalisePowerShellOutput;
 
 /** Run the script with an environment that contains no inherited staging config. */
 function runScript(env: Record<string, string>, args: string[] = []): ScriptRun {
@@ -125,6 +121,22 @@ afterAll(() => {
 });
 
 const itPS = powershell ? it : it.skip;
+
+describe('PowerShell output normalisation', () => {
+  it('rejoins a refusal wrapped by the pwsh host, so Linux and Windows agree', () => {
+    // Captured verbatim from a failing CI run: SGR sequences, pwsh's ` | `
+    // continuation marker, and a message split across two host lines.
+    const captured =
+      "\u001b[31;1mException: \u001b[0m/home/runner/work/POS-system/POS-system/server/tools/probe-readonly.ps1:104\n" +
+      "\u001b[36;1mLine |\u001b[0m\n" +
+      "\u001b[36;1m\u001b[36;1m 104 | \u001b[0m     \u001b[36;1mthrow 'BLOCKED: PROBE_ADMIN_USER does not belong to the designate\u001b[0m\n" +
+      "\u001b[36;1m     | \u001b[0m     \u001b[31;1mBLOCKED: PROBE_ADMIN_USER \u001b[27mdoes not belong to the designated staging\u001b[7m | \u001b[27m project. Expected postgres.<POS_STAGING_PROJECT_REF>.\u001b[0m";
+
+    const normalised = normalisePowerShellOutput(captured);
+    expect(normalised).toContain('does not belong to the designated staging project');
+    expect(normalised).not.toContain('\u001b');
+  });
+});
 
 describe('probe-readonly.ps1 hostname validation', () => {
   itPS('matches every shared hostname vector', () => {
