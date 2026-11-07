@@ -229,6 +229,31 @@ describe('identity probe exit-status and evidence handling', () => {
     expect(probeStep).not.toMatch(/\.\/gradlew[^\n]*\|\| true/);
   });
 
+  it('fails a zero probe exit when the sanitized evidence is not a confirmation', () => {
+    // The helper writes the evidence file and exits 0 even for invalid evidence,
+    // so a zero probe status alone must not be able to pass the job. The step
+    // reads `probe_completion` back and requires exactly one accepted line of
+    // every kind; a duplicate or contradictory line is rejected as ambiguous.
+    const evidenceIdx = probeStep.indexOf('bash tools/probe-evidence.sh');
+    const readbackIdx = probeStep.indexOf('evidence_read_only_confirmed=$(readback');
+    const rejectedIdx = probeStep.indexOf('::error::Read-only evidence rejected');
+    expect(evidenceIdx).toBeGreaterThan(-1);
+    expect(readbackIdx, 'the step must read the evidence back').toBeGreaterThan(evidenceIdx);
+    expect(rejectedIdx, 'the step must reject unconfirmed evidence').toBeGreaterThan(readbackIdx);
+    for (const rule of [
+      "completion_ok=$(readback '^probe_completion=ok$')",
+      "evidence_read_only_confirmed=$(readback '^read_only_transaction=server_confirmed$')",
+      "evidence_probe_status_ok=$(readback '^probe_status=ok$')",
+    ]) {
+      expect(probeStep).toContain(rule);
+    }
+    // The rejection happens after the raw inventory is deleted and after the
+    // probe's own non-zero status has been preserved.
+    expect(probeStep.indexOf('rm -f probe-raw.txt')).toBeLessThan(rejectedIdx);
+    expect(probeStep.indexOf('exit "$STATUS"')).toBeLessThan(rejectedIdx);
+    expect(probeStep).toMatch(/if \[ "\$completion_lines" -ne 1 \][\s\S]*?exit 1/);
+  });
+
   // ---- read-only evidence must be derived, never asserted -----------------
 
   it('never asserts read_only_transaction unconditionally', () => {
@@ -266,11 +291,15 @@ describe('identity probe exit-status and evidence handling', () => {
   it('keeps the sanitized evidence field allowlist', () => {
     // Only these probe fields may be copied into the evidence file.
     expect(EVIDENCE_SCRIPT).toMatch(
-      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\)='/,
+      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\)='/,
     );
     // The error category is selected separately from a fixed safe token and
     // emitted only after validation; it is not copied blindly by grep.
     expect(EVIDENCE_SCRIPT).toContain('echo "error_category=${error_category}"');
+    // probe_status is not copied from the raw output: it is emitted once from
+    // the validated counts, so a duplicate cannot make the evidence ambiguous.
+    expect(EVIDENCE_SCRIPT).toContain('echo "probe_status=${probe_status_value}"');
+    expect(EVIDENCE_SCRIPT).toContain('probe_status_value=error');
     // The raw file is never copied or dumped into the evidence.
     expect(EVIDENCE_SCRIPT).not.toMatch(/cat probe-raw\.txt/);
     expect(EVIDENCE_SCRIPT).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
@@ -452,9 +481,11 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       0,
     );
     try {
-      expect(result.status).toBe(0);
+      expect(result.status, result.stdout).toBe(1);
       expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
       expect(result.evidence?.probe_completion).toBe('failed');
+      expect(result.stdout).toContain('::error::Read-only evidence rejected');
+      expect(result.rawExists).toBe(false);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
@@ -474,8 +505,9 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       0,
     );
     try {
-      expect(result.status).toBe(0);
+      expect(result.status, result.stdout).toBe(1);
       expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.stdout).toContain('::error::Read-only evidence rejected');
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
@@ -555,6 +587,136 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       }
     }
   });
+
+  /**
+   * The strict-evidence integration contract.
+   *
+   * A probe process that exits 0 is not evidence: the helper records the
+   * failure in the summary and still exits 0 so the artifact survives. These
+   * cases run the REAL workflow step body under `bash -eo pipefail` against a
+   * stub probe and require the step itself to fail.
+   */
+  const exactConfirmation = '  read_only_transaction=server_confirmed';
+  const okStatus = '  probe_status=ok';
+  const probeHeader = ['== read-only state probe ==', '  target host: db.internal:5432/postgres'];
+  const probeInventory = ['  database=postgres', '  password=sup3rs3cret', '  table=public.profiles'];
+  const rawWith = (...lines: string[]) => [...probeHeader, ...lines, ...probeInventory].join('\n');
+
+  interface InvalidEvidenceCase {
+    name: string;
+    output: string;
+    probeStatus: number;
+    expectedExit: number;
+  }
+
+  const invalidEvidenceCases: InvalidEvidenceCase[] = [
+    {
+      name: 'legacy enforced value',
+      output: rawWith('  read_only_transaction=enforced', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'on value',
+      output: rawWith('  read_only_transaction=on', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'off value',
+      output: rawWith('  read_only_transaction=off', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'missing confirmation',
+      output: rawWith(okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'duplicate confirmation',
+      output: rawWith(exactConfirmation, exactConfirmation, okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'unexpected confirmation value',
+      output: rawWith('  read_only_transaction=server_confirmed_ish', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'duplicate probe_status=ok',
+      output: rawWith(exactConfirmation, okStatus, okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'probe_status=error',
+      output: rawWith(exactConfirmation, '  probe_status=error'),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'exact confirmation with a non-zero probe exit',
+      output: rawWith(exactConfirmation, okStatus),
+      probeStatus: 6,
+      expectedExit: 6,
+    },
+  ];
+
+  const allowlistedKeys = [
+    'database',
+    'error_category',
+    'migration_history',
+    'probe_completion',
+    'probe_status',
+    'read_only_transaction',
+    'supabase_migrations_exists',
+    'target_project_reference',
+    'username_suffix_validation',
+  ];
+
+  for (const testCase of invalidEvidenceCases) {
+    run(`fails the workflow step on invalid evidence: ${testCase.name}`, () => {
+      const result = runStep(testCase.output, testCase.probeStatus);
+      try {
+        // Zero probe exit is not enough; the step's own status must fail, and
+        // the probe's status must be preserved when it was already non-zero.
+        expect(result.status, result.stdout).toBe(testCase.expectedExit);
+        expect(result.status).not.toBe(0);
+        // Sanitized evidence is still generated and never claims success.
+        expect(result.evidence, 'sanitized evidence must still be generated').not.toBeNull();
+        expect(result.evidence!.probe_completion).toBe('failed');
+        // probe_status is accepted only when exactly one ok line and exit 0;
+        // the confirmation failures leave it `ok` and are caught by the
+        // completion/confirmation gate instead.
+        const statusWasAccepted =
+          testCase.probeStatus === 0 &&
+          !['duplicate probe_status=ok', 'probe_status=error'].includes(testCase.name);
+        expect(result.evidence!.probe_status).toBe(statusWasAccepted ? 'ok' : 'error');
+        // Only allowlisted fields are present.
+        expect(Object.keys(result.evidence!).every((key) => allowlistedKeys.includes(key))).toBe(true);
+        // Raw inventory is deleted before the step exits.
+        expect(result.rawExists, 'probe-raw.txt must be deleted before the step exits').toBe(false);
+        // The failure is reported as an Actions error, never as success.
+        if (testCase.probeStatus === 0) {
+          expect(result.stdout).toContain('::error::Read-only evidence rejected');
+        } else {
+          expect(result.stdout).toContain(
+            `::error::Read-only identity probe failed (exit ${testCase.probeStatus})`,
+          );
+        }
+        // Raw inventory, host and secrets are never printed.
+        expect(result.stdout).not.toContain('sup3rs3cret');
+        expect(result.stdout).not.toContain('public.profiles');
+        expect(result.stdout).not.toContain('db.internal');
+      } finally {
+        rmSync(result.dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   run('keeps errexit enabled and runs the probe before deleting anything', () => {
     expect(harness.script).not.toMatch(/^\s*set \+e\b/m);

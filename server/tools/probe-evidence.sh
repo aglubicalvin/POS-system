@@ -14,7 +14,8 @@
 #   * only allowlisted fields are copied; the raw inventory is never published.
 #
 # Exit status: 0 when the evidence file was written (whatever the probe did),
-# 2 on usage or input errors.
+# 2 on usage or input errors. A 0 here does NOT mean the evidence is valid: the
+# caller must read `probe_completion=ok` back and fail otherwise.
 set -uo pipefail
 
 if [ "$#" -ne 4 ]; then
@@ -48,11 +49,17 @@ fi
 probe_status_lines=$(grep -cE '^[[:space:]]*probe_status=' "$raw" || true)
 probe_status_ok=$(grep -cE '^[[:space:]]*probe_status=ok[[:space:]]*$' "$raw" || true)
 
+# Emitted from the validated counts rather than copied, so a duplicated or
+# contradictory status can never leak an `ok` into the evidence file. Anything
+# other than exactly one accepted `ok` with a zero exit is reported as `error`.
+probe_status_value=error
+if [ "$status" -eq 0 ] && [ "$probe_status_lines" -eq 1 ] && [ "$probe_status_ok" -eq 1 ]; then
+  probe_status_value=ok
+fi
+
 completion=failed
-if [ "$status" -eq 0 ] &&
-   [ "$read_only" = "read_only_transaction=server_confirmed" ] &&
-   [ "$probe_status_lines" -eq 1 ] &&
-   [ "$probe_status_ok" -eq 1 ]; then
+if [ "$probe_status_value" = "ok" ] &&
+   [ "$read_only" = "read_only_transaction=server_confirmed" ]; then
   completion=ok
 fi
 
@@ -89,7 +96,8 @@ fi
   echo "target_project_reference=${ref:-unset}"
   echo "username_suffix_validation=PASS"
   echo "$read_only"
-  grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history|probe_status)=' "$raw" \
+  echo "probe_status=${probe_status_value}"
+  grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history)=' "$raw" \
     | sed -E 's/^[[:space:]]+//' || true
   if [ -n "$error_category" ]; then
     echo "error_category=${error_category}"

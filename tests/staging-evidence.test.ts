@@ -135,6 +135,34 @@ describe('probe evidence requires an exact server confirmation', () => {
     expect(field(result.evidence, 'probe_completion')).toBe('failed');
   });
 
+  itBash('exits 0 after writing failed evidence, so the caller must enforce it', () => {
+    // The helper's contract is to summarize, not to decide the job: it always
+    // exits 0 after writing the file so the artifact survives a failed probe.
+    // The workflow step is what refuses probe_completion=failed.
+    const result = run(
+      confirmedRaw().replace(
+        'read_only_transaction=server_confirmed',
+        'read_only_transaction=enforced',
+      ),
+    );
+    expect(result.status).toBe(0);
+    expect(field(result.evidence, 'probe_completion')).toBe('failed');
+  });
+
+  itBash('emits exactly one probe_status line, derived from the accepted counts', () => {
+    // A duplicated or contradictory probe_status must not be copied through:
+    // the evidence file holds one status line, and it is `ok` only when the
+    // probe exited 0 and reported exactly one accepted ok line.
+    const duplicated = run(`${confirmedRaw()}\n  probe_status=ok`);
+    expect(duplicated.evidence.match(/^probe_status=/gm)).toHaveLength(1);
+    expect(field(duplicated.evidence, 'probe_status')).toBe('error');
+    expect(field(duplicated.evidence, 'probe_completion')).toBe('failed');
+
+    const contradictory = run(confirmedRaw(), 6);
+    expect(field(contradictory.evidence, 'probe_status')).toBe('error');
+    expect(field(contradictory.evidence, 'probe_completion')).toBe('failed');
+  });
+
   itBash('records the sanitized category of an unconfirmed read-only session', () => {
     const raw = [
       'read-only state probe',

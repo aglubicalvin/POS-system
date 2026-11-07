@@ -45,6 +45,8 @@
 # The summary is derived from the probe's own output wherever it describes the
 # probe: `read_only_transaction` is copied from the probe's server-side
 # confirmation line and falls back to `not_confirmed` when that line is absent.
+# That summary is then read back: a zero probe exit with anything other than
+# `probe_completion=ok` fails the job, so invalid evidence can never be green.
 
 name: probe-staging-identity
 
@@ -177,11 +179,40 @@ jobs:
           # failure path below.
           rm -f probe-raw.txt
 
+          # Writing the evidence file is not the same as accepting it. The helper
+          # records `probe_completion=failed` for anything it cannot confirm but
+          # still exits 0, so a failed run keeps its sanitized summary. The step
+          # therefore reads the helper's result back out of the evidence file
+          # (never out of the probe's output, and without re-deriving it here)
+          # and requires exactly one accepted line of each kind.
+          readback() {
+            grep -cE "$1" probe-evidence.txt || true
+          }
+
+          completion_lines=$(readback '^probe_completion=')
+          completion_ok=$(readback '^probe_completion=ok$')
+          evidence_read_only_lines=$(readback '^read_only_transaction=')
+          evidence_read_only_confirmed=$(readback '^read_only_transaction=server_confirmed$')
+          evidence_probe_status_lines=$(readback '^probe_status=')
+          evidence_probe_status_ok=$(readback '^probe_status=ok$')
+
           # The step's exit status mirrors the probe's, so a failed connection
           # can never be reported as a green workflow.
           if [ "$STATUS" -ne 0 ]; then
             echo "::error::Read-only identity probe failed (exit ${STATUS}). Sanitized evidence: server/probe-evidence.txt"
             exit "$STATUS"
+          fi
+
+          # A successful probe process is not sufficient evidence. `enforced`,
+          # `on`, `off`, an unexpected value, a missing line and duplicates all
+          # produce probe_completion=failed, and a duplicate or contradictory
+          # line anywhere makes the evidence ambiguous. Every one of those is a
+          # failed review, so the step fails instead of publishing a green job.
+          if [ "$completion_lines" -ne 1 ] || [ "$completion_ok" -ne 1 ] ||
+             [ "$evidence_read_only_lines" -ne 1 ] || [ "$evidence_read_only_confirmed" -ne 1 ] ||
+             [ "$evidence_probe_status_lines" -ne 1 ] || [ "$evidence_probe_status_ok" -ne 1 ]; then
+            echo "::error::Read-only evidence rejected: the probe exited 0 but the sanitized evidence does not contain exactly one server-confirmed read-only transaction, one accepted probe_status=ok and one probe_completion=ok. Sanitized evidence: server/probe-evidence.txt"
+            exit 1
           fi
 
       - name: Publish sanitized evidence
