@@ -340,10 +340,30 @@ describe('staging identity administrator credential is scoped to the probe', () 
 
   it('binds the credential to the probe command only, never to argv', () => {
     expect(step).toContain(
-      'if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew -q execProbeState > probe-raw.txt 2>&1; then',
+      'if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew --no-daemon -q execProbeState > probe-raw.txt 2>&1; then',
     );
     expect(step).not.toMatch(/--(pass|password)[= ]/i);
     expect(step).not.toContain('admin-pass');
+  });
+
+  it('runs the credential-bearing probe without a reusable Gradle daemon', () => {
+    // A reusable daemon outlives the build and would keep the credential-bearing
+    // environment alive after the step. The flag must be on the probe invocation
+    // itself, not on some other gradlew call.
+    const probeLine = step
+      .split('\n')
+      .find((line) => line.includes('execProbeState') && line.includes('./gradlew'));
+    expect(probeLine, 'the probe invocation is missing').toBeDefined();
+    expect(probeLine).toContain('--no-daemon');
+    // The credential must still reach the probe: the flag must not displace it.
+    expect(probeLine).toContain('CHECK_PASS="$PROBE_PASS_VALUE"');
+  });
+
+  it('does not disable the daemon for unrelated Gradle invocations', () => {
+    // Only the sensitive probe opts out; other gradlew calls keep the daemon.
+    const gradlewLines = step.split('\n').filter((line) => line.includes('./gradlew'));
+    const withNoDaemon = gradlewLines.filter((line) => line.includes('--no-daemon'));
+    expect(withNoDaemon).toHaveLength(1);
   });
 
   it('keeps the secret reference on this step alone', () => {

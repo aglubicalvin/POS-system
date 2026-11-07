@@ -173,7 +173,13 @@ jobs:
           # read-only transaction, and only ever issues SELECTs against catalogs
           # and views. It never invokes probe-readonly.ps1 and has no provisioning
           # path.
-          if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew -q execProbeState > probe-raw.txt 2>&1; then
+          # --no-daemon: a reusable Gradle daemon outlives the build and would
+          # keep the credential-bearing environment alive after this step. With
+          # --no-daemon Gradle either runs the build in the client JVM or starts a
+          # single-use daemon that it stops when the build ends, so the process
+          # holding CHECK_PASS terminates with this command. (This does not mean
+          # "no daemon process is ever created" -- see the process-lifetime test.)
+          if CHECK_PASS="$PROBE_PASS_VALUE" ./gradlew --no-daemon -q execProbeState > probe-raw.txt 2>&1; then
             STATUS=0
           else
             STATUS=$?

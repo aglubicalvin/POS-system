@@ -58,6 +58,37 @@ $Assert = Join-Path $PSScriptRoot 'pos_probe_readonly_assert.sql'
 $Preflight = Join-Path $PSScriptRoot 'pos_probe_readonly_preflight.sql'
 $EvidenceFile = Join-Path $ServerDir 'build/probe-readonly-evidence.txt'
 . (Join-Path $PSScriptRoot 'probe-role-evidence.ps1')
+<#
+.SYNOPSIS
+Delete a temporary sensitive path, recording failure instead of hiding it.
+
+.DESCRIPTION
+Cleanup used to run with -ErrorAction SilentlyContinue, so a failed deletion of
+the raw transcript or the temporary certificate copy was invisible: the run
+reported success while sensitive material remained on disk.
+
+Returns $null on success, or a short message on failure. It never throws, so it
+cannot replace the primary error, and the message never includes file contents
+or credential values.
+#>
+function Remove-SensitivePath {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Label,
+        [switch] $Recurse
+    )
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Force -Recurse:$Recurse -ErrorAction Stop
+        }
+        if (Test-Path -LiteralPath $Path) {
+            return "$Label still exists after deletion"
+        }
+        return $null
+    } catch {
+        return "$Label could not be deleted"
+    }
+}
 
 # Fail closed: the staging project must be designated explicitly, and the three
 # shared-staging values must be present. Known non-staging projects are refused.
@@ -307,15 +338,22 @@ try {
     $code = $LASTEXITCODE
 } catch {
     # A failure before the reduction reached its own cleanup must not leave even
-    # a partial transcript behind.
-    Remove-Item -LiteralPath $RawLog -Force -ErrorAction SilentlyContinue
+    # a partial transcript behind. The original error stays primary; a cleanup
+    # failure is reported as a warning rather than replacing it.
+    $cleanupFailure = Remove-SensitivePath -Path $RawLog -Label 'raw transcript'
+    if ($null -ne $cleanupFailure) {
+        Write-Warning "cleanup: $cleanupFailure"
+    }
     throw
 } finally {
     $ErrorActionPreference = 'Stop'
     $ProbePw = $null
     $AdminPass = $null
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $CertDir -Recurse -Force -ErrorAction SilentlyContinue
+    $certCleanupFailure = Remove-SensitivePath -Path $CertDir -Label 'temporary certificate directory' -Recurse
+    if ($null -ne $certCleanupFailure) {
+        Write-Warning "cleanup: $certCleanupFailure"
+    }
 }
 
 # Reduce the transcript, then delete it whether or not the reduction succeeded.
@@ -329,7 +367,7 @@ try {
 } catch {
     $sanitizerFailure = $_
 } finally {
-    Remove-Item -LiteralPath $RawLog -Force -ErrorAction SilentlyContinue
+    $transcriptCleanupFailure = Remove-SensitivePath -Path $RawLog -Label 'raw transcript'
 }
 
 if ($null -ne $sanitizerFailure) {
