@@ -138,6 +138,20 @@ body runs. Only `::1` counts as loopback: an IPv4-mapped literal such as
 `[::ffff:127.0.0.1]` is syntactically valid but is not accepted as a local
 target.
 
+The authority is also found before anything else is read: it runs from after the
+literal `jdbc:postgresql://` prefix to the first `/`, `?` or `#`, and no
+character past that boundary is ever inspected for a host. A `@` later in the
+database name or the query can therefore never become the classified host — the
+case `jdbc:postgresql://attacker.example:5432/business@127.0.0.1` is refused
+(exit 8) instead of being read as loopback while the driver is handed the remote
+authority. Two further consequences of the same rule: user-info in the authority
+(`user:password@host`) is refused rather than stripped, because credentials come
+from `CHECK_USER` and `CHECK_PASS`, and a comma is refused because pgJDBC reads
+it as a failover host list. Because the driver also honours connection properties
+in the query string, `host`, `hostaddr`, `port`, `socketFactory` and
+`socketFactoryArg` are refused there as well. The loopback URL passed to the
+driver is rebuilt from the validated parts, not forwarded as received.
+
 **ProbeState exit codes:** 2 missing `CHECK_URL` or credentials, 3 missing
 `PROBE_CONFIRM=yes`, 4 production-looking host, 5 connection failed, 6 read-only
 not confirmed, 7 probe failed, 8 unrecognised or mismatched target, 9 missing or
@@ -279,11 +293,15 @@ What follows from that split:
 2. The identity workflow authenticates as the administrator, so a green identity
    run says nothing about `pos_probe_readonly`. No workflow currently logs in as
    that role, and the probe has not been exercised under it.
-3. A **dedicated least-privilege connection test is still future work**: a probe
-   run with `CHECK_USER` set to `pos_probe_readonly` (or the equivalent pooler
-   login) and that account's own password. Until that test exists and passes, do
-   not claim the probe operates under the restricted account — the role is created
-   but unproven.
+3. A **dedicated least-privilege connection test is still future work**, and it
+   cannot be produced by changing one variable. The staging identity gate accepts
+   the administrator login only: `CHECK_USER` must be exactly
+   `postgres.<POS_STAGING_PROJECT_REF>`, so pointing it at `pos_probe_readonly` is
+   refused with exit 11 before any connection is attempted. That check is
+   deliberately not relaxed. Exercising the restricted account needs a separate
+   test path or an explicitly designed role-aware identity mode; neither exists
+   yet. Until such a test exists and passes, do not claim the probe operates under
+   the restricted account — the role is created but unproven.
 4. The role-creation step never becomes part of the identity workflow: identity
    verification must stay read-only and free of DDL.
 

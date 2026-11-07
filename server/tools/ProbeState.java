@@ -104,6 +104,30 @@ public class ProbeState {
     private static final Pattern PROJECT_REF_PATTERN = Pattern.compile("^[a-z0-9]{20}$");
 
     /**
+     * The only URL form this probe accepts or forwards. Written literally because
+     * pgJDBC requires it literally: a looser match here would validate a string
+     * the driver reads differently.
+     */
+    private static final String JDBC_URL_PREFIX = "jdbc:postgresql://";
+
+    /**
+     * Everything a host authority may contain. '@' (user-info), ',' (pgJDBC host
+     * list), '%' (percent-encoding), whitespace and control characters are all
+     * absent: each is a way for a parser and the driver to disagree about which
+     * characters form the host.
+     */
+    private static final Pattern AUTHORITY_CHARS = Pattern.compile("^[0-9A-Za-z.:_\\[\\]-]+$");
+
+    /**
+     * Query parameter names that can move the socket away from the authority the
+     * guard classified. pgJDBC turns query parameters into connection properties,
+     * so a URL whose authority says loopback could still name another destination
+     * here. No supported target needs these.
+     */
+    private static final java.util.Set<String> REDIRECTING_QUERY_PARAMS =
+        java.util.Set.of("host", "hostaddr", "port", "socketfactory", "socketfactoryarg");
+
+    /**
      * References that are known NOT to be staging: the documented development
      * project and the former verification project. Mirrors
      * KNOWN_NON_STAGING_REFS in src/config/staging-target.ts and the
@@ -130,14 +154,25 @@ public class ProbeState {
             System.err.println("  target host: " + hostOf(url));
             System.exit(3);
         }
-        String nominatedHost = hostOf(url);
+        // Locate and validate the URL authority exactly once, before anything is
+        // read out of the URL. Nothing downstream re-derives a host from the raw
+        // string, so the host classified here is the host the driver is handed.
+        ParsedUrl target = parseUrl(url);
+        if (!target.accepted()) {
+            System.err.println("REFUSED: " + target.reason);
+            System.err.println(
+                "  CHECK_URL is never handed to a driver unless its host authority is understood.");
+            System.exit(8);
+        }
+
+        String nominatedHost = target.authority;
         if (nominatedHost.toLowerCase(Locale.ROOT).contains("prod")) {
             System.err.println("REFUSED: " + nominatedHost + " looks like a production host.");
             System.err.println("  This probe must never run against production.");
             System.exit(4);
         }
 
-        String bareHost = hostName(url).toLowerCase(Locale.ROOT);
+        String bareHost = target.host.toLowerCase(Locale.ROOT);
         boolean stagingTarget = bareHost.endsWith(".pooler.supabase.com");
 
         // A pooler administrator login names a project. If that project is known
@@ -267,8 +302,11 @@ public class ProbeState {
                         + "loopback test database. The probe refuses any other target.");
                 System.exit(8);
             }
-            // Disposable local test database: no TLS material is involved.
-            connectUrl = url;
+            // Disposable local test database: no TLS material is involved. The
+            // string forwarded to the driver is rebuilt from the parts validated
+            // above, so the authority the guard classified is the authority the
+            // driver reads.
+            connectUrl = target.connectUrl();
         }
 
         System.out.println("== read-only state probe ==");
@@ -466,63 +504,198 @@ public class ProbeState {
         return "sqlstate=" + state + " message=" + msg;
     }
 
-    /** Host[:port]/database of a libpq URL, with userinfo stripped. */
+    /** Authority of a URL this probe understands, for messages; empty when refused. */
     static String hostOf(String url) {
-        String s = url.replaceFirst("^jdbc:", "");
-        s = s.replaceFirst("^postgresql://", "").replaceFirst("^postgres://", "");
-        int at = s.lastIndexOf('@');
-        if (at >= 0) s = s.substring(at + 1);
-        return s;
+        ParsedUrl parsed = parseUrl(url);
+        return parsed.accepted() ? parsed.authority : "";
     }
 
     /**
-     * Bare hostname of a JDBC/libpq URL: no userinfo, port, path or query.
+     * The only CHECK_URL form this probe forwards, split at its authority
+     * boundary.
      *
-     * The authority is validated as a WHOLE rather than searched for a plausible
-     * host substring. Extracting the text inside the first pair of brackets would
-     * accept `[::1]attacker.example:5432` as the loopback host `::1` and hand the
-     * raw URL to the driver, which resolves it as the attacker's name; here any
-     * character after the closing bracket other than an optional valid port makes
-     * the whole authority unparseable.
+     * The authority is located BEFORE user-info, host, port, database or query
+     * are examined: it runs from after `jdbc:postgresql://` to the first '/', '?'
+     * or '#', and no character past that boundary is ever inspected for a host.
+     * The previous version cut the whole URL at its LAST '@', so
      *
-     * IPv6 literals are accepted only in bracket notation. An unbracketed
-     * authority with more than one colon is ambiguous and is reported as
-     * unparseable (empty), which every caller refuses rather than guesses.
+     *     jdbc:postgresql://attacker.example:5432/business@127.0.0.1
+     *
+     * was classified from the database name as the loopback host 127.0.0.1 and
+     * the untouched string was then given to DriverManager, which resolved
+     * attacker.example: the guard judged one host while the driver used another.
+     * Anchoring on the authority makes that whole class of URL unrepresentable
+     * instead of denylisting one example string.
+     *
+     * The supported form is required, not guessed at. `jdbc:postgresql://` must
+     * appear literally; user-info is refused instead of stripped, because the
+     * probe authenticates with CHECK_USER and CHECK_PASS and has no use for a URL
+     * that carries its own credentials; and a comma is refused because pgJDBC
+     * reads it as a failover host list, which would offer CHECK_PASS to an
+     * endpoint this method never classified.
+     *
+     * Accepted: host, host:port, [ipv6] and [ipv6]:port, each optionally followed
+     * by /database, ?query and #fragment. A port, when present, is a decimal
+     * 1-65535 with no leading zero.
      */
-    static String hostName(String url) {
-        String s = hostOf(url);
-        int slash = s.indexOf('/');
-        if (slash >= 0) s = s.substring(0, slash);
-        int query = s.indexOf('?');
-        if (query >= 0) s = s.substring(0, query);
-        if (s.isEmpty()) return "";
+    static ParsedUrl parseUrl(String url) {
+        if (url == null) return ParsedUrl.refused("CHECK_URL is not set.");
+        if (!url.startsWith(JDBC_URL_PREFIX)) {
+            return ParsedUrl.refused(
+                "CHECK_URL must be exactly jdbc:postgresql://<host>[:port][/<database>]. Any other "
+                    + "scheme, prefix or bare libpq form would be read by the driver differently "
+                    + "from the way it is validated here.");
+        }
+        String rest = url.substring(JDBC_URL_PREFIX.length());
 
-        if (s.charAt(0) == '[') {
-            int close = s.indexOf(']');
-            if (close < 0) return "";
-            String literal = s.substring(1, close);
-            if (!isIpv6Literal(literal)) return "";
-            String rest = s.substring(close + 1);
-            if (rest.isEmpty()) return literal;
-            return validPortSuffix(rest) ? literal : "";
+        // The authority boundary. Path, query and fragment start at the first of
+        // these characters; none of them may contribute a host.
+        int boundary = rest.length();
+        for (int i = 0; i < rest.length(); i++) {
+            char ch = rest.charAt(i);
+            if (ch == '/' || ch == '?' || ch == '#') {
+                boundary = i;
+                break;
+            }
+        }
+        String authority = rest.substring(0, boundary);
+        String pathAndQuery = rest.substring(boundary);
+
+        if (authority.isEmpty()) {
+            return ParsedUrl.refused(
+                "CHECK_URL names no host: there is nothing between '//' and the path, so the "
+                    + "destination cannot be classified.");
+        }
+        // Credentials already arrive as CHECK_USER and CHECK_PASS. Refusing
+        // user-info keeps the authority unambiguous: with an '@' present, the text
+        // a validator strips and the text a driver parses can name different hosts.
+        if (authority.indexOf('@') >= 0) {
+            return ParsedUrl.refused(
+                "CHECK_URL must not embed user-info (user:password@host). Credentials come from "
+                    + "CHECK_USER and CHECK_PASS, and an authority containing '@' is ambiguous "
+                    + "about which part is the host.");
+        }
+        if (authority.indexOf(',') >= 0) {
+            return ParsedUrl.refused(
+                "CHECK_URL must name exactly one host. pgJDBC reads a comma as a failover list, so "
+                    + "the driver could connect to an endpoint this probe never classified.");
+        }
+        if (!AUTHORITY_CHARS.matcher(authority).matches()) {
+            return ParsedUrl.refused(
+                "CHECK_URL host authority contains characters other than letters, digits, dot, "
+                    + "hyphen, underscore, colon and IPv6 brackets. Percent-encoding, whitespace and "
+                    + "control characters are refused rather than decoded or ignored.");
+        }
+        // pgJDBC turns query parameters into connection properties, so the
+        // authority is not the only text that can decide where the socket goes.
+        int queryStart = pathAndQuery.indexOf('?');
+        if (queryStart >= 0) {
+            for (String parameter : pathAndQuery.substring(queryStart + 1).split("&", -1)) {
+                String name = parameter.split("=", 2)[0].trim().toLowerCase(Locale.ROOT);
+                if (REDIRECTING_QUERY_PARAMS.contains(name)) {
+                    return ParsedUrl.refused(
+                        "CHECK_URL must not carry connection overrides in its query string: only "
+                            + "the authority may name the host and port, or the driver would be "
+                            + "sent to an endpoint this probe never classified.");
+                }
+            }
         }
 
+        if (authority.charAt(0) == '[') {
+            int close = authority.indexOf(']');
+            if (close < 0) {
+                return ParsedUrl.refused(
+                    "CHECK_URL has an unterminated IPv6 bracket. A bracketed literal must close "
+                        + "before any port.");
+            }
+            String literal = authority.substring(1, close);
+            if (!isIpv6Literal(literal)) {
+                return ParsedUrl.refused(
+                    "CHECK_URL does not contain a valid IPv6 literal between the brackets.");
+            }
+            String suffix = authority.substring(close + 1);
+            int port = -1;
+            if (!suffix.isEmpty()) {
+                if (!validPortSuffix(suffix)) {
+                    return ParsedUrl.refused(
+                        "CHECK_URL must have nothing after a bracketed IPv6 literal except an "
+                            + "optional :<port> in 1-65535.");
+                }
+                port = Integer.parseInt(suffix.substring(1));
+            }
+            return new ParsedUrl(literal, port, authority, pathAndQuery, "");
+        }
+
+        int colon = authority.indexOf(':');
         String host;
-        String port;
-        int first = s.indexOf(':');
-        if (first < 0) {
-            host = s;
-            port = null;
+        int port = -1;
+        if (colon < 0) {
+            host = authority;
         } else {
-            if (s.indexOf(':', first + 1) >= 0) return "";
-            host = s.substring(0, first);
-            port = s.substring(first + 1);
+            host = authority.substring(0, colon);
+            String portText = authority.substring(colon + 1);
+            if (portText.indexOf(':') >= 0) {
+                return ParsedUrl.refused(
+                    "CHECK_URL has more than one colon in an unbracketed authority. An IPv6 "
+                        + "literal must be bracketed and a port cannot contain a colon, so the "
+                        + "host:port split would be ambiguous.");
+            }
+            if (!isValidPort(portText)) {
+                return ParsedUrl.refused(
+                    "CHECK_URL names a port that is not a decimal 1-65535 without a leading zero.");
+            }
+            port = Integer.parseInt(portText);
         }
-        // No accepted target contains a bracket in a bare host, and such a host
-        // is never passed to the driver on the strength of a guess.
-        if (host.isEmpty() || host.indexOf('[') >= 0 || host.indexOf(']') >= 0) return "";
-        if (port != null && !isValidPort(port)) return "";
-        return host;
+        if (host.isEmpty() || host.indexOf('[') >= 0 || host.indexOf(']') >= 0) {
+            return ParsedUrl.refused(
+                "CHECK_URL host is empty or contains a bracket outside IPv6 bracket notation.");
+        }
+        return new ParsedUrl(host, port, authority, pathAndQuery, "");
+    }
+
+    /**
+     * A CHECK_URL this probe understands: the validated authority, the bare host
+     * it was classified from, and the untouched path and query.
+     *
+     * `host` is empty exactly when the URL was refused, and a refused instance
+     * carries no parsed host at all, so no caller can act on a half-understood
+     * URL.
+     */
+    static final class ParsedUrl {
+        /** Bare host used for classification: no brackets, no port. */
+        final String host;
+        /** Port from the authority, or -1 when the URL named none. */
+        final int port;
+        /** The authority exactly as written, after it passed validation. */
+        final String authority;
+        /** Path, query and fragment exactly as written. */
+        final String pathAndQuery;
+        final String reason;
+
+        private ParsedUrl(
+            String host, int port, String authority, String pathAndQuery, String reason) {
+            this.host = host;
+            this.port = port;
+            this.authority = authority;
+            this.pathAndQuery = pathAndQuery;
+            this.reason = reason;
+        }
+
+        static ParsedUrl refused(String reason) {
+            return new ParsedUrl("", -1, "", "", reason);
+        }
+
+        boolean accepted() {
+            return !host.isEmpty();
+        }
+
+        /**
+         * The URL handed to the driver for a loopback target, rebuilt from the
+         * parts validated above rather than forwarded as received.
+         */
+        String connectUrl() {
+            return JDBC_URL_PREFIX + authority + pathAndQuery;
+        }
     }
 
     /** ":<port>": the only suffix allowed after a bracketed IPv6 literal. */

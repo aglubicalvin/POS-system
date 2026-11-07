@@ -286,6 +286,87 @@ class ProbeStateHostValidationTest {
         }
     }
 
+    // ---- URL structure: the classified host is the host the driver uses -----
+
+    @Test
+    fun `a host in the database path is never the classified host`() {
+        // The '@' suffix belongs to the database name, not the authority. When the
+        // parser cut the whole URL at its last '@', these were classified as
+        // loopback while the untouched string still named a remote authority for
+        // the driver to resolve.
+        for (url in listOf(
+            "jdbc:postgresql://attacker.example:5432/business@127.0.0.1",
+            "jdbc:postgresql://attacker.example:5432/business?target=@127.0.0.1",
+            "jdbc:postgresql://attacker.example:5432/business#@127.0.0.1",
+            "jdbc:postgresql://attacker.example/business@localhost",
+            "jdbc:postgresql://attacker.example:5432/business@[::1]:5432",
+        )) {
+            val result = runProbe(url, "probe_local")
+            assertEquals(8, result.exitCode, "$url must be refused with exit 8:\n${result.output}")
+            assertTrue(result.output.contains("REFUSED"), "expected a refusal:\n${result.output}")
+            assertFalse(
+                result.output.contains("read-only state probe"),
+                "$url must be refused before DriverManager is reached:\n${result.output}",
+            )
+            assertFalse(
+                result.output.contains("read_only_transaction="),
+                "$url must never report a confirmed read-only session:\n${result.output}",
+            )
+        }
+    }
+
+    @Test
+    fun `URL user-info is refused instead of stripped`() {
+        // Credentials arrive as CHECK_USER and CHECK_PASS. An authority carrying
+        // its own is ambiguous about which '@' ends the user-info, so it is
+        // refused even when the text after it looks like a loopback host.
+        for (url in listOf(
+            "jdbc:postgresql://user:secret@127.0.0.1:5432/postgres",
+            "jdbc:postgresql://postgres@localhost/postgres",
+            "jdbc:postgresql://@127.0.0.1:5432/postgres",
+        )) {
+            val result = runProbe(url, "probe_local")
+            assertEquals(8, result.exitCode, "$url must be refused:\n${result.output}")
+            assertTrue(result.output.contains("user-info"), result.output)
+            assertFalse(result.output.contains("read-only state probe"), result.output)
+        }
+    }
+
+    @Test
+    fun `query parameters that could move the socket are refused`() {
+        // pgJDBC turns query parameters into connection properties, so a loopback
+        // authority with 'host' or 'socketFactory' set would still leave the
+        // destination the guard classified.
+        for (url in listOf(
+            "jdbc:postgresql://127.0.0.1:1/postgres?host=attacker.example",
+            "jdbc:postgresql://127.0.0.1:1/postgres?hostaddr=203.0.113.9",
+            "jdbc:postgresql://127.0.0.1:1/postgres?socketFactory=com.example.Factory",
+        )) {
+            val result = runProbe(url, "probe_local")
+            assertEquals(8, result.exitCode, "$url must be refused:\n${result.output}")
+            assertTrue(result.output.contains("connection overrides"), result.output)
+            assertFalse(result.output.contains("read-only state probe"), result.output)
+        }
+    }
+
+    @Test
+    fun `an unsupported URL form is refused rather than interpreted`() {
+        for (url in listOf(
+            "postgresql://127.0.0.1:5432/postgres",
+            "jdbc:postgres://127.0.0.1:5432/postgres",
+            "jdbc:postgresql:127.0.0.1/postgres",
+            "jdbc:postgresql:///postgres",
+            "jdbc:postgresql://localhost:5432,attacker.example:5432/postgres",
+            "jdbc:postgresql://127.0.0.1%40attacker.example:5432/postgres",
+            "jdbc:postgresql://127.0.0.1 :5432/postgres",
+        )) {
+            val result = runProbe(url, "probe_local")
+            assertEquals(8, result.exitCode, "$url must be refused with exit 8:\n${result.output}")
+            assertFalse(result.output.contains("read-only state probe"), result.output)
+            assertFalse(result.output.contains("read_only_transaction="), result.output)
+        }
+    }
+
     // ---- project identity --------------------------------------------------
 
     @Test

@@ -16,10 +16,16 @@
 --     authenticates as the staging administrator and does NOT use
 --     pos_probe_readonly. Nothing in this repository currently logs in as that
 --     role.
+--   * The current staging identity gate accepts the ADMINISTRATOR login only:
+--     ProbeState requires CHECK_USER to be exactly postgres.<POS_STAGING_PROJECT_REF>.
+--     Setting CHECK_USER=pos_probe_readonly is therefore NOT sufficient today --
+--     the gate refuses every other login with exit 11 before a connection is
+--     attempted, and that administrator check is deliberately not relaxed here.
 --   * Proving that the probe works under pos_probe_readonly needs a separate
---     least-privilege connection test (a probe run with CHECK_USER set to that
---     role and that account's own password). That test is future work: creating
---     the role is not evidence that the probe can run under it.
+--     future test path, or an explicitly designed role-aware identity mode, that
+--     authenticates as that account with its own password. Until such a test
+--     exists and passes, creating the role is not evidence that the probe can run
+--     under it: the role is uncreated and unproven.
 --   * Verifying project identity and creating this role are separate operations
 --     with separate authorization requirements.
 --
