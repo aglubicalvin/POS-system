@@ -103,35 +103,50 @@ function installStubDocker(
   const bin = join(dir, 'bin');
   mkdirSync(bin, { recursive: true });
   const stdinFile = join(dir, 'docker-stdin.txt');
+  // Recorded separately from argv, stdin and output: the environment the Docker
+  // CLI itself inherited, and the mode of the raw psql transcript at the moment
+  // Docker runs. Both are needed to prove findings 1 and 3 rather than assume
+  // them. A Node stub is used on every platform: a shell shim would have to
+  // drain stdin by hand, and Windows' .cmd cannot do that without mangling it.
+  const envFile = join(dir, 'docker-env.txt');
+  const rawModeFile = join(dir, 'docker-rawmode.txt');
+  const stub = join(bin, 'docker-stub.mjs');
+  writeFileSync(
+    stub,
+    [
+      "import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';",
+      'const [stdinFile, argsFile, transcriptFile, code, envFile, rawModeFile, ...dockerArgs] = process.argv.slice(2);',
+      "let input = '';",
+      'try { input = readFileSync(0, "utf8"); } catch {}',
+      'writeFileSync(stdinFile, input, "utf8");',
+      'writeFileSync(argsFile, dockerArgs.join(" ") + String.fromCharCode(10), "utf8");',
+      'writeFileSync(envFile, process.env.PROBE_PW === undefined ? "<absent>" : "PRESENT:" + process.env.PROBE_PW, "utf8");',
+      'const tempRoot = process.env.TMPDIR || process.env.TMP || "";',
+      'let mode = "";',
+      'if (process.platform !== "win32" && tempRoot) {',
+      '  try {',
+      '    const [name] = readdirSync(tempRoot).filter((entry) => entry.startsWith("pos-probe-raw-") && entry.endsWith(".log"));',
+      '    if (name) mode = (statSync(`${tempRoot}/${name}`).mode & 0o777).toString(8).padStart(3, "0");',
+      '  } catch {}',
+      '}',
+      'writeFileSync(rawModeFile, mode + String.fromCharCode(10), "utf8");',
+      'if (transcriptFile) { try { process.stdout.write(readFileSync(transcriptFile, "utf8")); } catch {} }',
+      'process.exit(Number(code));',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
   if (process.platform === 'win32') {
-    const stub = join(bin, 'docker-stub.mjs');
-    writeFileSync(
-      stub,
-      [
-        "import { readFileSync, writeFileSync } from 'node:fs';",
-        'const [stdinFile, argsFile, transcriptFile, code, ...dockerArgs] = process.argv.slice(2);',
-        "let input = '';",
-        'try { input = readFileSync(0, "utf8"); } catch {}',
-        'writeFileSync(stdinFile, input, "utf8");',
-        'writeFileSync(argsFile, dockerArgs.join(" ") + "\\n", "utf8");',
-        'if (transcriptFile) { try { process.stdout.write(readFileSync(transcriptFile, "utf8")); } catch {} }',
-        'process.exit(Number(code));',
-        '',
-      ].join('\n'),
-      'utf8',
-    );
     writeFileSync(
       join(bin, 'docker.cmd'),
-      `@echo off\r\nnode "%~dp0docker-stub.mjs" "${stdinFile}" "${argsFile}" "${transcriptFile ?? ''}" ${exitCode} %*\r\n`,
+      ['@echo off', `node "%~dp0docker-stub.mjs" "${stdinFile}" "${argsFile}" "${transcriptFile ?? ''}" ${exitCode} "${envFile}" "${rawModeFile}" %*`, ''].join(String.fromCharCode(13, 10)),
       'utf8',
     );
   } else {
     const shim = join(bin, 'docker');
     writeFileSync(
       shim,
-      `#!/bin/sh\ncat > "${stdinFile}"\nprintf '%s\\n' "$*" > "${argsFile}"\n` +
-        (transcriptFile ? `cat "${transcriptFile}"\n` : '') +
-        `exit ${exitCode}\n`,
+      ['#!/bin/sh', `exec node "${stub}" "${stdinFile}" "${argsFile}" "${transcriptFile ?? ''}" ${exitCode} "${envFile}" "${rawModeFile}" "$@"`, ''].join(String.fromCharCode(10)),
       'utf8',
     );
     chmodSync(shim, 0o755);
@@ -746,5 +761,126 @@ describe('probe-readonly.ps1 sanitized evidence', () => {
     expect(JSON.stringify(evidence)).not.toContain('probe-pass');
     expect(result.output).not.toContain('probe-pass');
     expect(rawLogs()).toEqual([]);
+  });
+});
+
+/**
+ * Second independent review: the Docker CLI must not inherit PROBE_PW, and the
+ * raw psql transcript must be owner-only while it exists and deleted whether
+ * the run succeeds or fails. The stub records the CLI's environment and the
+ * transcript mode at the process boundary; no container is started.
+ */
+describe('probe-readonly.ps1 password environment and transcript handling', () => {
+  interface RunOutcome {
+    status: number | null;
+    output: string;
+    args: string | null;
+    stdin: string | null;
+    dockerEnv: string | null;
+    transcriptMode: string | null;
+    tempEntries: string[];
+    evidence: Record<string, string> | null;
+  }
+
+  function runApply(
+    lines: string[],
+    exitCode: number,
+    extraEnv: Record<string, string> = {},
+  ): RunOutcome {
+    const dir = scratchDir('ps-hardening-');
+    const cert = certificate(dir, 19);
+    // A private temp root, so this run's transcript and CA copy are the only
+    // entries in it and cleanup can be asserted without racing another test.
+    const runTemp = join(dir, 'tmp');
+    mkdirSync(runTemp, { recursive: true });
+    rmSync(EVIDENCE_FILE, { force: true });
+    const transcript = join(dir, 'transcript.txt');
+    writeFileSync(transcript, `${lines.join('\n')}\n`, 'utf8');
+    const argsFile = join(dir, 'docker-args.txt');
+    const bin = installStubDocker(dir, argsFile, transcript, exitCode);
+    const result = runScript(
+      {
+        POS_STAGING_PROJECT_REF: STAGING_REF,
+        POS_STAGING_POOLER_HOST: POOLER_HOST,
+        POS_STAGING_DB_ROOT_CERT: cert.path,
+        POS_STAGING_DB_ROOT_CERT_SHA256: cert.fingerprint,
+        PROBE_ADMIN_USER: `postgres.${STAGING_REF}`,
+        PROBE_ADMIN_PASS: 'admin-pass',
+        PROBE_PW: 'probe-pass',
+        PATH: `${bin}${delimiter}${process.env.PATH ?? ''}`,
+        TMP: runTemp,
+        TEMP: runTemp,
+        TMPDIR: runTemp,
+        ...extraEnv,
+      },
+      ['-Apply'],
+    );
+    const readIfPresent = (path: string) =>
+      existsSync(path) ? readFileSync(path, 'utf8') : null;
+    return {
+      status: result.status,
+      output: result.output,
+      args: readIfPresent(argsFile),
+      stdin: readIfPresent(join(dir, 'docker-stdin.txt')),
+      dockerEnv: readIfPresent(join(dir, 'docker-env.txt')),
+      transcriptMode: readIfPresent(join(dir, 'docker-rawmode.txt'))?.trim() ?? null,
+      tempEntries: readdirSync(runTemp),
+      evidence: existsSync(EVIDENCE_FILE) ? readEvidence() : null,
+    };
+  }
+
+  const cleanLines = CLEAN_TRANSCRIPT.trimEnd().split('\n');
+  const FAILED_TRANSCRIPT = ['psql: error: connection to server at "db.internal:5432" failed'];
+
+  itPS('removes PROBE_PW from the environment the Docker CLI inherits', () => {
+    const outcome = runApply(cleanLines, 0);
+    expect(outcome.status, outcome.output).toBe(0);
+    // The child process reports its own environment, not what the wrapper meant
+    // to do: the password must be gone before Docker exists.
+    expect(outcome.dockerEnv, 'the Docker CLI inherited PROBE_PW').toBe('<absent>');
+    // Delivery is still stdin-only, one line per \password prompt.
+    expect(outcome.stdin?.replace(/\r\n/g, '\n')).toBe('probe-pass\nprobe-pass\n');
+    expect(outcome.args).not.toContain('probe-pass');
+    expect(outcome.output).not.toContain('probe-pass');
+    expect(JSON.stringify(outcome.evidence)).not.toContain('probe-pass');
+  });
+
+  itPS('keeps PROBE_PW out of the Docker environment on the failure path', () => {
+    const outcome = runApply(FAILED_TRANSCRIPT, 3);
+    expect(outcome.status, outcome.output).toBe(3);
+    expect(outcome.dockerEnv).toBe('<absent>');
+    expect(outcome.stdin?.replace(/\r\n/g, '\n')).toBe('probe-pass\nprobe-pass\n');
+  });
+
+  itPS('still supplies the administrator credential only through PGPASSWORD', () => {
+    const outcome = runApply(cleanLines, 0);
+    expect(outcome.status, outcome.output).toBe(0);
+    // `-e PGPASSWORD` names a variable; the value is never an argument.
+    expect(outcome.args).toContain('-e PGPASSWORD');
+    expect(outcome.args).not.toContain('admin-pass');
+  });
+
+  itPS('creates the raw transcript owner-only before psql writes to it', () => {
+    const outcome = runApply(cleanLines, 0);
+    expect(outcome.status, outcome.output).toBe(0);
+    if (process.platform === 'win32') {
+      // Windows has no POSIX mode bits: the file inherits the per-user temp ACL.
+      // The mode probe is therefore inapplicable here rather than passing.
+      expect(outcome.transcriptMode, 'POSIX mode must not be claimed on Windows').toBe('');
+    } else {
+      expect(outcome.transcriptMode, 'the transcript must be 0600 while Docker runs').toBe('600');
+    }
+  });
+
+  itPS('removes the transcript and the certificate copy after success', () => {
+    const outcome = runApply(cleanLines, 0);
+    expect(outcome.status, outcome.output).toBe(0);
+    expect(outcome.tempEntries).toEqual([]);
+  });
+
+  itPS('removes the transcript and the certificate copy after failure', () => {
+    const outcome = runApply(FAILED_TRANSCRIPT, 5);
+    expect(outcome.status, outcome.output).toBe(5);
+    expect(outcome.tempEntries).toEqual([]);
   });
 });

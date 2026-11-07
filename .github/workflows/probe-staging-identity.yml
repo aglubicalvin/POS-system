@@ -58,6 +58,12 @@ permissions:
 
 jobs:
   verify-identity:
+    # Main-only, job-level: a manual dispatch that selects any other branch is
+    # skipped before the environment -- and its staging administrator secret --
+    # is resolved. This repository guard is separate from, and does not replace,
+    # the environment's own deployment branch policy and required reviewers:
+    # those live in GitHub and are NOT verified by this file or by any test.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: pos-staging-admin
     steps:

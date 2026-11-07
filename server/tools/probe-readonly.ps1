@@ -44,7 +44,9 @@
 # log or uploaded. It is captured to a private temp file, reduced to the
 # allowlisted summary in server/tools/probe-role-evidence.ps1
 # (server/build/probe-readonly-evidence.txt), and the transcript is deleted on
-# success and failure. Unexpected transcript output is rejected, not forwarded.
+# success and failure. The transcript is created owner-only (0600 on Linux, where
+# a permissive umask would otherwise expose it to other local users) before any
+# content is written. Unexpected transcript output is rejected, not forwarded.
 # The original psql exit status is preserved so a failed run cannot look green.
 
 param([switch]$Apply)
@@ -186,6 +188,18 @@ if ($env:PROBE_PW -match '[\r\n\x00]') {
     throw 'Refusing to run: PROBE_PW must not contain line breaks or NUL.'
 }
 
+# Read the role password into this process only, then REMOVE it from the
+# environment before any child process exists. Child processes inherit the
+# environment, so leaving PROBE_PW set while Docker runs would hand the Docker
+# CLI -- and anything it starts -- the password even though stdin is the intended
+# delivery channel. Nothing below restores the variable; the local copy feeds the
+# two stdin lines and is cleared in the finally block.
+$ProbePw = $env:PROBE_PW
+if ([string]::IsNullOrEmpty($ProbePw)) {
+    throw 'Refusing to run: PROBE_PW must be set in the environment.'
+}
+Remove-Item Env:PROBE_PW -ErrorAction SilentlyContinue
+
 # The CA must exist INSIDE the container: a host path means nothing to libpq in
 # Docker. Copy it into a private temp directory and mount that directory read-only
 # at a fixed container path, so sslrootcert is a constant rather than an
@@ -226,6 +240,26 @@ $dockerArgs = @(
 $env:PGPASSWORD = $env:PROBE_ADMIN_PASS
 $code = 1
 try {
+    # Create the transcript owner-only BEFORE its first byte. A permissive umask
+    # on a shared Linux runner would otherwise leave the psql output (database,
+    # role, schema and grant names) readable by other local users while it
+    # exists. Out-File truncates this same file, so the mode survives every write.
+    # On Windows, POSIX mode bits do not exist and the file inherits the private
+    # per-user temp-directory ACL.
+    $transcriptStream = [System.IO.File]::Open(
+        $RawLog,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None
+    )
+    $transcriptStream.Dispose()
+    if ($IsLinux -or $IsMacOS) {
+        & chmod 0600 $RawLog
+        if ($LASTEXITCODE -ne 0) {
+            throw 'BLOCKED: could not restrict permissions on the psql transcript, so the run is refused.'
+        }
+    }
+
     # Exactly the verified bytes, not a fresh read of the caller's path.
     [System.IO.File]::WriteAllBytes($LocalCert, $PemBytes)
     # The CA is a public trust anchor and the container runs unprivileged, so the
@@ -243,12 +277,13 @@ try {
     #
     # pos_probe_readonly_password.sql is `\password pos_probe_readonly`, which
     # reads TWO lines from psql's stdin. Docker runs with -i, so the inherited
-    # stdin pipe is psql's stdin. Piping the password twice
-    # delivers exactly one line per \password prompt and never puts it in the
-    # argument vector or in a Docker -e value. PROBE_PW was rejected above if it
-    # contained CR, LF or NUL, so no password value can add or remove a line.
+    # stdin pipe is psql's stdin. Piping the local copy twice delivers exactly one
+    # line per \password prompt and never puts it in the argument vector, in a
+    # Docker -e value, or in the inherited environment (PROBE_PW was removed from
+    # it above, and was rejected if it contained CR, LF or NUL, so no password
+    # value can add or remove an input line).
     $ErrorActionPreference = 'Continue'
-    @($env:PROBE_PW, $env:PROBE_PW) |
+    @($ProbePw, $ProbePw) |
         & docker @dockerArgs 2>&1 |
         ForEach-Object {
             if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message }
@@ -256,8 +291,14 @@ try {
         } |
         Out-File -LiteralPath $RawLog -Encoding utf8
     $code = $LASTEXITCODE
+} catch {
+    # A failure before the reduction reached its own cleanup must not leave even
+    # a partial transcript behind.
+    Remove-Item -LiteralPath $RawLog -Force -ErrorAction SilentlyContinue
+    throw
 } finally {
     $ErrorActionPreference = 'Stop'
+    $ProbePw = $null
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $CertDir -Recurse -Force -ErrorAction SilentlyContinue
 }

@@ -225,3 +225,83 @@ describe('staged root certificate materialization', () => {
     expect(existsSync(join(runnerTemp, 'staging-root-ca.pem'))).toBe(true);
   });
 });
+
+/**
+ * Second independent review, finding 2: the identity job receives
+ * PROBE_ADMIN_PASS through the pos-staging-admin environment, so it needs the
+ * same repository-level main-branch guard the role-creation job already has.
+ * These assertions read the workflow text; no workflow is dispatched, and the
+ * environment's own protections live in GitHub and are not verified here.
+ */
+describe('staging identity job is restricted to main', () => {
+  const yml = read(IDENTITY);
+
+  /** The verify-identity job's own text (it is the workflow's only job). */
+  function identityJob(): string {
+    const start = yml.indexOf('\n  verify-identity:');
+    expect(start, 'the verify-identity job is missing').toBeGreaterThan(-1);
+    return yml.slice(start + 1);
+  }
+
+  /**
+   * Evaluate the guard the job is allowed to carry. Only an exact equality
+   * against refs/heads/main is accepted; anything that widens it fails before
+   * the ref comparison happens.
+   */
+  function jobRunsFor(ref: string): boolean {
+    const job = identityJob();
+    expect(job).toMatch(/^ {4}if: github\.ref == 'refs\/heads\/main'\r?$/m);
+    const condition = /^ {4}if: (.+?)\r?$/m.exec(job)?.[1] ?? '';
+    expect(condition).not.toMatch(/\|\||&&|always\(\)|pull_request|workflow_dispatch/);
+    return ref === 'refs/heads/main';
+  }
+
+  it('permits the identity job on refs/heads/main', () => {
+    expect(jobRunsFor('refs/heads/main')).toBe(true);
+  });
+
+  it('excludes the identity job on feature branches', () => {
+    expect(jobRunsFor('refs/heads/hardening-staging-db-connections')).toBe(false);
+    expect(jobRunsFor('refs/heads/feature/anything')).toBe(false);
+  });
+
+  it('applies the guard to the job, before the environment is resolved', () => {
+    const job = identityJob();
+    const guard = job.indexOf("if: github.ref == 'refs/heads/main'");
+    const environment = job.indexOf('environment: pos-staging-admin');
+    expect(guard).toBeGreaterThan(-1);
+    expect(environment).toBeGreaterThan(-1);
+    expect(guard).toBeLessThan(environment);
+    // No workflow-level or job-level `env:` block, so no secret is widened.
+    expect(yml).not.toMatch(/^env:/m);
+    expect(job).not.toMatch(/^ {4}env:/m);
+  });
+
+  it('keeps the administrator secret on the one step that consumes it', () => {
+    expect(yml.match(/secrets\.PROBE_ADMIN_PASS/g)).toHaveLength(1);
+    const stepStart = yml.indexOf('Run read-only staging identity probe');
+    const stepEnd = yml.indexOf('Publish sanitized evidence');
+    expect(stepStart).toBeGreaterThan(-1);
+    expect(stepEnd).toBeGreaterThan(stepStart);
+    expect(yml.slice(stepStart, stepEnd)).toContain(
+      'CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}',
+    );
+    // The identity workflow never receives the role password at all.
+    expect(yml).not.toContain('secrets.PROBE_PW');
+  });
+
+  it('keeps the workflow structurally valid and otherwise unchanged', () => {
+    // No YAML parser is a project dependency, so this asserts the structure the
+    // edited file must keep: no tabs, one trigger, one job, one environment,
+    // read-only permissions and a credential-less checkout.
+    expect(yml).not.toContain('\t');
+    // The worktree keeps this file with CRLF endings; the committed blob is LF.
+    expect(yml).toMatch(/^on:\r?\n {2}workflow_dispatch:\r?$/m);
+    expect(yml.match(/^jobs:\r?$/gm)).toHaveLength(1);
+    expect(yml.match(/^ {2}[a-z0-9-]+:\r?$/gm)).toHaveLength(1);
+    expect(yml).toMatch(/permissions:\r?\n {2}contents: read/);
+    expect(yml).toContain('environment: pos-staging-admin');
+    expect(yml).toContain('persist-credentials: false');
+    expect(yml).toMatch(/name: probe-staging-identity-evidence/);
+  });
+});
