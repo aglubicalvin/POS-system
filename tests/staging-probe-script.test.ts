@@ -202,6 +202,49 @@ describe('probe-readonly.ps1 hostname validation', () => {
   });
 });
 
+describe('probe-readonly.ps1 deny-list is additive', () => {
+  function runDeny(ref: string, custom: string): ScriptRun {
+    const dir = scratchDir('ps-deny-');
+    const cert = certificate(dir, 9);
+    return runScript({
+      POS_STAGING_PROJECT_REF: ref,
+      POS_STAGING_POOLER_HOST: POOLER_HOST,
+      POS_STAGING_DB_ROOT_CERT: cert.path,
+      POS_STAGING_DB_ROOT_CERT_SHA256: cert.fingerprint,
+      POS_NON_STAGING_REFS: custom,
+      PROBE_ADMIN_USER: `postgres.${ref}`,
+      PROBE_ADMIN_PASS: 'admin-pass',
+      PROBE_PW: 'probe-pass',
+    });
+  }
+
+  itPS('keeps the built-in development reference with a blank custom list', () => {
+    const result = runDeny('uemdrtrzlvhdtonccczt', ' , ');
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('known non-staging project');
+  });
+
+  itPS('keeps the built-in verification reference with an empty custom list', () => {
+    const result = runDeny('numwzjogaanfhlrfgrqk', '');
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('known non-staging project');
+  });
+
+  itPS('refuses a custom reference after trimming, lower-casing and de-duplication', () => {
+    const ref = 'customref00000000001';
+    const result = runDeny(ref, `  ${ref.toUpperCase()} , ${ref} ,, `);
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('known non-staging project');
+  });
+
+  itPS('refuses a malformed custom entry instead of ignoring it', () => {
+    const result = runDeny(STAGING_REF, 'not-a-ref');
+    expect(result.status).not.toBe(0);
+    expect(result.output).toContain('POS_NON_STAGING_REFS');
+    expect(result.output).toContain('not a Supabase project reference');
+  });
+});
+
 describe('probe-readonly.ps1 certificate contract', () => {
   const baseEnv = (certPath: string, fingerprint: string) => ({
     POS_STAGING_PROJECT_REF: STAGING_REF,

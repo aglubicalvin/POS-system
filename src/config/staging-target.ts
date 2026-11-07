@@ -78,6 +78,7 @@ export interface StagingPoolerHost {
 export type StagingBlockCode =
   | 'missing-ref'
   | 'malformed-ref'
+  | 'malformed-non-staging-ref'
   | 'non-staging-ref'
   | 'missing-admin-user'
   | 'malformed-admin-user'
@@ -149,10 +150,31 @@ function blocked(code: StagingBlockCode, message: string): StagingResolution {
   return { ok: false, code, message };
 }
 
-function nonStagingRefs(env: Env): string[] {
+/**
+ * Custom entries from POS_NON_STAGING_REFS, trimmed, lower-cased and with
+ * blanks removed. Never replaces the built-in list.
+ */
+function customNonStagingRefs(env: Env): string[] {
   const raw = env[NON_STAGING_REFS_ENV];
-  const list = raw === undefined ? KNOWN_NON_STAGING_REFS : raw.split(',');
-  return list.map((value) => value.trim().toLowerCase()).filter((value) => value !== '');
+  if (raw === undefined) return [];
+  return raw
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value !== '');
+}
+
+/** Custom entries that are not Supabase project references. */
+function malformedNonStagingRefs(env: Env): string[] {
+  return customNonStagingRefs(env).filter((value) => !PROJECT_REF_PATTERN.test(value));
+}
+
+/**
+ * The effective deny-list: the immutable built-ins plus custom entries.
+ * Additive by construction, so a blank or empty POS_NON_STAGING_REFS can
+ * never un-deny the development or former verification project.
+ */
+function nonStagingRefs(env: Env): string[] {
+  return [...new Set([...KNOWN_NON_STAGING_REFS, ...customNonStagingRefs(env)])];
 }
 
 /**
@@ -177,6 +199,14 @@ export function resolveStagingTarget(env: Env): StagingResolution {
       'malformed-ref',
       `BLOCKED: ${STAGING_REF_ENV} is not a valid Supabase project reference ` +
         '(expected 20 lowercase letters or digits).',
+    );
+  }
+
+  if (malformedNonStagingRefs(env).length > 0) {
+    return blocked(
+      'malformed-non-staging-ref',
+      `BLOCKED: ${NON_STAGING_REFS_ENV} contains an entry that is not a Supabase ` +
+        'project reference. Refusing to guess which projects are non-staging.',
     );
   }
 

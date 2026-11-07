@@ -29,11 +29,12 @@
 --   * Verifying project identity and creating this role are separate operations
 --     with separate authorization requirements.
 --
--- TARGET SCOPE (revised): the DESIGNATED STAGING project only, run by an
--- administrator of that project. This file previously said "DEVELOPMENT project
--- only"; that instruction is superseded because the probe role now exists to
--- read the staging database. Development is no longer a supported target for
--- this role.
+-- TARGET SCOPE: the DESIGNATED STAGING project only, run by an administrator
+-- of that project. This file previously said "DEVELOPMENT project only"; that
+-- instruction is superseded: the role is scoped to the designated staging
+-- project and to nothing else. The pos_probe_readonly role is defined in the
+-- proposed SQL but remains uncreated and unproven. No repository workflow or
+-- test currently authenticates as that role.
 --
 -- Why this DDL is valid on staging, statement by statement:
 --   * step 1 creates a LOGIN role owned by the executing administrator. It names
@@ -45,7 +46,8 @@
 --   * steps 4-5 grant USAGE on supabase_migrations and column SELECT on
 --     supabase_migrations.schema_migrations, both created and owned by Supabase
 --     itself. Nothing in public or auth is granted, so the role cannot read
---     business data.
+--     business data. USAGE on public is inherited from Supabase's PUBLIC
+--     baseline and confers no object access; it is expected, not granted here.
 --   * steps 6-8 are read-only verification queries.
 -- There is no environment-specific object, no extension, no data and no
 -- destructive statement anywhere in this file.
@@ -103,16 +105,19 @@ alter role pos_probe_readonly set statement_timeout = '60s';
 grant connect on database postgres to pos_probe_readonly;
 
 -- 4. Schema access: only supabase_migrations, which the probe queries by name.
---    public is NOT granted. ProbeState reads pg_catalog, which needs no schema
---    USAGE. No table privileges are granted anywhere.
+--    public is NOT granted here. Supabase already grants USAGE on public to
+--    PUBLIC, so the role inherits it; that baseline confers no access to any
+--    object. ProbeState reads pg_catalog, which needs no schema USAGE. No table
+--    privileges are granted anywhere.
 grant usage on schema supabase_migrations to pos_probe_readonly;
 
 -- 5. Migration history: only the two columns the probe prints.
 --    `statements` (raw SQL text) and `created_by` are deliberately NOT granted.
 grant select (version, name) on supabase_migrations.schema_migrations to pos_probe_readonly;
 
--- 6. Verification (read-only). Expected result: every column is false/none.
---    Run after steps 1-5 to confirm the role holds nothing it should not.
+-- 6. Verification (read-only). Expected: public_schema_usage = true (inherited
+--    from Supabase's PUBLIC baseline and harmless), every other privilege
+--    column false/none, and elevated_attribute false. Run after steps 1-5.
 select
   has_schema_privilege('pos_probe_readonly', 'auth', 'USAGE')                              as auth_schema_usage,
   has_schema_privilege('pos_probe_readonly', 'public', 'USAGE')                           as public_schema_usage,

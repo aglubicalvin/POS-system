@@ -169,8 +169,15 @@ public class ProbeState {
         // A pooler administrator login names a project. If that project is known
         // not to be staging, refuse before looking at the target: identity is
         // never allowed to ride on a hostname.
+        Denylist denylist = denylist();
+        if (denylist.malformed != null) {
+            System.err.println("REFUSED: " + NON_STAGING_REFS_ENV
+                + " contains an entry that is not a Supabase project reference. Refusing to "
+                + "guess which projects are non-staging.");
+            System.exit(11);
+        }
         String adminRef = adminUserProjectRef(user);
-        if (adminRef != null && nonStagingRefs().contains(adminRef)) {
+        if (adminRef != null && denylist.refs.contains(adminRef)) {
             System.err.println(
                 "REFUSED: CHECK_USER belongs to project " + adminRef + ", which is configured as a "
                     + "known non-staging project. The probe will not read a development or former "
@@ -222,7 +229,7 @@ public class ProbeState {
                         + "(expected 20 lowercase letters or digits).");
                 System.exit(11);
             }
-            if (nonStagingRefs().contains(configuredRef)) {
+            if (denylist.refs.contains(configuredRef)) {
                 System.err.println(
                     "REFUSED: " + configuredRef + " is configured as a known non-staging project. "
                         + "Set a dedicated staging reference.");
@@ -338,90 +345,27 @@ public class ProbeState {
             // Server-side verification, before ANY catalog query. A successful
             // JDBC setter call is not proof: the driver may ignore it, and a
             // pooler may hand back a session with a different default.
-            String transactionReadOnly = readTransactionReadOnly(c);
-            if (!"on".equals(transactionReadOnly)) {
+            // Result-based control flow. The previous version set exitCode = 6
+            // and `return`ed from main(), which skipped the final
+            // System.exit(exitCode) and made a failed read-only check exit 0.
+            // Each branch now falls through to the single exit point at the
+            // end of main, so the process status reports the failure.
+            ReadOnlyConfirmation confirmation = confirmReadOnlyTransaction(c);
+            if (!confirmation.confirmed()) {
                 System.err.println("  probe_status=error");
                 System.err.println("  error_category=read_only_not_confirmed");
-                System.err.println(
-                    "  error_detail=transaction_read_only="
-                        + (transactionReadOnly == null ? "unavailable" : sanitizeValue(transactionReadOnly)));
+                System.err.println("  error_detail=transaction_read_only=" + confirmation.evidence());
                 exitCode = 6;
-                return;
-            }
-
-            // Reached only after PostgreSQL confirmed the transaction is
-            // read-only, so the workflow can copy this exact line into evidence.
-            System.out.println("  read_only_transaction=server_confirmed");
-
-            // Every query from here on is a SELECT over catalogs/views; none
-            // is reached unless the check above passed.
-            q(c, "select 'database=' || current_database()");
-            q(c, "select 'current_user=' || current_user");
-            q(c, "select 'app_tables=' || count(*) from pg_class c "
-                + "join pg_namespace n on n.oid=c.relnamespace "
-                + "where n.nspname='public' and c.relkind='r'");
-            q(c, "select 'views=' || count(*) from pg_class c "
-                + "join pg_namespace n on n.oid=c.relnamespace "
-                + "where n.nspname='public' and c.relkind in ('v','m')");
-            q(c, "select 'policies=' || count(*) from pg_policies where schemaname='public'");
-            q(c, "select 'policies_to_authenticated=' || count(*) from pg_policies p "
-                + "where p.schemaname='public' and exists (select 1 from unnest(p.roles) r "
-                + "where r='authenticated')");
-            q(c, "select 'policies_to_public=' || count(*) from pg_policies p "
-                + "where p.schemaname='public' and exists (select 1 from unnest(p.roles) r "
-                + "where r='public')");
-            q(c, "select 'functions=' || count(*) from pg_proc p "
-                + "join pg_namespace n on n.oid=p.pronamespace "
-                + "where n.nspname='public' and p.proname not like 'pg\\_%'");
-            q(c, "select 'functions_pinned_search_path=' || count(*) from pg_proc p "
-                + "join pg_namespace n on n.oid=p.pronamespace "
-                + "where n.nspname='public' and p.proconfig is not null");
-            q(c, "select 'triggers=' || count(*) from pg_trigger t "
-                + "join pg_class c on c.oid=t.tgrelid "
-                + "join pg_namespace n on n.oid=c.relnamespace "
-                + "where n.nspname='public' and not t.tgisinternal");
-            q(c, "select 'tables_with_rls=' || count(*) from pg_class c "
-                + "join pg_namespace n on n.oid=c.relnamespace "
-                + "where n.nspname='public' and c.relkind='r' and c.relrowsecurity");
-
-            // Migration-history existence check (read-only, catalog-based). The
-            // count MUST be a separate statement guarded in Java: PostgreSQL
-            // analyses every subquery in an expression before evaluating a CASE
-            // condition, so a reference to a missing table would fail even when
-            // that branch would not be taken.
-            System.out.println("-- migration history --");
-            boolean migrationTableExists = exists(c,
-                "select 1 from information_schema.tables "
-                    + "where table_schema='supabase_migrations' and table_name='schema_migrations'");
-
-            System.out.println("  supabase_migrations_exists=" + migrationTableExists);
-            if (migrationTableExists) {
-                q(c, "select 'migration_history=' || count(version) || "
-                    + "' rows from supabase_migrations.schema_migrations' "
-                    + "from supabase_migrations.schema_migrations");
             } else {
-                System.out.println("  migration_history=not_initialized");
+                // Reached only after PostgreSQL confirmed the transaction is
+                // read-only, so the workflow can copy this exact line into evidence.
+                System.out.println("  read_only_transaction=server_confirmed");
+                // runCatalogQueries prints the single `probe_status=ok` line after
+                // the last catalog query; printing it here as well would publish a
+                // duplicate completion marker that the evidence contract rejects.
+                runCatalogQueries(c);
             }
 
-            System.out.println("-- public tables --");
-            q(c, "select c.relname from pg_class c "
-                + "join pg_namespace n on n.oid=c.relnamespace "
-                + "where n.nspname='public' and c.relkind='r' order by 1");
-
-            System.out.println("-- policies not scoped to authenticated --");
-            q(c, "select p.tablename || '.' || p.policyname || ' -> ' || array_to_string(p.roles, ',') "
-                + "from pg_policies p where p.schemaname='public' "
-                + "and not exists (select 1 from unnest(p.roles) r where r='authenticated') "
-                + "order by 1");
-
-            // ProbeState never writes; closing a read-only session is harmless.
-            try {
-                c.rollback();
-            } catch (SQLException ignored) {
-                // Closing a read-only session must not fail the audit output.
-            }
-
-            System.out.println("  probe_status=ok");
         } catch (SQLException e) {
             // Sanitized category only: the driver message can carry the host,
             // port, database and role, and the workflow log is public.
@@ -437,21 +381,119 @@ public class ProbeState {
     }
 
     /**
-     * Known non-staging project references. Mirrors the TypeScript deny-list:
-     * POS_NON_STAGING_REFS replaces the built-in list when it is set.
+     * The catalog audit. Reached only after PostgreSQL itself confirmed the
+     * transaction is read-only, because the caller runs it only in that branch;
+     * every statement here is a SELECT.
      */
-    static List<String> nonStagingRefs() {
+    static void runCatalogQueries(Connection c) throws Exception {
+        // Every query from here on is a SELECT over catalogs/views; none
+        // is reached unless the check above passed.
+        q(c, "select 'database=' || current_database()");
+        q(c, "select 'current_user=' || current_user");
+        q(c, "select 'app_tables=' || count(*) from pg_class c "
+            + "join pg_namespace n on n.oid=c.relnamespace "
+            + "where n.nspname='public' and c.relkind='r'");
+        q(c, "select 'views=' || count(*) from pg_class c "
+            + "join pg_namespace n on n.oid=c.relnamespace "
+            + "where n.nspname='public' and c.relkind in ('v','m')");
+        q(c, "select 'policies=' || count(*) from pg_policies where schemaname='public'");
+        q(c, "select 'policies_to_authenticated=' || count(*) from pg_policies p "
+            + "where p.schemaname='public' and exists (select 1 from unnest(p.roles) r "
+            + "where r='authenticated')");
+        q(c, "select 'policies_to_public=' || count(*) from pg_policies p "
+            + "where p.schemaname='public' and exists (select 1 from unnest(p.roles) r "
+            + "where r='public')");
+        q(c, "select 'functions=' || count(*) from pg_proc p "
+            + "join pg_namespace n on n.oid=p.pronamespace "
+            + "where n.nspname='public' and p.proname not like 'pg\\_%'");
+        q(c, "select 'functions_pinned_search_path=' || count(*) from pg_proc p "
+            + "join pg_namespace n on n.oid=p.pronamespace "
+            + "where n.nspname='public' and p.proconfig is not null");
+        q(c, "select 'triggers=' || count(*) from pg_trigger t "
+            + "join pg_class c on c.oid=t.tgrelid "
+            + "join pg_namespace n on n.oid=c.relnamespace "
+            + "where n.nspname='public' and not t.tgisinternal");
+        q(c, "select 'tables_with_rls=' || count(*) from pg_class c "
+            + "join pg_namespace n on n.oid=c.relnamespace "
+            + "where n.nspname='public' and c.relkind='r' and c.relrowsecurity");
+
+        // Migration-history existence check (read-only, catalog-based). The
+        // count MUST be a separate statement guarded in Java: PostgreSQL
+        // analyses every subquery in an expression before evaluating a CASE
+        // condition, so a reference to a missing table would fail even when
+        // that branch would not be taken.
+        System.out.println("-- migration history --");
+        boolean migrationTableExists = exists(c,
+            "select 1 from information_schema.tables "
+                + "where table_schema='supabase_migrations' and table_name='schema_migrations'");
+
+        System.out.println("  supabase_migrations_exists=" + migrationTableExists);
+        if (migrationTableExists) {
+            q(c, "select 'migration_history=' || count(version) || "
+                + "' rows from supabase_migrations.schema_migrations' "
+                + "from supabase_migrations.schema_migrations");
+        } else {
+            System.out.println("  migration_history=not_initialized");
+        }
+
+        System.out.println("-- public tables --");
+        q(c, "select c.relname from pg_class c "
+            + "join pg_namespace n on n.oid=c.relnamespace "
+            + "where n.nspname='public' and c.relkind='r' order by 1");
+
+        System.out.println("-- policies not scoped to authenticated --");
+        q(c, "select p.tablename || '.' || p.policyname || ' -> ' || array_to_string(p.roles, ',') "
+            + "from pg_policies p where p.schemaname='public' "
+            + "and not exists (select 1 from unnest(p.roles) r where r='authenticated') "
+            + "order by 1");
+
+        // ProbeState never writes; closing a read-only session is harmless.
+        try {
+            c.rollback();
+        } catch (SQLException ignored) {
+            // Closing a read-only session must not fail the audit output.
+        }
+
+        System.out.println("  probe_status=ok");
+    }
+
+    /**
+     * The staging deny-list, as a result rather than a list.
+     *
+     * POS_NON_STAGING_REFS is ADDITIVE to the immutable built-ins, so a blank
+     * or empty custom value can never remove the development or former
+     * verification references. Entries are trimmed, lower-cased and
+     * de-duplicated. A malformed entry is a refusal rather than something to
+     * silently ignore, because ignoring it would leave a guard the operator
+     * believes is active silently disabled.
+     */
+    static final class Denylist {
+        final List<String> refs;
+        /** The first malformed custom entry, or null when the value is valid. */
+        final String malformed;
+
+        private Denylist(List<String> refs, String malformed) {
+            this.refs = refs;
+            this.malformed = malformed;
+        }
+    }
+
+    static Denylist denylist() {
+        List<String> refs = new ArrayList<>(Arrays.asList(KNOWN_NON_STAGING_REFS));
+        String malformed = null;
         String raw = System.getenv(NON_STAGING_REFS_ENV);
-        List<String> refs = new ArrayList<>();
-        if (raw == null || raw.isBlank()) {
-            refs.addAll(Arrays.asList(KNOWN_NON_STAGING_REFS));
-            return refs;
+        if (raw != null) {
+            for (String part : raw.split(",")) {
+                String value = part.trim().toLowerCase(Locale.ROOT);
+                if (value.isEmpty()) continue;
+                if (!PROJECT_REF_PATTERN.matcher(value).matches()) {
+                    if (malformed == null) malformed = value;
+                    continue;
+                }
+                if (!refs.contains(value)) refs.add(value);
+            }
         }
-        for (String part : raw.split(",")) {
-            String value = part.trim().toLowerCase(Locale.ROOT);
-            if (!value.isEmpty()) refs.add(value);
-        }
-        return refs;
+        return new Denylist(refs, malformed);
     }
 
     /** The project reference named by a pooler administrator login, or null. */
@@ -459,6 +501,33 @@ public class ProbeState {
         if (user == null) return null;
         Matcher m = ADMIN_USER_PATTERN.matcher(user.trim());
         return m.matches() ? m.group(1) : null;
+    }
+
+    /**
+     * The server's own answer to `SHOW transaction_read_only`: `on` is the only
+     * confirmed state, anything else (including a missing row or a failed
+     * query) is not.
+     */
+    static final class ReadOnlyConfirmation {
+        private final String value;
+
+        private ReadOnlyConfirmation(String value) {
+            this.value = value;
+        }
+
+        boolean confirmed() {
+            return "on".equals(value);
+        }
+
+        /** A short, sanitized value for the evidence log. */
+        String evidence() {
+            return value == null ? "unavailable" : sanitizeValue(value);
+        }
+    }
+
+    /** Ask the server once, and report its answer as a result. */
+    static ReadOnlyConfirmation confirmReadOnlyTransaction(Connection c) {
+        return new ReadOnlyConfirmation(readTransactionReadOnly(c));
     }
 
     /**
@@ -853,10 +922,12 @@ public class ProbeState {
      * path. The copy is deleted on exit, on success and failure.
      */
     static Path prepareStagedRootCert(String rootCert, String rootCertSha256) throws Exception {
-        byte[] der;
-        try (InputStream in = Files.newInputStream(Path.of(rootCert))) {
-            der = toDer(in);
-        }
+        // Read the certificate ONCE. The previous version hashed one read and
+        // then re-read the caller's path to build the copy, so a file replaced
+        // between the two reads could be trusted from one byte sequence and
+        // consumed from another. These exact bytes are hashed and written.
+        byte[] pem = Files.readAllBytes(Path.of(rootCert));
+        byte[] der = toDer(new java.io.ByteArrayInputStream(pem));
         String actual = bytesToHex(MessageDigest.getInstance("SHA-256").digest(der));
         if (!actual.equalsIgnoreCase(rootCertSha256)) {
             throw new IllegalArgumentException(
@@ -864,7 +935,7 @@ public class ProbeState {
                     + ". The certificate may have been rotated, or this is not the approved staging target.");
         }
         Path temp = Files.createTempFile("staging-root-cert-", ".pem");
-        Files.writeString(temp, Files.readString(Path.of(rootCert)));
+        Files.write(temp, pem);
         try {
             Files.setPosixFilePermissions(temp, EnumSet.of(PosixFilePermission.OWNER_READ));
         } catch (UnsupportedOperationException ignored) {

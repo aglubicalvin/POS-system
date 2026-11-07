@@ -45,8 +45,26 @@ $StagingRef = $StagingRef.Trim()
 if ($StagingRef -notmatch '^[a-z0-9]{20}$') {
     throw 'BLOCKED: POS_STAGING_PROJECT_REF is not a valid Supabase project reference.'
 }
+# Immutable built-ins, plus POS_NON_STAGING_REFS which is ADDITIVE: a blank or
+# empty custom value never removes them. Entries are trimmed, lower-cased and
+# de-duplicated; a malformed entry is refused rather than silently ignored.
+if ($StagingRef -cne $StagingRef.ToLowerInvariant()) {
+    throw 'BLOCKED: POS_STAGING_PROJECT_REF is not a valid Supabase project reference.'
+}
 $KnownNonStaging = @('uemdrtrzlvhdtonccczt', 'numwzjogaanfhlrfgrqk')
-if ($KnownNonStaging -contains $StagingRef) {
+$CustomNonStaging = @()
+if (-not [string]::IsNullOrWhiteSpace($env:POS_NON_STAGING_REFS)) {
+    $CustomNonStaging = @($env:POS_NON_STAGING_REFS -split ',' |
+        ForEach-Object { $_.Trim().ToLowerInvariant() } |
+        Where-Object { $_ })
+    foreach ($entry in $CustomNonStaging) {
+        if ($entry -notmatch '^[a-z0-9]{20}$') {
+            throw 'BLOCKED: POS_NON_STAGING_REFS contains an entry that is not a Supabase project reference. Refusing to guess which projects are non-staging.'
+        }
+    }
+}
+$DeniedRefs = @($KnownNonStaging + $CustomNonStaging | Select-Object -Unique)
+if ($DeniedRefs -contains $StagingRef) {
     throw 'BLOCKED: POS_STAGING_PROJECT_REF names a known non-staging project. Set the dedicated staging reference.'
 }
 
@@ -81,8 +99,13 @@ if ($RootCertSha256 -notmatch '^[0-9a-fA-F]{64}$') {
 if (-not (Test-Path -LiteralPath $RootCert -PathType Leaf)) {
     throw 'BLOCKED: POS_STAGING_DB_ROOT_CERT does not name a readable file.'
 }
+# Read the certificate ONCE. The bytes hashed below are the bytes written
+# into the container later; re-reading the caller's path after verification
+# would let a file replaced in between be trusted from one sequence and
+# consumed from another.
 try {
-    $b64 = ((Get-Content -Raw -LiteralPath $RootCert) -split "`r?`n" |
+    $PemBytes = [System.IO.File]::ReadAllBytes($RootCert)
+    $b64 = (([System.Text.Encoding]::ASCII.GetString($PemBytes)) -split "`r?`n" |
         ForEach-Object { $_.Trim() } |
         Where-Object { $_ -and -not $_.StartsWith('-----') }) -join ''
     $der = [Convert]::FromBase64String($b64)
@@ -154,7 +177,8 @@ $dockerArgs = @(
 
 $env:PGPASSWORD = $env:PROBE_ADMIN_PASS
 try {
-    Copy-Item -LiteralPath $RootCert -Destination $LocalCert -Force
+    # Exactly the verified bytes, not a fresh read of the caller's path.
+    [System.IO.File]::WriteAllBytes($LocalCert, $PemBytes)
     # The CA is a public trust anchor and the container runs unprivileged, so the
     # copy must be readable inside the mount. It is never writable, holds no
     # secret, and the directory is removed in the finally block.

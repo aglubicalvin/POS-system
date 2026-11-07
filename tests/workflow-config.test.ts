@@ -1,7 +1,17 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { extractProbeStep, identityWorkflowText, parseEvidence } from './helpers/probe-step.ts';
@@ -18,6 +28,12 @@ import { extractProbeStep, identityWorkflowText, parseEvidence } from './helpers
 const here = dirname(fileURLToPath(import.meta.url));
 const workflowsDir = resolve(here, '../.github/workflows');
 const read = (name: string) => readFileSync(resolve(workflowsDir, name), 'utf8');
+// The evidence rules live in a script so they can run without GitHub; the
+// workflow only invokes it. Tests read both and check each side of that split.
+const EVIDENCE_SCRIPT = readFileSync(
+  resolve(here, '../server/tools/probe-evidence.sh'),
+  'utf8',
+);
 
 const DEV_WORKFLOW = 'probe-readonly.yml';
 const STAGING_WORKFLOW = 'probe-staging.yml';
@@ -179,16 +195,16 @@ describe('identity probe exit-status and evidence handling', () => {
   it('writes sanitized evidence whether the probe succeeds or fails', () => {
     // Evidence generation must precede the failure exit so a failed run still
     // leaves its allowlisted summary behind for the artifact step.
-    const evidenceIdx = probeStep.indexOf('tee probe-evidence.txt');
+    const evidenceIdx = probeStep.indexOf('bash tools/probe-evidence.sh');
     const failureExitIdx = probeStep.indexOf('exit "$STATUS"');
     expect(evidenceIdx).toBeGreaterThan(-1);
     expect(failureExitIdx).toBeGreaterThan(-1);
     expect(evidenceIdx).toBeLessThan(failureExitIdx);
-    // The completion field in the evidence file is derived from the captured
-    // status, not hard-coded to ok.
-    expect(probeStep).toMatch(/probe_completion=\$\{COMPLETION\}/);
-    expect(probeStep).toMatch(/COMPLETION=failed/);
-    expect(probeStep).toMatch(/COMPLETION=ok/);
+    // The completion field is derived from the captured status, not hard-coded
+    // to ok, and the script writes the evidence file on both outcomes.
+    expect(EVIDENCE_SCRIPT).toContain('probe_completion=${completion}');
+    expect(EVIDENCE_SCRIPT).toContain('completion=failed');
+    expect(EVIDENCE_SCRIPT).toContain('completion=ok');
   });
 
   it('deletes raw output and never uploads it as an artifact', () => {
@@ -223,17 +239,20 @@ describe('identity probe exit-status and evidence handling', () => {
     expect(probeStep).not.toContain('echo "read_only_transaction=');
   });
 
-  it('extracts the confirmation from the probe output and defaults to not_confirmed', () => {
-    // The exact probe line is matched; anything else falls back explicitly. Both
-    // the server-confirmed line and the pre-server-check `enforced` line are
-    // accepted, so a binary built before the server-side check cannot silently
-    // downgrade a genuine confirmation.
-    expect(probeStep).toContain('grep -qxE');
-    expect(probeStep).toContain('read_only_transaction=(server_confirmed|enforced)');
-    // Whatever matched, the evidence uses the current vocabulary.
-    expect(probeStep).toContain('READ_ONLY=read_only_transaction=server_confirmed');
-    expect(probeStep).toContain('READ_ONLY=read_only_transaction=not_confirmed');
-    expect(probeStep).toContain('echo "${READ_ONLY}"');
+  it('extracts only an exact server_confirmed line and defaults to not_confirmed', () => {
+    // Exactly one read_only_transaction line must be present and it must be the
+    // exact server-confirmed line. `enforced`, `on`, `off`, a missing line and
+    // duplicates are all not_confirmed; nothing is rewritten.
+    expect(EVIDENCE_SCRIPT).toContain(
+      'if [ "$read_only_lines" -eq 1 ] && [ "$confirmed_lines" -eq 1 ]; then',
+    );
+    expect(EVIDENCE_SCRIPT).toContain(
+      'read_only_transaction=server_confirmed[[:space:]]*$',
+    );
+    expect(EVIDENCE_SCRIPT).toContain('read_only=read_only_transaction=not_confirmed');
+    expect(EVIDENCE_SCRIPT).toContain('echo "$read_only"');
+    // The step never emits read_only_transaction itself; only the script does.
+    expect(probeStep).not.toMatch(/echo\s+"?read_only_transaction=/);
   });
 
   it('deletes the raw output before the step exits', () => {
@@ -246,15 +265,16 @@ describe('identity probe exit-status and evidence handling', () => {
 
   it('keeps the sanitized evidence field allowlist', () => {
     // Only these probe fields may be copied into the evidence file.
-    expect(probeStep).toMatch(
+    expect(EVIDENCE_SCRIPT).toMatch(
       /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\)='/,
     );
     // The error category is selected separately from a fixed safe token and
     // emitted only after validation; it is not copied blindly by grep.
-    expect(probeStep).toContain('echo "error_category=${ERROR_CATEGORY}"');
+    expect(EVIDENCE_SCRIPT).toContain('echo "error_category=${error_category}"');
     // The raw file is never copied or dumped into the evidence.
+    expect(EVIDENCE_SCRIPT).not.toMatch(/cat probe-raw\.txt/);
+    expect(EVIDENCE_SCRIPT).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
     expect(probeStep).not.toMatch(/cat probe-raw\.txt/);
-    expect(probeStep).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
   });
 });
 
@@ -300,6 +320,13 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     const serverDir = join(dir, 'server');
     // The step starts with `cd server`; this directory holds the stub gradlew.
     mkdirSync(serverDir, { recursive: true });
+    // The step invokes `bash tools/probe-evidence.sh`, so the script it runs
+    // must be present exactly where the checkout would put it.
+    mkdirSync(join(serverDir, 'tools'), { recursive: true });
+    copyFileSync(
+      resolve(here, '../server/tools/probe-evidence.sh'),
+      join(serverDir, 'tools', 'probe-evidence.sh'),
+    );
     // The stub reads its output from an absolute path: `$0` and `pwd` are not
     // reliable under Git Bash's MSYS path translation on Windows.
     writeFileSync(join(dir, 'probe-output.txt'), probeOutput, 'utf8');
@@ -316,7 +343,12 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     const executed = spawnSync(bash as string, ['-eo', 'pipefail', scriptPath], {
       cwd: dir,
       encoding: 'utf8',
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+      // Git Bash's own directory is not always on PATH on Windows, and the step
+      // calls `bash tools/probe-evidence.sh` by name.
+      env: {
+        PATH: `${dirname(bash as string)}${delimiter}${process.env.PATH ?? ''}`,
+        HOME: process.env.HOME ?? '',
+      },
       // A wedged child must not hang the suite forever.
       timeout: 60_000,
     });
@@ -412,15 +444,17 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     }
   });
 
-  run('accepts the pre-server-check confirmation line too', () => {
-    // A workflow can run against a ProbeState binary compiled before the
-    // server-side check existed. That binary only prints `enforced`; treating it
-    // as a near-miss would under-report a genuine confirmation.
-    const result = runStep('== read-only state probe ==\n  read_only_transaction=enforced\n  probe_status=ok', 0);
+  run('rejects the legacy `enforced` value instead of rewriting it', () => {
+    // A binary built before the server-side check only printed `enforced`; that
+    // value never demonstrated the protection, so it is not a confirmation.
+    const result = runStep(
+      '== read-only state probe ==\n  read_only_transaction=enforced\n  probe_status=ok',
+      0,
+    );
     try {
       expect(result.status).toBe(0);
-      // Accepted as a confirmation, and normalised to the current value.
-      expect(result.evidence?.read_only_transaction).toBe('server_confirmed');
+      expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.evidence?.probe_completion).toBe('failed');
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
@@ -461,6 +495,7 @@ describe('probe step evidence generation (bash, stub probe)', () => {
         expect(readdirSync(join(result.dir, 'server')).sort()).toEqual([
           'gradlew',
           'probe-evidence.txt',
+          'tools',
         ]);
         const evidence = result.evidence!;
         expect(Object.keys(evidence).sort()).toEqual(

@@ -1,12 +1,15 @@
 package com.businessstore.pos.config
 
+import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermission
 import java.security.MessageDigest
 import java.util.Base64
 
@@ -55,7 +58,13 @@ class StagingConnectionConfigTest {
         assertEquals(projectRef, config.projectRef)
         assertEquals("postgres.$projectRef", config.adminUser)
         assertEquals("verify-full", config.sslMode)
-        assertEquals(cert.toAbsolutePath().normalize(), config.certPath)
+        // The connection consumes a private copy of the verified bytes, never the
+        // caller's path, which could be replaced between hashing and connecting.
+        assertEquals(cert.toAbsolutePath().normalize(), config.sourceCertPath)
+        assertNotEquals(cert.toAbsolutePath().normalize(), config.certPath)
+        assertArrayEquals(Files.readAllBytes(cert), Files.readAllBytes(config.certPath))
+        assertTrue(config.certPath.toString().contains("staging-root-cert-"), config.certPath.toString())
+        Files.deleteIfExists(config.certPath)
     }
 
     @Test
@@ -165,5 +174,105 @@ class StagingConnectionConfigTest {
         )
         assertTrue(outcome is StagingConnectionConfig.Outcome.Rejected)
         assertEquals("ref-mismatch", (outcome as StagingConnectionConfig.Outcome.Rejected).code)
+    }
+
+    // ---- certificate TOCTOU -------------------------------------------------
+
+    @Test
+    fun `a source file replaced after verification does not change what is consumed`(@TempDir dir: Path) {
+        val (cert, fingerprint) = pem(dir)
+        val config = StagingConnectionConfig.require(env(cert, fingerprint))
+        val verifiedBytes = Files.readAllBytes(config.certPath)
+
+        // Same path, different certificate: verification already happened, so a
+        // second read of the source would consume unverified bytes.
+        pem(dir, ByteArray(48) { (it + 9).toByte() })
+
+        assertArrayEquals(verifiedBytes, Files.readAllBytes(config.certPath), "the verified copy must not change")
+        assertEquals(fingerprint, config.rootCertSha256)
+        assertTrue(config.connectionString().contains("sslrootcert=${config.certPath}"))
+        Files.deleteIfExists(config.certPath)
+    }
+
+    @Test
+    fun `the private certificate copy is owner-readable only where POSIX permissions exist`(@TempDir dir: Path) {
+        val (cert, fingerprint) = pem(dir)
+        val config = StagingConnectionConfig.require(env(cert, fingerprint))
+        val permissions = runCatching { Files.getPosixFilePermissions(config.certPath) }.getOrNull()
+        if (permissions != null) {
+            assertEquals(setOf(PosixFilePermission.OWNER_READ), permissions)
+        }
+        Files.deleteIfExists(config.certPath)
+    }
+
+    // ---- deny-list ----------------------------------------------------------
+
+    private fun refEnv(
+        ref: String,
+        cert: Path,
+        fingerprint: String,
+        custom: String? = null,
+    ): Map<String, String> =
+        env(cert, fingerprint) + mapOf(
+            StagingConnectionConfig.PROJECT_REF_ENV to ref,
+            StagingConnectionConfig.ADMIN_USER_ENV to "postgres.$ref",
+        ) + (custom?.let { mapOf(StagingConnectionConfig.NON_STAGING_REFS_ENV to it) } ?: emptyMap())
+
+    @Test
+    fun `built-in references stay denied when the custom list is blank, empty or absent`(@TempDir dir: Path) {
+        val (cert, fingerprint) = pem(dir)
+        for (ref in listOf("uemdrtrzlvhdtonccczt", "numwzjogaanfhlrfgrqk")) {
+            for (custom in listOf(null, "", "   ", " , ")) {
+                val outcome = StagingConnectionConfig.resolve(refEnv(ref, cert, fingerprint, custom))
+                assertEquals(
+                    "non-staging-ref",
+                    (outcome as? StagingConnectionConfig.Outcome.Rejected)?.code,
+                    "ref=$ref custom=$custom",
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `a custom reference is denied after trimming, lower-casing and de-duplication`(@TempDir dir: Path) {
+        val (cert, fingerprint) = pem(dir)
+        val ref = "customref00000000001"
+        val outcome = StagingConnectionConfig.resolve(
+            refEnv(ref, cert, fingerprint, "  ${ref.uppercase()} , $ref ,, "),
+        )
+        assertEquals(
+            "non-staging-ref",
+            (outcome as? StagingConnectionConfig.Outcome.Rejected)?.code,
+        )
+    }
+
+    @Test
+    fun `a malformed custom entry is refused rather than ignored`(@TempDir dir: Path) {
+        val (cert, fingerprint) = pem(dir)
+        for (bad in listOf("not-a-ref", "short", "has space0000000000", "customref0000000000!")) {
+            val outcome = StagingConnectionConfig.resolve(refEnv(projectRef, cert, fingerprint, bad))
+            assertEquals(
+                "malformed-non-staging-ref",
+                (outcome as? StagingConnectionConfig.Outcome.Rejected)?.code,
+                "entry=$bad",
+            )
+        }
+    }
+
+    @Test
+    fun `custom entries add to the built-ins instead of replacing them`(@TempDir dir: Path) {
+        val (cert, fingerprint) = pem(dir)
+        val custom = "customref00000000001"
+        val outcome = StagingConnectionConfig.resolve(
+            refEnv("uemdrtrzlvhdtonccczt", cert, fingerprint, custom),
+        )
+        assertEquals(
+            "non-staging-ref",
+            (outcome as? StagingConnectionConfig.Outcome.Rejected)?.code,
+        )
+        assertEquals(
+            listOf("uemdrtrzlvhdtonccczt", "numwzjogaanfhlrfgrqk"),
+            StagingConnectionConfig.KNOWN_NON_STAGING_REFS,
+        )
     }
 }

@@ -161,71 +161,16 @@ jobs:
             STATUS=$?
           fi
 
-          if [ "$STATUS" -eq 0 ]; then
-            COMPLETION=ok
-          else
-            COMPLETION=failed
-          fi
-
-          # Preserve a safe Java probe category when one was emitted. If Gradle
-          # failed before ProbeState could classify the problem, classify only
-          # well-known toolchain/dependency failures from fixed patterns. Never
-          # copy Gradle's raw error text, paths, environment, or stack trace.
-          ERROR_CATEGORY="$(awk '
-            /^[[:space:]]+error_category=[a-z_]+$/ {
-              sub(/^[[:space:]]+error_category=/, "")
-              print
-              exit
-            }
-          ' probe-raw.txt)"
-
-          if [ "$STATUS" -ne 0 ] && [ -z "$ERROR_CATEGORY" ]; then
-            if grep -Eqi 'invalid source release: 21|invalid target release: 21|Could not target platform.*Java SE 21|No matching toolchains found.*21' probe-raw.txt; then
-              ERROR_CATEGORY=java_toolchain_mismatch
-            elif grep -Eqi 'Could not resolve|Could not GET|Could not HEAD|Could not download|Could not find .*artifact' probe-raw.txt; then
-              ERROR_CATEGORY=gradle_dependency_resolution
-            elif grep -Eqi "JAVA_HOME.*(not set|invalid)|java(:| ) (command )?not found" probe-raw.txt; then
-              ERROR_CATEGORY=java_runtime_unavailable
-            else
-              ERROR_CATEGORY=execution_failed_without_probe_category
-            fi
-          fi
-
-          # Read-only mode is a property of the probe SESSION, not of this
-          # workflow. ProbeState asks PostgreSQL itself
-          # (`SHOW transaction_read_only`) before any catalog query and prints
-          # `read_only_transaction=server_confirmed` only when the server says
-          # `on`, so the value is read back from the probe's own output: an
-          # exact match confirms the session, anything else (including a refused
-          # target, a failed connection, or a server that reported `off`) is
-          # recorded as not_confirmed. `enforced` is still accepted for the
-          # pre-server-check build, so a stale binary cannot silently downgrade
-          # a confirmed run. The value written to evidence is always
-          # `server_confirmed` (the tool's current vocabulary), regardless of
-          # which exact line was found. Asserting the field unconditionally
-          # would publish evidence that claims a protection never applied.
-          if grep -qxE '[[:space:]]*read_only_transaction=(server_confirmed|enforced)' probe-raw.txt; then
-            READ_ONLY=read_only_transaction=server_confirmed
-          else
-            READ_ONLY=read_only_transaction=not_confirmed
-          fi
-
-          # --- allowlisted evidence only -------------------------------------
-          # Written on BOTH outcomes: a failed probe must still leave sanitized
-          # evidence rather than a bare exit code. A strict field allowlist: no
-          # table lists, no policy names, no role names, no counts, no JDBC
-          # URLs, no stack traces.
-          {
-            echo "target_project_reference=${MATCHED_REF:-unset}"
-            echo "username_suffix_validation=PASS"
-            echo "${READ_ONLY}"
-            grep -E '^[[:space:]]+(database|supabase_migrations_exists|migration_history|probe_status)=' probe-raw.txt \
-              | sed -E 's/^[[:space:]]+//' || true
-            if [ -n "$ERROR_CATEGORY" ]; then
-              echo "error_category=${ERROR_CATEGORY}"
-            fi
-            echo "probe_completion=${COMPLETION}"
-          } | tee probe-evidence.txt
+          # Every evidence rule lives in tools/probe-evidence.sh so it can be
+          # tested without GitHub. The script reads the raw output once and
+          # requires, independently: the probe's exit status is 0; EXACTLY ONE
+          # `read_only_transaction=server_confirmed` line and no other
+          # read_only_transaction line (enforced, on, off, missing, duplicates and
+          # unexpected values are all not_confirmed); and EXACTLY ONE
+          # `probe_status=ok` line. A previous version accepted `enforced` and
+          # rewrote it to `server_confirmed`, which published confirmation for a
+          # protection the binary never checked.
+          bash tools/probe-evidence.sh probe-raw.txt probe-evidence.txt "$STATUS" "${MATCHED_REF:-unset}"
 
           # The full probe output is inventory; it must never be published.
           # Deleted BEFORE this step can exit, on both the success and the

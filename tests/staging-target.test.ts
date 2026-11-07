@@ -166,6 +166,59 @@ describe('staging target resolution', () => {
   });
 });
 
+describe('the non-staging deny-list is additive', () => {
+  const CUSTOM_REF = 'customref00000000001';
+
+  const withRef = (ref: string, custom: string | undefined) => ({
+    ...fullEnv,
+    POS_STAGING_PROJECT_REF: ref,
+    POS_STAGING_ADMIN_USER: `postgres.${ref}`,
+    POS_NON_STAGING_REFS: custom,
+  });
+
+  it('keeps the built-in development reference with a blank custom list', () => {
+    for (const custom of ['', '   ', ' , ', undefined]) {
+      const result = resolveStagingTarget(withRef(NON_STAGING_REF, custom));
+      expect(result.ok, String(custom)).toBe(false);
+      if (!result.ok) expect(result.code).toBe('non-staging-ref');
+    }
+  });
+
+  it('keeps the built-in former verification reference', () => {
+    const result = resolveStagingTarget(withRef('numwzjogaanfhlrfgrqk', 'stagingref0000000001'));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('non-staging-ref');
+  });
+
+  it('refuses a custom reference after trimming, lower-casing and de-duplication', () => {
+    const result = resolveStagingTarget(
+      withRef(CUSTOM_REF, `  ${CUSTOM_REF.toUpperCase()} , ${CUSTOM_REF} ,, `),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('non-staging-ref');
+  });
+
+  it('accepts a reference that appears on neither list', () => {
+    const result = resolveStagingTarget(withRef('stagingref0000000001', CUSTOM_REF));
+    expect(result.ok).toBe(true);
+  });
+
+  it('refuses a malformed custom entry instead of silently ignoring it', () => {
+    for (const bad of ['not-a-ref', 'short', 'has space0000000000', 'customref0000000000!']) {
+      const result = resolveStagingTarget(withRef('stagingref0000000001', bad));
+      expect(result.ok, bad).toBe(false);
+      if (!result.ok) expect(result.code).toBe('malformed-non-staging-ref');
+    }
+  });
+
+  it('exposes exactly the two immutable built-ins', () => {
+    expect(KNOWN_NON_STAGING_REFS).toEqual([
+      'uemdrtrzlvhdtonccczt',
+      'numwzjogaanfhlrfgrqk',
+    ]);
+  });
+});
+
 describe('staging TLS material', () => {
   it('accepts a staged certificate with an independent fingerprint', () => {
     const result = validateStagingTlsEnv(fullEnv);

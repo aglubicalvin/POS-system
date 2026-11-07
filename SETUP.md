@@ -305,13 +305,16 @@ What follows from that split:
    deliberately not relaxed. Exercising the restricted account needs a separate
    test path or an explicitly designed role-aware identity mode; neither exists
    yet. Until such a test exists and passes, do not claim the probe operates under
-   the restricted account — the role is created but unproven.
+   the restricted account. The pos_probe_readonly role is defined in the proposed
+   SQL but remains uncreated and unproven. No repository workflow or test
+   currently authenticates as that role.
 4. The role-creation step never becomes part of the identity workflow: identity
    verification must stay read-only and free of DDL.
 
 `pos_probe_readonly.sql` is scoped to the designated staging project. Its header
-previously said "development project only"; that instruction is superseded,
-because the role exists to read the staging database. The DDL is
+previously said "development project only"; that instruction is superseded: the
+file targets the designated staging project and nothing else, and none of it
+has been executed. The DDL is
 environment-agnostic: a LOGIN role with no elevated attributes, role defaults,
 `CONNECT` on `postgres`, `USAGE` on `supabase_migrations`, and column `SELECT` on
 `schema_migrations.version`/`name`. Nothing in `public` or `auth` is granted, so
