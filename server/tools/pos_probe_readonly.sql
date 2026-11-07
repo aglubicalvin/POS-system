@@ -1,6 +1,27 @@
 -- pos_probe_readonly: least-privilege role for server/tools/ProbeState.java
 --
 -- STATUS: PROPOSED. NOT EXECUTED. Requires explicit manual approval.
+-- Committing, reviewing or merging this file is not evidence that it was run.
+-- No CI job, no workflow and no test executes it: the only runner is
+-- probe-readonly.ps1 with -Apply, invoked deliberately by the project owner.
+--
+-- WHO RUNS THIS, AND WITH WHICH CREDENTIAL:
+--   * It runs as the designated staging ADMINISTRATOR (PROBE_ADMIN_USER =
+--     postgres.<POS_STAGING_PROJECT_REF>), because creating a role requires
+--     CREATEROLE on the project.
+--   * It creates a SEPARATE least-privilege account, pos_probe_readonly, with its
+--     own password (set by pos_probe_readonly_password.sql; the password is never
+--     stored in this repository).
+--   * The identity probe (probe-staging-identity.yml -> ProbeState.java) also
+--     authenticates as the staging administrator and does NOT use
+--     pos_probe_readonly. Nothing in this repository currently logs in as that
+--     role.
+--   * Proving that the probe works under pos_probe_readonly needs a separate
+--     least-privilege connection test (a probe run with CHECK_USER set to that
+--     role and that account's own password). That test is future work: creating
+--     the role is not evidence that the probe can run under it.
+--   * Verifying project identity and creating this role are separate operations
+--     with separate authorization requirements.
 --
 -- TARGET SCOPE (revised): the DESIGNATED STAGING project only, run by an
 -- administrator of that project. This file previously said "DEVELOPMENT project
@@ -46,11 +67,16 @@
 -- indexes, function bodies, grants, extensions or data checksums. Do not report
 -- its output as a complete RLS, constraint or integrity audit.
 
--- 0. Confirm the target before running anything. current_database() returns
---    'postgres' on every Supabase project, so it does NOT identify the project.
---    Check the project ref in the Supabase dashboard you are logged into, and
---    check it matches the approved DEVELOPMENT ref. This query only prints the
---    executing account; the project check is manual.
+-- 0. Confirm the target before running anything.
+--    This file is intended for the DESIGNATED STAGING project ONLY.
+--    current_database() returns 'postgres' on every Supabase project, so it does
+--    NOT identify the project. The operator must open the Supabase dashboard for
+--    the project actually connected to, read that project's reference, and
+--    confirm it matches the approved POS_STAGING_PROJECT_REF. That comparison is
+--    manual and is the only accepted project-identity evidence at this point.
+--    Never run this file against production, and do not infer the project from
+--    the pooler hostname either: the pooler is shared by every project in a
+--    region. This query only prints the executing account and database name.
 select current_user, current_database();
 
 -- 1. Role: LOGIN only, no elevated attributes.

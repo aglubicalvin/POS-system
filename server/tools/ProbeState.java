@@ -59,7 +59,11 @@ import java.io.InputStream;
  *    target allowed without TLS. Loopback is decided by exact name or by strict
  *    literal parsing, never by DNS resolution and never by a string prefix, so
  *    a name such as 127.db.attacker.example is a remote host and is refused.
- *    Every other host is refused.
+ *    The URL authority is validated as a whole, not mined for a plausible host:
+ *    a bracketed IPv6 literal is accepted only when nothing but an optional
+ *    valid port follows the closing bracket, so [::1]attacker.example:5432 is
+ *    unparseable and is refused instead of being read as ::1. Every other host
+ *    is refused.
  *
  * Exit codes:
  *   2  CHECK_URL missing, or staging credentials missing
@@ -474,22 +478,146 @@ public class ProbeState {
     /**
      * Bare hostname of a JDBC/libpq URL: no userinfo, port, path or query.
      *
-     * IPv6 literals are only accepted in bracket notation (`[::1]:5432`). An
-     * unbracketed host with more than one colon is ambiguous and is reported as
+     * The authority is validated as a WHOLE rather than searched for a plausible
+     * host substring. Extracting the text inside the first pair of brackets would
+     * accept `[::1]attacker.example:5432` as the loopback host `::1` and hand the
+     * raw URL to the driver, which resolves it as the attacker's name; here any
+     * character after the closing bracket other than an optional valid port makes
+     * the whole authority unparseable.
+     *
+     * IPv6 literals are accepted only in bracket notation. An unbracketed
+     * authority with more than one colon is ambiguous and is reported as
      * unparseable (empty), which every caller refuses rather than guesses.
      */
     static String hostName(String url) {
         String s = hostOf(url);
         int slash = s.indexOf('/');
         if (slash >= 0) s = s.substring(0, slash);
-        if (s.startsWith("[")) {
+        int query = s.indexOf('?');
+        if (query >= 0) s = s.substring(0, query);
+        if (s.isEmpty()) return "";
+
+        if (s.charAt(0) == '[') {
             int close = s.indexOf(']');
-            return close < 0 ? "" : s.substring(1, close);
+            if (close < 0) return "";
+            String literal = s.substring(1, close);
+            if (!isIpv6Literal(literal)) return "";
+            String rest = s.substring(close + 1);
+            if (rest.isEmpty()) return literal;
+            return validPortSuffix(rest) ? literal : "";
         }
+
+        String host;
+        String port;
         int first = s.indexOf(':');
-        if (first < 0) return s;
-        if (s.indexOf(':', first + 1) >= 0) return "";
-        return s.substring(0, first);
+        if (first < 0) {
+            host = s;
+            port = null;
+        } else {
+            if (s.indexOf(':', first + 1) >= 0) return "";
+            host = s.substring(0, first);
+            port = s.substring(first + 1);
+        }
+        // No accepted target contains a bracket in a bare host, and such a host
+        // is never passed to the driver on the strength of a guess.
+        if (host.isEmpty() || host.indexOf('[') >= 0 || host.indexOf(']') >= 0) return "";
+        if (port != null && !isValidPort(port)) return "";
+        return host;
+    }
+
+    /** ":<port>": the only suffix allowed after a bracketed IPv6 literal. */
+    static boolean validPortSuffix(String suffix) {
+        return suffix.length() > 1 && suffix.charAt(0) == ':' && isValidPort(suffix.substring(1));
+    }
+
+    /**
+     * A decimal TCP port in 1-65535. No sign, whitespace, leading zero or
+     * non-digit is accepted: two spellings of one endpoint would let a validator
+     * and the driver disagree about the destination.
+     */
+    static boolean isValidPort(String port) {
+        if (port == null || port.isEmpty() || port.length() > 5) return false;
+        if (port.length() > 1 && port.charAt(0) == '0') return false;
+        for (int i = 0; i < port.length(); i++) {
+            char ch = port.charAt(i);
+            if (ch < '0' || ch > '9') return false;
+        }
+        int value = Integer.parseInt(port);
+        return value >= 1 && value <= 65535;
+    }
+
+    /**
+     * True only for a syntactically valid IPv6 address literal (RFC 4291): two
+     * to eight 16-bit hexadecimal groups, at most one "::" compression standing
+     * for at least one group, and an optional dotted-quad tail in the final two
+     * groups. This is a shape check only; accepting an address here does not make
+     * it loopback, and only ::1 (expanded or compressed) is treated as such.
+     */
+    static boolean isIpv6Literal(String text) {
+        if (text == null || text.isEmpty() || text.length() > 45) return false;
+        if (!text.matches("[0-9A-Fa-f:.]+")) return false;
+
+        int compression = text.indexOf("::");
+        // At most one compression marker: "1::2::3" is not an address.
+        if (compression >= 0 && text.indexOf("::", compression + 1) >= 0) return false;
+
+        String head = compression >= 0 ? text.substring(0, compression) : text;
+        String tail = compression >= 0 ? text.substring(compression + 2) : null;
+
+        int used = 0;
+        if (!head.isEmpty()) {
+            used = ipv6GroupCount(head, false);
+            if (used < 0) return false;
+        }
+        if (tail == null) return used == 8;
+        if (!tail.isEmpty()) {
+            int tailGroups = ipv6GroupCount(tail, true);
+            if (tailGroups < 0) return false;
+            used += tailGroups;
+        }
+        // The compression must stand for at least one 16-bit group.
+        return used <= 7;
+    }
+
+    /**
+     * Groups in one colon-separated run, counting an embedded dotted quad as two
+     * groups, or -1 when the run is malformed. A dotted quad is only valid in the
+     * last positions, so it is refused when it appears before a "::" marker.
+     */
+    private static int ipv6GroupCount(String run, boolean allowDottedQuad) {
+        String[] parts = run.split(":", -1);
+        int groups = 0;
+        for (int i = 0; i < parts.length; i++) {
+            String part = parts[i];
+            if (part.indexOf('.') >= 0) {
+                if (!allowDottedQuad || i != parts.length - 1) return -1;
+                if (!isDottedQuad(part)) return -1;
+                groups += 2;
+                continue;
+            }
+            if (part.isEmpty() || part.length() > 4) return -1;
+            for (int j = 0; j < part.length(); j++) {
+                if (Character.digit(part.charAt(j), 16) < 0) return -1;
+            }
+            groups++;
+        }
+        return groups;
+    }
+
+    /** Syntactic dotted quad, independent of 127/8. */
+    private static boolean isDottedQuad(String text) {
+        String[] parts = text.split("\\.", -1);
+        if (parts.length != 4) return false;
+        for (String part : parts) {
+            if (part.isEmpty() || part.length() > 3) return false;
+            if (part.length() > 1 && part.charAt(0) == '0') return false;
+            for (int i = 0; i < part.length(); i++) {
+                char ch = part.charAt(i);
+                if (ch < '0' || ch > '9') return false;
+            }
+            if (Integer.parseInt(part) > 255) return false;
+        }
+        return true;
     }
 
     /**

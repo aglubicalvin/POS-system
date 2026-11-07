@@ -127,6 +127,17 @@ by a string prefix and never by DNS, so `127.db.attacker.example`,
 targets and are refused before a connection is attempted. Everything else is
 refused with exit 8.
 
+The authority is validated as a whole, never mined for a plausible host
+substring. A bracketed IPv6 literal is accepted only when everything inside the
+brackets is a well-formed address and nothing but an optional decimal port
+(1-65535, no leading zero) follows the closing bracket. `[::1]`,
+`[::1]:5432` and `[0:0:0:0:0:0:0:1]:5432` are loopback; `[::1]attacker.example`,
+`[::1]junk:5432`, `[::1]:0`, `[::1]:65536`, `[::1]:5432:extra`, `[::1`, `[]`, and
+the ambiguous unbracketed `::1:5432` are refused with exit 8 before the probe
+body runs. Only `::1` counts as loopback: an IPv4-mapped literal such as
+`[::ffff:127.0.0.1]` is syntactically valid but is not accepted as a local
+target.
+
 **ProbeState exit codes:** 2 missing `CHECK_URL` or credentials, 3 missing
 `PROBE_CONFIRM=yes`, 4 production-looking host, 5 connection failed, 6 read-only
 not confirmed, 7 probe failed, 8 unrecognised or mismatched target, 9 missing or
@@ -239,16 +250,42 @@ connection from the validated host, port and database, then sets `sslmode` and
 place. The configured certificate must also be **readable** by the process, not
 merely present.
 
-### Identity vs role creation
+### Identity verification vs least-privilege role creation
 
-- **Identity probe** (`ProbeState.java`, `execProbeState`, `probe-staging-identity.yml`):
-  read-only audit of an already-provisioned project. It never creates, alters or
-  deletes roles, queries no role management API, and never applies migrations.
-- **Role creation** (`probe-readonly.ps1` with `-Apply`, `pos_probe_readonly.sql`):
-  deliberate step that creates the `pos_probe_readonly` role on the *designated*
-  staging project. It is gated by `-Apply`, requires the operator's explicit
-  approval, and must never run against the development or the former verification
-  project even by name.
+These are two different operations, with different credentials and different
+authorization requirements.
+
+- **Initial identity verification** (`ProbeState.java`, `execProbeState`,
+  `probe-staging-identity.yml`): read-only audit of an already-provisioned
+  project, and it authenticates as the **designated staging administrator**. The
+  workflow maps `PROBE_ADMIN_USER` into `CHECK_USER` and `PROBE_ADMIN_PASS` into
+  `CHECK_PASS`, and the probe accepts that username only when it is exactly
+  `postgres.<POS_STAGING_PROJECT_REF>`. It never creates, alters or deletes roles,
+  queries no role management API, never applies migrations, and **does not use
+  `pos_probe_readonly`**.
+- **Least-privilege role creation** (`probe-readonly.ps1` with `-Apply`,
+  `pos_probe_readonly.sql`, `pos_probe_readonly_password.sql`): a deliberate step,
+  run with the same administrator credential, that creates the *separate*
+  `pos_probe_readonly` account on the *designated* staging project and sets its
+  own password (never stored in the repository). It is gated by `-Apply`, requires
+  the operator's explicit approval, and must never run against the development or
+  the former verification project even by name.
+
+What follows from that split:
+
+1. Creating the account and verifying project identity are separate activities.
+   Identity verification only reads; role creation adds a persistent login to the
+   project and needs its own approval.
+2. The identity workflow authenticates as the administrator, so a green identity
+   run says nothing about `pos_probe_readonly`. No workflow currently logs in as
+   that role, and the probe has not been exercised under it.
+3. A **dedicated least-privilege connection test is still future work**: a probe
+   run with `CHECK_USER` set to `pos_probe_readonly` (or the equivalent pooler
+   login) and that account's own password. Until that test exists and passes, do
+   not claim the probe operates under the restricted account — the role is created
+   but unproven.
+4. The role-creation step never becomes part of the identity workflow: identity
+   verification must stay read-only and free of DDL.
 
 `pos_probe_readonly.sql` is scoped to the designated staging project. Its header
 previously said "development project only"; that instruction is superseded,

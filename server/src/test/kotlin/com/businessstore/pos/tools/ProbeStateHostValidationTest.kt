@@ -2,6 +2,7 @@ package com.businessstore.pos.tools
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.io.File
@@ -213,6 +214,76 @@ class ProbeStateHostValidationTest {
         // treated as loopback and is refused rather than guessed at.
         val unbracketed = runProbe("jdbc:postgresql://::1:5432/postgres", "probe_local")
         assertEquals(8, unbracketed.exitCode, unbracketed.output)
+    }
+
+    @Test
+    fun `a complete bracketed IPv6 authority is accepted as loopback`() {
+        // Port 1 is closed, so exit 5 proves the authority passed validation and
+        // the driver was reached. These are the forms whose port is explicit.
+        for (url in listOf(
+            "jdbc:postgresql://[::1]:1/postgres",
+            "jdbc:postgresql://[0:0:0:0:0:0:0:1]:1/postgres",
+        )) {
+            val result = runProbe(url, "probe_local")
+            assertEquals(
+                5,
+                result.exitCode,
+                "$url must pass validation and fail only at connect:\n${result.output}",
+            )
+            assertTrue(result.output.contains("read-only state probe"), result.output)
+            assertFalse(result.output.contains("read_only_transaction="), result.output)
+        }
+
+        // The port is optional. On a host where 5432 is filtered the connect can
+        // block, so these assert only that the target was ACCEPTED (the probe
+        // body was reached) rather than pinning the failure mechanism.
+        for (url in listOf(
+            "jdbc:postgresql://[::1]/postgres",
+            "jdbc:postgresql://[0:0:0:0:0:0:0:1]/postgres",
+        )) {
+            val result = runProbe(url, "probe_local")
+            assertNotEquals(8, result.exitCode, "$url must not be refused:\n${result.output}")
+            assertTrue(
+                result.output.contains("read-only state probe"),
+                "an omitted port must still be an accepted loopback target:\n${result.output}",
+            )
+        }
+    }
+
+    @Test
+    fun `a malformed bracketed IPv6 authority is refused before the probe starts`() {
+        // The whole authority is validated, not just the text inside the first
+        // brackets: every case below must stop at exit 8, before the probe header
+        // is printed and before DriverManager is reached.
+        val rejected = listOf(
+            "jdbc:postgresql://[::1]attacker.example/postgres",
+            "jdbc:postgresql://[::1]attacker.example:5432/postgres",
+            "jdbc:postgresql://[::1]junk:5432/postgres",
+            "jdbc:postgresql://[::1]:invalid/postgres",
+            "jdbc:postgresql://[::1]:0/postgres",
+            "jdbc:postgresql://[::1]:65536/postgres",
+            "jdbc:postgresql://[::1]:5432:extra/postgres",
+            "jdbc:postgresql://[::1]:/postgres",
+            "jdbc:postgresql://[::1/postgres",
+            "jdbc:postgresql://[]:5432/postgres",
+            "jdbc:postgresql://[gggg::1]:5432/postgres",
+            "jdbc:postgresql://[::1]:5432,/postgres",
+            "jdbc:postgresql://[::1]@attacker.example:5432/postgres",
+            "jdbc:postgresql://::1:5432/postgres",
+        )
+        for (url in rejected) {
+            val result = runProbe(url, "probe_local")
+            assertEquals(8, result.exitCode, "$url must be refused with exit 8:\n${result.output}")
+            assertTrue(result.output.contains("REFUSED"), "expected a refusal:\n${result.output}")
+            assertFalse(
+                result.output.contains("read-only state probe"),
+                "$url must be refused before the probe body:\n${result.output}",
+            )
+            assertFalse(
+                result.output.contains("read_only_transaction="),
+                "$url must never report a confirmed read-only session:\n${result.output}",
+            )
+        }
     }
 
     // ---- project identity --------------------------------------------------
