@@ -66,6 +66,12 @@ jobs:
           # The environment calls this PROBE_ADMIN_USER; the validator module reads
           # POS_STAGING_ADMIN_USER. Map it rather than renaming the stored variable.
           POS_STAGING_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
+          # Shared staging connection contract, consumed by both ProbeState (JDBC)
+          # and probe-readonly.ps1 (PowerShell). Both paths validate these three
+          # values against the same staging contract before any connection is made.
+          POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
+          POS_STAGING_DB_ROOT_CERT: ${{ vars.POS_STAGING_DB_ROOT_CERT }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
         run: |
           set -euo pipefail
 
@@ -92,7 +98,11 @@ jobs:
       - name: Run read-only staging identity probe
         shell: bash
         env:
-          CHECK_URL: jdbc:postgresql://aws-0-eu-west-2.pooler.supabase.com:5432/postgres
+          POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
+          POS_STAGING_POOLER_HOST: ${{ vars.POS_STAGING_POOLER_HOST }}
+          POS_STAGING_DB_ROOT_CERT: ${{ vars.POS_STAGING_DB_ROOT_CERT }}
+          POS_STAGING_DB_ROOT_CERT_SHA256: ${{ vars.POS_STAGING_DB_ROOT_CERT_SHA256 }}
+          CHECK_URL: jdbc:postgresql://${{ vars.POS_STAGING_POOLER_HOST }}:5432/postgres
           CHECK_USER: ${{ vars.PROBE_ADMIN_USER }}
           CHECK_PASS: ${{ secrets.PROBE_ADMIN_PASS }}
           PROBE_CONFIRM: "yes"

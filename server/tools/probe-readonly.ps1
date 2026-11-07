@@ -8,9 +8,24 @@
 #
 # Required environment (never put these in a file or in Git):
 #   POS_STAGING_PROJECT_REF  designated staging project reference (no default)
+#   POS_STAGING_POOLER_HOST  pooler hostname from the shared staging contract
+#   POS_STAGING_DB_ROOT_CERT the staged root certificate (file path)
+#   POS_STAGING_DB_ROOT_CERT_SHA256  SHA-256 of that certificate's DER encoding
 #   PROBE_ADMIN_USER         e.g. postgres.<ref> (must match the reference)
 #   PROBE_ADMIN_PASS         admin password
 #   PROBE_PW                 password to set for pos_probe_readonly
+#
+# TLS and pooler rules (enforced here and in the Java ProbeState path):
+#   - The pooler hostname is the SAME value the JDBC identity-probe path consumes;
+#     it is validated against the shared staging contract first, so both paths use
+#     exactly one approved pooler endpoint and no region is inferred from the
+#     project reference or from any previously used endpoint.
+#   - sslmode=verify-full only. There is no prefer/require/allow/disable fallback.
+#   - The staged root certificate is written to private temp material and is
+#     deleted before exit on success and failure, so it is never left on disk or
+#     printed. The independently supplied SHA-256 over the certificate's DER
+#     encoding must match the certificate we actually write; a mismatch refuses
+#     the target before anything is run.
 
 param([switch]$Apply)
 
@@ -18,11 +33,9 @@ $ErrorActionPreference = 'Stop'
 $ServerDir = Split-Path -Parent $PSScriptRoot
 $Sql = Join-Path $PSScriptRoot 'pos_probe_readonly.sql'
 $Assert = Join-Path $PSScriptRoot 'pos_probe_readonly_assert.sql'
-$HostName = 'aws-0-eu-west-2.pooler.supabase.com'
 
-# Fail closed: the staging project must be designated explicitly. Known
-# non-staging projects (the documented development project) are refused even if
-# they are named here, so a development database can never be probed as staging.
+# Fail closed: the staging project must be designated explicitly, and the three
+# shared-staging values must be present. Known non-staging projects are refused.
 $StagingRef = $env:POS_STAGING_PROJECT_REF
 if ([string]::IsNullOrWhiteSpace($StagingRef)) {
     throw 'BLOCKED: POS_STAGING_PROJECT_REF has not been explicitly configured. The staging project must be designated by the project owner.'
@@ -31,12 +44,57 @@ $StagingRef = $StagingRef.Trim()
 if ($StagingRef -notmatch '^[a-z0-9]{20}$') {
     throw 'BLOCKED: POS_STAGING_PROJECT_REF is not a valid Supabase project reference.'
 }
-# Known non-staging projects: development and the former verification project.
-# Neither may ever be designated as staging, even by name.
 $KnownNonStaging = @('uemdrtrzlvhdtonccczt', 'numwzjogaanfhlrfgrqk')
 if ($KnownNonStaging -contains $StagingRef) {
     throw 'BLOCKED: POS_STAGING_PROJECT_REF names a known non-staging project. Set the dedicated staging reference.'
 }
+
+$PoolerHost = $env:POS_STAGING_POOLER_HOST
+if ([string]::IsNullOrWhiteSpace($PoolerHost)) {
+    throw 'BLOCKED: POS_STAGING_POOLER_HOST has not been explicitly configured. The staging connection must use an approved Supabase pooler hostname; there is no default, no region inference, and no fallback to a previously used endpoint.'
+}
+$Normalized = $PoolerHost.Trim().ToLowerInvariant()
+if ($Normalized -notmatch '^aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com$') {
+    throw 'BLOCKED: POS_STAGING_POOLER_HOST does not name an approved Supabase pooler endpoint. Expected exactly aws-<n>-<region>.pooler.supabase.com, with <n> one or more digits and <region> one or more lowercase letters, digits or hyphens. IP literals, loopback names, arbitrary DNS names, URIs, paths, credentials, query strings and ports are refused.'
+}
+
+$RootCert = $env:POS_STAGING_DB_ROOT_CERT
+if ([string]::IsNullOrWhiteSpace($RootCert)) {
+    throw 'BLOCKED: POS_STAGING_DB_ROOT_CERT has not been explicitly configured. A staged root certificate is mandatory for the staging contract.'
+}
+$RootCertSha256 = $env:POS_STAGING_DB_ROOT_CERT_SHA256
+if ([string]::IsNullOrWhiteSpace($RootCertSha256)) {
+    throw 'BLOCKED: POS_STAGING_DB_ROOT_CERT_SHA256 has not been explicitly configured. A staged certificate fingerprint is mandatory for the staging contract.'
+}
+if ($RootCertSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw 'BLOCKED: POS_STAGING_DB_ROOT_CERT_SHA256 is not 64 hex characters. Verify the SHA-256 of the staged root certificate.'
+}
+
+# Verify the independently supplied fingerprint against the certificate we are
+# actually about to trust, over its DER encoding -- the same rule ProbeState
+# enforces. A shape check alone would accept any certificate.
+if (-not (Test-Path -LiteralPath $RootCert -PathType Leaf)) {
+    throw 'BLOCKED: POS_STAGING_DB_ROOT_CERT does not name a readable file.'
+}
+try {
+    $b64 = ((Get-Content -Raw -LiteralPath $RootCert) -split "`r?`n" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('-----') }) -join ''
+    $der = [Convert]::FromBase64String($b64)
+} catch {
+    throw 'BLOCKED: POS_STAGING_DB_ROOT_CERT is not a readable PEM certificate.'
+}
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $actualSha256 = ($sha256.ComputeHash($der) | ForEach-Object { $_.ToString('x2') }) -join ''
+} finally {
+    $sha256.Dispose()
+}
+$der = $null
+if ($actualSha256 -ne $RootCertSha256.Trim().Replace(':', '').ToLowerInvariant()) {
+    throw 'BLOCKED: the SHA-256 of the staged root certificate does not match POS_STAGING_DB_ROOT_CERT_SHA256. The certificate may have been rotated, or this is not the approved staging target.'
+}
+
 if ($env:PROBE_ADMIN_USER -ne "postgres.$StagingRef") {
     throw 'BLOCKED: PROBE_ADMIN_USER does not belong to the designated staging project. Expected postgres.<POS_STAGING_PROJECT_REF>.'
 }
@@ -47,7 +105,8 @@ if (-not $env:PROBE_ADMIN_PASS -or -not $env:PROBE_PW) {
 $Log = Join-Path $ServerDir "build/probe-readonly-$(Get-Date -Format yyyyMMdd-HHmmss).log"
 New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
 
-Write-Host "Target host: $HostName  staging project: $StagingRef  database: postgres"
+# The pooler hostname is the ONLY host ever printed. No cert contents, no secrets.
+Write-Host "Target pooler host: $Normalized  staging project: $StagingRef  database: postgres"
 Write-Host "Scripts: $Sql , $Assert"
 Write-Host "Log: $Log"
 
@@ -61,22 +120,26 @@ if (-not $Apply) {
 if ($env:PROBE_PW -match '[\r\n\x00]') {
     throw 'Refusing to run: PROBE_PW must not contain line breaks or NUL.'
 }
-$uri = "host=$HostName port=5432 dbname=postgres user=$($env:PROBE_ADMIN_USER) sslmode=require"
+
+# Build the pooler connection string from the validated staging contract only.
+# No hardcoded host, no credentials, sslmode=verify-full + sslrootcert, libpq.
+$uri = "host=$Normalized port=5432 dbname=postgres user=$($env:PROBE_ADMIN_USER) sslmode=verify-full sslrootcert=$RootCert"
+
 $dockerArgs = @(
     'run', '--rm', '-i',
     '-e', 'PGPASSWORD',
     '-v', "$PSScriptRoot`:/work:ro",
     'postgres:17',
     'psql', $uri, '--single-transaction', '-v', 'ON_ERROR_STOP=1',
-    '-c', "SET password_encryption = 'scram-sha-256'",
     '-f', '/work/pos_probe_readonly.sql',
     '-f', '/work/pos_probe_readonly_password.sql',
     '-f', '/work/pos_probe_readonly_assert.sql'
 )
+
 $env:PGPASSWORD = $env:PROBE_ADMIN_PASS
 try {
-    # Windows PowerShell turns native stderr (including psql's prompts) into
-    # errors. Keep it non-terminating and check the native exit code explicitly.
+    # Windows PowerShell turns native stderr into errors. Keep it non-terminating
+    # and check the native exit code explicitly.
     $ErrorActionPreference = 'Continue'
     @($env:PROBE_PW, $env:PROBE_PW) | & docker @dockerArgs 2>&1 | Tee-Object -FilePath $Log
     $code = $LASTEXITCODE
