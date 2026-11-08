@@ -68,9 +68,73 @@ the raw transcript or the temporary certificate copy was invisible: the run
 reported success while sensitive material remained on disk.
 
 Returns $null on success, or a short message on failure. It never throws, so it
-cannot replace the primary error, and the message never includes file contents
-or credential values.
+<#
+.SYNOPSIS
+Cleanup result accumulated across every sensitive-path deletion.
+
+.DESCRIPTION
+Warnings alone do not change a script's exit status, so a failed deletion of the
+raw transcript or the temporary certificate copy could leave sensitive material
+on disk while the run reported success. Every deletion now records its outcome
+here, all deletions are attempted regardless of earlier failures, and the
+collected result is applied to the final exit status by Set-ProbeFailure.
+
+Messages name only the path kind. They never include file contents, the
+transcript, or credential values.
 #>
+$script:CleanupFailures = [System.Collections.Generic.List[string]]::new()
+
+<#
+.SYNOPSIS
+Attempt deletion of every sensitive path, collecting failures.
+
+.DESCRIPTION
+Runs each deletion even if an earlier one failed, so one stuck file cannot leave
+the rest behind. Returns the failures recorded during this call.
+#>
+function Clear-SensitivePaths {
+    param(
+        [Parameter(Mandatory)] [object[]] $Targets
+    )
+    $before = $script:CleanupFailures.Count
+    foreach ($target in $Targets) {
+        $message = Remove-SensitivePath -Path $target.Path -Label $target.Label -Recurse:$target.Recurse
+        if ($null -ne $message) {
+            [void]$script:CleanupFailures.Add($message)
+            Write-Warning "cleanup: $message"
+        }
+    }
+    return @($script:CleanupFailures | Select-Object -Skip $before)
+}
+
+<#
+.SYNOPSIS
+Exit with the primary status, adding a non-zero status if cleanup failed.
+
+.DESCRIPTION
+The primary failure is never replaced: when it is already non-zero it is used
+as-is, and cleanup failures are reported alongside it. When the primary status
+is zero but cleanup failed, the run must not report success, so a dedicated
+cleanup exit code is used. 3 is chosen so it cannot be confused with psql's own
+status or with the generic 1 used for an unverified summary.
+#>
+function Set-ProbeFailure {
+    param(
+        [Parameter(Mandatory)] [int] $PrimaryStatus,
+        [Parameter(Mandatory)] [string] $Context
+    )
+    if ($script:CleanupFailures.Count -eq 0) {
+        exit $PrimaryStatus
+    }
+    $joined = $script:CleanupFailures -join '; '
+    if ($PrimaryStatus -ne 0) {
+        Write-Host "::error::$Context failed with exit code $PrimaryStatus, and sensitive-file cleanup also failed: $joined"
+        exit $PrimaryStatus
+    }
+    Write-Host "::error::$Context succeeded but sensitive-file cleanup failed: $joined. Temporary sensitive material may remain on disk."
+    exit 3
+}
+
 function Remove-SensitivePath {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -338,22 +402,22 @@ try {
     $code = $LASTEXITCODE
 } catch {
     # A failure before the reduction reached its own cleanup must not leave even
-    # a partial transcript behind. The original error stays primary; a cleanup
-    # failure is reported as a warning rather than replacing it.
-    $cleanupFailure = Remove-SensitivePath -Path $RawLog -Label 'raw transcript'
-    if ($null -ne $cleanupFailure) {
-        Write-Warning "cleanup: $cleanupFailure"
-    }
+    # a partial transcript behind. The original error stays primary; cleanup
+    # failures are collected and reported when the exit status is finally set.
+    [void](Clear-SensitivePaths -Targets @(
+        @{ Path = $RawLog; Label = 'raw transcript' }
+    ))
     throw
 } finally {
     $ErrorActionPreference = 'Stop'
     $ProbePw = $null
     $AdminPass = $null
     Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
-    $certCleanupFailure = Remove-SensitivePath -Path $CertDir -Label 'temporary certificate directory' -Recurse
-    if ($null -ne $certCleanupFailure) {
-        Write-Warning "cleanup: $certCleanupFailure"
-    }
+    # Every sensitive path is attempted here, even if the transcript above
+    # could not be removed.
+    [void](Clear-SensitivePaths -Targets @(
+        @{ Path = $CertDir; Label = 'temporary certificate directory'; Recurse = $true }
+    ))
 }
 
 # Reduce the transcript, then delete it whether or not the reduction succeeded.
@@ -367,7 +431,11 @@ try {
 } catch {
     $sanitizerFailure = $_
 } finally {
-    $transcriptCleanupFailure = Remove-SensitivePath -Path $RawLog -Label 'raw transcript'
+    # Collected, not merely assigned: a result nobody checks is the defect this
+    # fix removes.
+    [void](Clear-SensitivePaths -Targets @(
+        @{ Path = $RawLog; Label = 'raw transcript' }
+    ))
 }
 
 if ($null -ne $sanitizerFailure) {
@@ -377,6 +445,7 @@ if ($null -ne $sanitizerFailure) {
         'evidence_status=rejected'
         "psql_exit=$code"
     )
+    Set-ProbeFailure -PrimaryStatus 1 -Context 'evidence reduction'
     throw "BLOCKED: the psql transcript could not be reduced to allowlisted evidence, so the run is refused and nothing raw was written to the log or uploaded. $($sanitizerFailure.Exception.Message)"
 }
 
@@ -386,10 +455,13 @@ Set-Content -LiteralPath $EvidenceFile -Encoding ASCII -Value $summary
 # sanitizing the output must not rewrite the code.
 if ($code -ne 0) {
     Write-Host "::error::psql failed with exit code $code. Sanitized evidence: $EvidenceFile"
-    exit $code
+    # The primary status is preserved exactly; cleanup failures are added to the
+    # message, never substituted for the status.
+    Set-ProbeFailure -PrimaryStatus $code -Context 'psql'
 }
 if (-not ($summary -contains 'evidence_status=ok')) {
     Write-Host "::error::the psql run did not produce a verified evidence summary. See $EvidenceFile"
-    exit 1
+    Set-ProbeFailure -PrimaryStatus 1 -Context 'evidence summary'
 }
 Write-Host "Completed. Sanitized evidence: $EvidenceFile"
+Set-ProbeFailure -PrimaryStatus 0 -Context 'probe'
