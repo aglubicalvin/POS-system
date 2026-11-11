@@ -23,6 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Dry run or apply
+        id: probe
         shell: pwsh
         env:
           PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
@@ -34,7 +35,7 @@ jobs:
           else { ./server/tools/probe-readonly.ps1 }
 
       - name: Upload sanitized evidence
-        if: always()
+        if: ${{ always() && steps.probe.outputs.evidence_ready == 'true' }}
         uses: actions/upload-artifact@v7.0.2
         with:
           # Only the allowlisted summary: the raw psql transcript never leaves the runner.

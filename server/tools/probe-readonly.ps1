@@ -58,6 +58,24 @@ $Assert = Join-Path $PSScriptRoot 'pos_probe_readonly_assert.sql'
 $Preflight = Join-Path $PSScriptRoot 'pos_probe_readonly_preflight.sql'
 $EvidenceFile = Join-Path $ServerDir 'build/probe-readonly-evidence.txt'
 . (Join-Path $PSScriptRoot 'probe-role-evidence.ps1')
+
+# A previous run's result must never be mistaken for this one. An -Apply run
+# REMOVES any existing artifact before any step that can terminate the run, so a
+# refusal during validation cannot leave a stale evidence_status=ok for the
+# workflow to upload. A run that gets past validation records an explicit
+# not_run state below, before credentials are read. A dry run never touches the
+# artifact, and a removal failure fails closed.
+if ($Apply) {
+    try {
+        if (Test-Path -LiteralPath $EvidenceFile) {
+            Remove-Item -LiteralPath $EvidenceFile -Force -ErrorAction Stop
+        }
+    } catch {
+        # Fail closed: if the previous result cannot be cleared, this run cannot
+        # prove its own result, so it must not proceed.
+        throw 'BLOCKED: a previous sanitized evidence artifact could not be removed, so this run cannot prove its own result.'
+    }
+}
 <#
 .SYNOPSIS
 Delete a temporary sensitive path, recording failure instead of hiding it.
@@ -83,6 +101,10 @@ Messages name only the path kind. They never include file contents, the
 transcript, or credential values.
 #>
 $script:CleanupFailures = [System.Collections.Generic.List[string]]::new()
+
+# Exit status when the probe itself succeeded but required cleanup failed.
+# Distinct from psql's documented 0-3 range (see Set-ProbeFailure).
+$script:CleanupOnlyExitCode = 4
 
 <#
 .SYNOPSIS
@@ -115,8 +137,15 @@ Exit with the primary status, adding a non-zero status if cleanup failed.
 The primary failure is never replaced: when it is already non-zero it is used
 as-is, and cleanup failures are reported alongside it. When the primary status
 is zero but cleanup failed, the run must not report success, so a dedicated
-cleanup exit code is used. 3 is chosen so it cannot be confused with psql's own
-status or with the generic 1 used for an unverified summary.
+cleanup exit code is used.
+
+$script:CleanupOnlyExitCode = 4. The previous value, 3, was WRONG: psql documents
+3 as "script error when ON_ERROR_STOP is set", and this script runs psql with
+ON_ERROR_STOP=1, so a real psql failure could be indistinguishable from a
+cleanup-only failure. 4 lies outside psql's documented 0-3 range.
+
+A psql failure of any status -- including 3 -- is preserved exactly; cleanup
+failure is reported alongside it and never substitutes a different status.
 #>
 function Set-ProbeFailure {
     param(
@@ -132,7 +161,7 @@ function Set-ProbeFailure {
         exit $PrimaryStatus
     }
     Write-Host "::error::$Context succeeded but sensitive-file cleanup failed: $joined. Temporary sensitive material may remain on disk."
-    exit 3
+    exit $script:CleanupOnlyExitCode
 }
 
 function Remove-SensitivePath {
@@ -277,6 +306,36 @@ if (-not $Apply) {
     exit 0
 }
 
+# Past this point the run can still fail before psql produces a summary: the
+# setup guard, credential loading, or a database-step exception. Record that this
+# run started and did not complete, so the artifact can never be mistaken for a
+# successful result.
+try {
+    New-Item -ItemType Directory -Force -Path (Split-Path $EvidenceFile) | Out-Null
+    Set-Content -LiteralPath $EvidenceFile -Encoding ASCII -Value @(
+        'evidence_schema=probe-role/v1'
+        'evidence_status=not_run'
+    )
+} catch {
+    throw 'BLOCKED: the sanitized evidence artifact could not be set to a not-run state, so this run cannot prove its own result.'
+}
+
+# The workflow may upload evidence only after this invocation has removed the
+# previous artifact and initialized this run's sanitized not-run record. A
+# local invocation has no GITHUB_OUTPUT and keeps its existing behavior.
+$githubOutput = [System.Environment]::GetEnvironmentVariable('GITHUB_OUTPUT')
+if ($null -ne $githubOutput) {
+    try {
+        [System.IO.File]::AppendAllText(
+            $githubOutput,
+            "evidence_ready=true`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+    } catch {
+        throw 'BLOCKED: the sanitized evidence readiness output could not be written.'
+    }
+}
+
 # psql's \password reads two lines from stdin and hashes client-side. Reject
 # line breaks so the two prompts cannot consume different values.
 if ($env:PROBE_PW -match '[\r\n\x00]') {
@@ -348,6 +407,32 @@ $dockerArgs = @(
 
 $env:PGPASSWORD = $AdminPass
 $code = 1
+
+# The certificate directory was created just above, outside the protected region,
+# and PGPASSWORD is now in the environment. If anything from here to the try
+# below threw, the directory would be abandoned with no cleanup, so this guard
+# covers that window.
+try {
+    if (-not (Test-Path -LiteralPath $CertDir)) {
+        throw "temporary certificate directory is missing: $CertDir"
+    }
+} catch {
+    $env:PGPASSWORD = $null
+    $ProbePw = $null
+    $AdminPass = $null
+    [void](Clear-SensitivePaths -Targets @(
+        @{ Path = $RawLog; Label = 'raw transcript' },
+        @{ Path = $CertDir; Label = 'temporary certificate directory'; Recurse = $true }
+    ))
+    Write-Host "::error::probe setup failed before the database step"
+    Set-ProbeFailure -PrimaryStatus 1 -Context 'setup'
+}
+
+# Set by the Docker catch block below when the invocation throws before returning
+# a status. The exit happens after the finally block, so cleanup failures on that
+# path still reach the exit status.
+$dockerFailure = $null
+
 try {
     # Create the transcript owner-only BEFORE its first byte. A permissive umask
     # on a shared Linux runner would otherwise leave the psql output (database,
@@ -401,13 +486,13 @@ try {
         Out-File -LiteralPath $RawLog -Encoding utf8
     $code = $LASTEXITCODE
 } catch {
-    # A failure before the reduction reached its own cleanup must not leave even
-    # a partial transcript behind. The original error stays primary; cleanup
-    # failures are collected and reported when the exit status is finally set.
+    # Docker threw before returning a status. Record it and let the finally
+    # block finish cleanup; the exit happens AFTER it, so cleanup failures on
+    # this path still reach the exit status. A bare throw here was a defect.
     [void](Clear-SensitivePaths -Targets @(
         @{ Path = $RawLog; Label = 'raw transcript' }
     ))
-    throw
+    $dockerFailure = $_
 } finally {
     $ErrorActionPreference = 'Stop'
     $ProbePw = $null
@@ -418,6 +503,21 @@ try {
     [void](Clear-SensitivePaths -Targets @(
         @{ Path = $CertDir; Label = 'temporary certificate directory'; Recurse = $true }
     ))
+}
+
+# Exit only after the finally block has run, so the status reflects cleanup.
+# Docker never returned a psql status on this path; use the wrapper-specific
+# status 4 after cleanup completes.
+if ($null -ne $dockerFailure) {
+    # Sanitized: the exception message can carry connection details.
+    Write-Host "::error::the database step failed before returning an exit status"
+    if ($script:CleanupFailures.Count -gt 0) {
+        Write-Host "::error::sensitive-file cleanup also failed: $($script:CleanupFailures -join '; ')"
+    }
+    # psql never ran, so there is no database status to preserve. Both a
+    # clean and a failed cleanup report 4: the dedicated "probe did not
+    # complete" status, distinct from psql 1-3.
+    exit $script:CleanupOnlyExitCode
 }
 
 # Reduce the transcript, then delete it whether or not the reduction succeeded.
@@ -445,8 +545,12 @@ if ($null -ne $sanitizerFailure) {
         'evidence_status=rejected'
         "psql_exit=$code"
     )
-    Set-ProbeFailure -PrimaryStatus 1 -Context 'evidence reduction'
-    throw "BLOCKED: the psql transcript could not be reduced to allowlisted evidence, so the run is refused and nothing raw was written to the log or uploaded. $($sanitizerFailure.Exception.Message)"
+    # Report the reason BEFORE exiting: Set-ProbeFailure calls exit, so anything
+    # after it would never run. The reason is a fixed category, never the
+    # exception text -- a sanitizer exception can quote transcript content.
+    Write-Host "::error::evidence reduction failed: the psql transcript could not be reduced to allowlisted evidence, so the run is refused and nothing raw was written to the log or uploaded."
+    $reductionFailureStatus = if ($code -ne 0) { $code } else { 1 }
+    Set-ProbeFailure -PrimaryStatus $reductionFailureStatus -Context 'evidence reduction'
 }
 
 Set-Content -LiteralPath $EvidenceFile -Encoding ASCII -Value $summary

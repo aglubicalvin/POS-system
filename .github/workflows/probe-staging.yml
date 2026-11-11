@@ -70,6 +70,7 @@ jobs:
         run: bash server/tools/materialize-staging-root-cert.sh
 
       - name: Dry run or apply
+        id: probe
         shell: pwsh
         env:
           POS_STAGING_PROJECT_REF: ${{ vars.POS_STAGING_PROJECT_REF }}
@@ -85,7 +86,7 @@ jobs:
           else { ./server/tools/probe-readonly.ps1 }
 
       - name: Upload sanitized evidence
-        if: always()
+        if: ${{ always() && steps.probe.outputs.evidence_ready == 'true' }}
         uses: actions/upload-artifact@v7.0.2
         with:
           # Only the allowlisted summary: the raw psql transcript never leaves the runner.

@@ -32,7 +32,19 @@ function findPowerShell(): string | null {
 }
 
 const powershell = findPowerShell();
-const run = powershell ? it : it.skip;
+
+// A silent skip here would let CI report green while none of these scenarios
+// ran. GitHub's ubuntu-latest and windows-latest images both ship pwsh, so an
+// absent PowerShell is a broken environment, not an acceptable outcome: the
+// suite fails loudly instead.
+if (!powershell) {
+  throw new Error(
+    'PowerShell (pwsh) is required for this suite and was not found. ' +
+      'GitHub ubuntu-latest and windows-latest both preinstall it, so this ' +
+      'environment cannot validate the probe orchestration.',
+  );
+}
+const run = it;
 
 /** Load only the script's function definitions; its main body never runs. */
 function loaderSource(): string {
@@ -42,7 +54,9 @@ function loaderSource(): string {
     '$funcs = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)',
     'foreach ($f in $funcs) { . ([scriptblock]::Create($f.Extent.Text)) }',
     'foreach ($v in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {',
-    '  if ($v.Left.Extent.Text -like "*CleanupFailures") { . ([scriptblock]::Create($v.Extent.Text)) }',
+    '  if ($v.Left.Extent.Text -like "*CleanupFailures" -or $v.Left.Extent.Text -like "*CleanupOnlyExitCode") {',
+  '    . ([scriptblock]::Create($v.Extent.Text))',
+  '  }',
     '}',
     'if (-not (Get-Command Set-ProbeFailure -ErrorAction SilentlyContinue)) { throw "Set-ProbeFailure missing" }',
     'if (-not (Get-Command Clear-SensitivePaths -ErrorAction SilentlyContinue)) { throw "Clear-SensitivePaths missing" }',
@@ -74,6 +88,104 @@ function stuckDir(base: string, name: string): string {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'ca.pem'), 'CERTIFICATE-CONTENTS-MUST-NOT-LEAK', 'utf8');
   return dir;
+}
+
+interface DeferredExitPlacement {
+  dockerCatch: number;
+  certFinally: number;
+  certFinallyEnd: number;
+  certCleanup: number;
+  deferredGuard: number;
+  deferredExit: number;
+  violations: string[];
+}
+
+/** Index of the line that closes the brace block opened on `start`. */
+function closingLine(lines: string[], start: number): number {
+  let depth = 1;
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    for (const ch of line) {
+      if (ch === '{') depth++;
+      else if (ch === '}') depth--;
+    }
+    if (depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Locate the deferred Docker-failure exit and the certificate-cleanup finally it
+ * must follow, structurally.
+ *
+ * The block is found from the catch that records $dockerFailure and from the
+ * certificate-cleanup call INSIDE that finally. The first `} finally {` in the
+ * file is the SHA-256 disposal, so using it satisfied the ordering assertion
+ * while the exit could still be moved above the cleanup it depends on.
+ */
+function analyseDeferredExit(text: string): DeferredExitPlacement {
+  const lines = text.split('\n');
+  const fnStart = lines.findIndex((line) => line.includes('function Set-ProbeFailure'));
+  let fnEnd = -1;
+  for (let i = fnStart + 1; fnStart > -1 && i < lines.length; i++) {
+    const line = lines[i] ?? '';
+    if (!/^\s/.test(line) && line.trim() === '}') {
+      fnEnd = i;
+      break;
+    }
+  }
+
+  const deferredExit =
+    fnEnd > -1
+      ? lines.findIndex((line, i) => i > fnEnd && line.trim() === 'exit $script:CleanupOnlyExitCode')
+      : -1;
+  const dockerCatch = lines.findIndex((line) => line.includes('$dockerFailure = $_'));
+  const certFinally =
+    dockerCatch > -1
+      ? lines.findIndex((line, i) => i > dockerCatch && line.trim() === '} finally {')
+      : -1;
+  const certFinallyEnd = certFinally > -1 ? closingLine(lines, certFinally) : -1;
+  const certCleanup =
+    certFinally > -1 && certFinallyEnd > -1
+      ? lines.findIndex(
+          (line, i) =>
+            i > certFinally &&
+            i < certFinallyEnd &&
+            line.includes('temporary certificate directory') &&
+            line.includes('Label'),
+        )
+      : -1;
+  const deferredGuard = lines.findIndex((line) => line.includes('if ($null -ne $dockerFailure)'));
+
+  const violations: string[] = [];
+  if (fnEnd < 0) violations.push('Set-ProbeFailure has no closing brace, so its exits cannot be excluded');
+  if (dockerCatch < 0) violations.push('the catch does not record $dockerFailure, so no deferred failure is captured');
+  if (certFinally < 0) violations.push('no finally block follows the Docker catch');
+  if (certFinallyEnd < 0) violations.push('the certificate-cleanup finally block does not close');
+  if (certCleanup < 0) violations.push('the finally block does not clear the temporary certificate directory');
+  if (deferredGuard < 0) violations.push('the deferred exit is not guarded by $dockerFailure');
+  if (deferredExit < 0) violations.push('no exit outside Set-ProbeFailure uses $script:CleanupOnlyExitCode');
+  if (deferredGuard > -1 && deferredExit > -1 && deferredExit < deferredGuard) {
+    violations.push('the deferred exit occurs before the $dockerFailure guard');
+  }
+  if (certFinallyEnd > -1 && deferredExit > -1 && deferredExit < certFinallyEnd) {
+    violations.push('the deferred exit occurs before the certificate-cleanup finally block completes');
+  }
+  return { dockerCatch, certFinally, certFinallyEnd, certCleanup, deferredGuard, deferredExit, violations };
+}
+
+/** Test-only mutation: move the deferred exit above the try/finally it depends on. */
+function moveDeferredExitBeforeCertificateCleanup(text: string): string {
+  const lines = text.split('\n');
+  const start = lines.findIndex((line) => line.includes('if ($null -ne $dockerFailure)'));
+  if (start < 0) return text;
+  const end = closingLine(lines, start);
+  if (end < 0) return text;
+  const anchor = lines.findIndex((line) => line.includes('$dockerFailure = $null'));
+  if (anchor < 0 || anchor > start) return text;
+  const moved = lines.slice(start, end + 1);
+  const rest = [...lines.slice(0, start), ...lines.slice(end + 1)];
+  return [...rest.slice(0, anchor + 1), ...moved, ...rest.slice(anchor + 1)].join('\n');
 }
 
 describe('F-02 caller: cleanup failures reach the final exit status', () => {
@@ -110,7 +222,7 @@ describe('F-02 caller: cleanup failures reach the final exit status', () => {
         work,
         'case2a',
       );
-      expect(r.status, r.output).toBe(3);
+      expect(r.status, r.output).toBe(4);
       expect(r.output).toContain('raw transcript');
     } finally {
       rmSync(work, { recursive: true, force: true });
@@ -131,7 +243,7 @@ describe('F-02 caller: cleanup failures reach the final exit status', () => {
         work,
         'case2b',
       );
-      expect(r.status, r.output).toBe(3);
+      expect(r.status, r.output).toBe(4);
       expect(r.output).toContain('temporary certificate directory');
     } finally {
       rmSync(work, { recursive: true, force: true });
@@ -161,7 +273,7 @@ describe('F-02 caller: cleanup failures reach the final exit status', () => {
       // Both stuck paths are reported, and the third was still attempted.
       expect(r.output).toContain('raw transcript');
       expect(r.output).toContain('certificate copy');
-      expect(r.status, r.output).toBe(3);
+      expect(r.status, r.output).toBe(4);
       // The third path was removed, so it is not reported as a failure.
       expect(r.output).not.toContain('third path');
     } finally {
@@ -230,7 +342,7 @@ describe('F-02 caller: cleanup failures reach the final exit status', () => {
         'case7',
       );
       expect(r.output).toContain('SECOND_GONE');
-      expect(r.status, r.output).toBe(3);
+      expect(r.status, r.output).toBe(4);
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -249,7 +361,7 @@ describe('F-02 caller: cleanup failures reach the final exit status', () => {
         work,
         'case8',
       );
-      expect(r.status, r.output).toBe(3);
+      expect(r.status, r.output).toBe(4);
       expect(r.output).not.toContain('CERTIFICATE-CONTENTS-MUST-NOT-LEAK');
       expect(r.output).not.toContain('TRANSCRIPT-CONTENTS');
     } finally {
@@ -292,15 +404,61 @@ describe('F-02 caller: cleanup failures reach the final exit status', () => {
       .filter(({ line }) => /^exit\s+\S+/.test(line));
 
     const outsideFunction = exitLines.filter(({ i }) => i < fnStart || i > fnEnd);
-    // Exactly one exit may occur outside Set-ProbeFailure: the dry-run exit.
-    expect(outsideFunction.length, `exits outside Set-ProbeFailure: ${JSON.stringify(outsideFunction)}`).toBe(1);
-    expect(outsideFunction[0]?.line).toBe('exit 0');
-    // ...and it must be guarded by the dry-run condition.
-    expect(text).toContain('if (-not $Apply)');
+    // Two terminal exits are legitimate outside Set-ProbeFailure, and ONLY these
+    // two, each for a reason that means it cannot skip a collected result:
+    //
+    //   1. `exit 0` for the dry run. It happens before any sensitive file or
+    //      credential exists, so there is nothing to collect.
+    //   2. `exit $script:CleanupOnlyExitCode` in the deferred $dockerFailure
+    //      block. Docker raised before returning a status, so the exit has to
+    //      happen AFTER the finally block that performs the certificate cleanup,
+    //      and the status is the same 4 whether or not that cleanup also failed.
+    //      Routing it through Set-ProbeFailure would exit identically; it would
+    //      only change the wording that reports an additional cleanup failure.
+    expect(
+      outsideFunction.map(({ line }) => line),
+      `unexpected terminal exits outside Set-ProbeFailure: ${JSON.stringify(outsideFunction)}`,
+    ).toEqual(['exit 0', 'exit $script:CleanupOnlyExitCode']);
+
+    // The dry-run exit must be guarded by the dry-run condition.
+    const dryRunIndex = lines.findIndex((line) => line.includes('if (-not $Apply)'));
+    expect(dryRunIndex).toBeGreaterThan(-1);
+    expect(outsideFunction[0]!.i).toBeGreaterThan(dryRunIndex);
+
+    // The deferred exit must sit inside the $dockerFailure guard and after the
+    // certificate-cleanup finally block whose failure it exists to surface. That
+    // block is identified structurally from the catch that records $dockerFailure
+    // and from the cleanup call INSIDE it -- never from "the first } finally {",
+    // which in this file closes the SHA-256 disposal and proves nothing about
+    // certificate cleanup.
+    const placement = analyseDeferredExit(text);
+    expect(placement.violations, JSON.stringify(placement)).toEqual([]);
+    expect(placement.dockerCatch).toBeGreaterThan(-1);
+    expect(placement.certFinally).toBeGreaterThan(placement.dockerCatch);
+    expect(placement.certCleanup).toBeGreaterThan(placement.certFinally);
+    expect(placement.certCleanup).toBeLessThan(placement.certFinallyEnd);
+    expect(placement.deferredGuard).toBeGreaterThan(placement.certFinallyEnd);
+    expect(placement.deferredExit).toBeGreaterThan(placement.deferredGuard);
+    expect(outsideFunction[1]!.i).toBe(placement.deferredExit);
+    // Guard against regressing to the SHA-256 disposal block, which was the bug.
+    const shaDisposal = lines.findIndex((line) => line.includes('ComputeHash'));
+    expect(shaDisposal).toBeGreaterThan(-1);
+    expect(placement.certFinally).toBeGreaterThan(shaDisposal);
 
     // Inside Set-ProbeFailure, the primary status is preserved for failures.
     const functionBody = lines.slice(fnStart, fnEnd + 1).join('\n');
     expect(functionBody).toContain('exit $PrimaryStatus');
-    expect(functionBody).toContain('exit 3');
+    expect(functionBody).not.toContain('exit 4');
+  });
+
+  run('the deferred-exit placement check rejects an exit moved above certificate cleanup', () => {
+    const text = readFileSync(scriptPath, 'utf8');
+    const mutated = moveDeferredExitBeforeCertificateCleanup(text);
+    // The mutation must change the text, or the check below proves nothing.
+    expect(mutated).not.toBe(text);
+    const placement = analyseDeferredExit(mutated);
+    expect(placement.violations.join(' | '), JSON.stringify(placement)).toContain(
+      'before the certificate-cleanup finally block completes',
+    );
   });
 });

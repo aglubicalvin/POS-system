@@ -22,6 +22,38 @@ const read = (name: string) => readFileSync(resolve(workflowsDir, name), 'utf8')
 
 const IDENTITY = 'probe-staging-identity.yml';
 const ROLE = 'probe-staging.yml';
+const DEVELOPMENT_ROLE = 'probe-readonly.yml';
+
+function namedStep(yml: string, name: string): string {
+  const marker = `      - name: ${name}`;
+  const start = yml.indexOf(marker);
+  expect(start, `step ${name} is missing`).toBeGreaterThan(-1);
+  const nextStep = yml.indexOf('\n      - ', start + marker.length);
+  return yml.slice(start, nextStep < 0 ? undefined : nextStep);
+}
+
+describe('role probe evidence uploads require fresh-run readiness', () => {
+  it.each([DEVELOPMENT_ROLE, ROLE])('%s gates its upload on the identified probe step', (name) => {
+    const yml = read(name);
+    const probe = namedStep(yml, 'Dry run or apply');
+    const upload = namedStep(yml, 'Upload sanitized evidence');
+
+    expect(probe.match(/^        id: probe\r?$/gm)).toHaveLength(1);
+    expect(probe).toContain('shell: pwsh');
+    expect(upload).toMatch(/^        if: \$\{\{ always\(\) && steps\.probe\.outputs\.evidence_ready == 'true' \}\}\r?$/m);
+    expect(upload).not.toMatch(/^        if: always\(\)\r?$/m);
+    expect(upload).toContain('path: server/build/probe-readonly-evidence.txt');
+    expect(upload).toContain('if-no-files-found: ignore');
+    expect(yml.match(/uses: actions\/upload-artifact@/g)).toHaveLength(1);
+  });
+
+  it('keeps staging certificate cleanup unconditional and independent of evidence readiness', () => {
+    const yml = read(ROLE);
+    const cleanup = namedStep(yml, 'Remove staged certificate');
+    expect(cleanup).toContain('if: always()');
+    expect(cleanup).not.toContain('steps.probe.outputs.evidence_ready');
+  });
+});
 
 describe('both staging workflows receive the same connection contract', () => {
   const workflows = [IDENTITY, ROLE];
