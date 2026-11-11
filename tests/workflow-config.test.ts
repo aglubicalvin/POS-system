@@ -1,7 +1,17 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { extractProbeStep, identityWorkflowText, parseEvidence } from './helpers/probe-step.ts';
@@ -18,6 +28,12 @@ import { extractProbeStep, identityWorkflowText, parseEvidence } from './helpers
 const here = dirname(fileURLToPath(import.meta.url));
 const workflowsDir = resolve(here, '../.github/workflows');
 const read = (name: string) => readFileSync(resolve(workflowsDir, name), 'utf8');
+// The evidence rules live in a script so they can run without GitHub; the
+// workflow only invokes it. Tests read both and check each side of that split.
+const EVIDENCE_SCRIPT = readFileSync(
+  resolve(here, '../server/tools/probe-evidence.sh'),
+  'utf8',
+);
 
 const DEV_WORKFLOW = 'probe-readonly.yml';
 const STAGING_WORKFLOW = 'probe-staging.yml';
@@ -170,7 +186,7 @@ describe('identity probe exit-status and evidence handling', () => {
     // The conditional-execution pattern required by the audit: the failing
     // command is an if-condition, not a bare statement.
     expect(probeStep).toMatch(
-      /if \.\/gradlew -q execProbeState > probe-raw\.txt 2>&1; then\s*\n\s*STATUS=0\s*\n\s*else\s*\n\s*STATUS=\$\?/,);
+      /if (?:CHECK_PASS="\$PROBE_PASS_VALUE" )?\.\/gradlew --no-daemon -q execProbeState > probe-raw\.txt 2>&1; then\s*\n\s*STATUS=0\s*\n\s*else\s*\n\s*STATUS=\$\?/,);
     // errexit is not disabled to make the capture possible. Matched against
     // command lines only, so mentions of the pattern in comments don't trip it.
     expect(probeStep).not.toMatch(/^\s*(?:set \+e|set \+o errexit)\b/m);
@@ -179,16 +195,16 @@ describe('identity probe exit-status and evidence handling', () => {
   it('writes sanitized evidence whether the probe succeeds or fails', () => {
     // Evidence generation must precede the failure exit so a failed run still
     // leaves its allowlisted summary behind for the artifact step.
-    const evidenceIdx = probeStep.indexOf('tee probe-evidence.txt');
+    const evidenceIdx = probeStep.indexOf('bash tools/probe-evidence.sh');
     const failureExitIdx = probeStep.indexOf('exit "$STATUS"');
     expect(evidenceIdx).toBeGreaterThan(-1);
     expect(failureExitIdx).toBeGreaterThan(-1);
     expect(evidenceIdx).toBeLessThan(failureExitIdx);
-    // The completion field in the evidence file is derived from the captured
-    // status, not hard-coded to ok.
-    expect(probeStep).toMatch(/probe_completion=\$\{COMPLETION\}/);
-    expect(probeStep).toMatch(/COMPLETION=failed/);
-    expect(probeStep).toMatch(/COMPLETION=ok/);
+    // The completion field is derived from the captured status, not hard-coded
+    // to ok, and the script writes the evidence file on both outcomes.
+    expect(EVIDENCE_SCRIPT).toContain('probe_completion=${completion}');
+    expect(EVIDENCE_SCRIPT).toContain('completion=failed');
+    expect(EVIDENCE_SCRIPT).toContain('completion=ok');
   });
 
   it('deletes raw output and never uploads it as an artifact', () => {
@@ -213,6 +229,31 @@ describe('identity probe exit-status and evidence handling', () => {
     expect(probeStep).not.toMatch(/\.\/gradlew[^\n]*\|\| true/);
   });
 
+  it('fails a zero probe exit when the sanitized evidence is not a confirmation', () => {
+    // The helper writes the evidence file and exits 0 even for invalid evidence,
+    // so a zero probe status alone must not be able to pass the job. The step
+    // reads `probe_completion` back and requires exactly one accepted line of
+    // every kind; a duplicate or contradictory line is rejected as ambiguous.
+    const evidenceIdx = probeStep.indexOf('bash tools/probe-evidence.sh');
+    const readbackIdx = probeStep.indexOf('evidence_read_only_confirmed=$(readback');
+    const rejectedIdx = probeStep.indexOf('::error::Read-only evidence rejected');
+    expect(evidenceIdx).toBeGreaterThan(-1);
+    expect(readbackIdx, 'the step must read the evidence back').toBeGreaterThan(evidenceIdx);
+    expect(rejectedIdx, 'the step must reject unconfirmed evidence').toBeGreaterThan(readbackIdx);
+    for (const rule of [
+      "completion_ok=$(readback '^probe_completion=ok$')",
+      "evidence_read_only_confirmed=$(readback '^read_only_transaction=server_confirmed$')",
+      "evidence_probe_status_ok=$(readback '^probe_status=ok$')",
+    ]) {
+      expect(probeStep).toContain(rule);
+    }
+    // The rejection happens after the raw inventory is deleted and after the
+    // probe's own non-zero status has been preserved.
+    expect(probeStep.indexOf('rm -f probe-raw.txt')).toBeLessThan(rejectedIdx);
+    expect(probeStep.indexOf('exit "$STATUS"')).toBeLessThan(rejectedIdx);
+    expect(probeStep).toMatch(/if \[ "\$completion_lines" -ne 1 \][\s\S]*?exit 1/);
+  });
+
   // ---- read-only evidence must be derived, never asserted -----------------
 
   it('never asserts read_only_transaction unconditionally', () => {
@@ -223,17 +264,20 @@ describe('identity probe exit-status and evidence handling', () => {
     expect(probeStep).not.toContain('echo "read_only_transaction=');
   });
 
-  it('extracts the confirmation from the probe output and defaults to not_confirmed', () => {
-    // The exact probe line is matched; anything else falls back explicitly. Both
-    // the server-confirmed line and the pre-server-check `enforced` line are
-    // accepted, so a binary built before the server-side check cannot silently
-    // downgrade a genuine confirmation.
-    expect(probeStep).toContain('grep -qxE');
-    expect(probeStep).toContain('read_only_transaction=(server_confirmed|enforced)');
-    // Whatever matched, the evidence uses the current vocabulary.
-    expect(probeStep).toContain('READ_ONLY=read_only_transaction=server_confirmed');
-    expect(probeStep).toContain('READ_ONLY=read_only_transaction=not_confirmed');
-    expect(probeStep).toContain('echo "${READ_ONLY}"');
+  it('extracts only an exact server_confirmed line and defaults to not_confirmed', () => {
+    // Exactly one read_only_transaction line must be present and it must be the
+    // exact server-confirmed line. `enforced`, `on`, `off`, a missing line and
+    // duplicates are all not_confirmed; nothing is rewritten.
+    expect(EVIDENCE_SCRIPT).toContain(
+      'if [ "$read_only_lines" -eq 1 ] && [ "$confirmed_lines" -eq 1 ]; then',
+    );
+    expect(EVIDENCE_SCRIPT).toContain(
+      'read_only_transaction=server_confirmed[[:space:]]*$',
+    );
+    expect(EVIDENCE_SCRIPT).toContain('read_only=read_only_transaction=not_confirmed');
+    expect(EVIDENCE_SCRIPT).toContain('echo "$read_only"');
+    // The step never emits read_only_transaction itself; only the script does.
+    expect(probeStep).not.toMatch(/echo\s+"?read_only_transaction=/);
   });
 
   it('deletes the raw output before the step exits', () => {
@@ -246,15 +290,20 @@ describe('identity probe exit-status and evidence handling', () => {
 
   it('keeps the sanitized evidence field allowlist', () => {
     // Only these probe fields may be copied into the evidence file.
-    expect(probeStep).toMatch(
-      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\|probe_status\)='/,
+    expect(EVIDENCE_SCRIPT).toMatch(
+      /grep -E '\^\[\[:space:\]\]\+\(database\|supabase_migrations_exists\|migration_history\)='/,
     );
     // The error category is selected separately from a fixed safe token and
     // emitted only after validation; it is not copied blindly by grep.
-    expect(probeStep).toContain('echo "error_category=${ERROR_CATEGORY}"');
+    expect(EVIDENCE_SCRIPT).toContain('echo "error_category=${error_category}"');
+    // probe_status is not copied from the raw output: it is emitted once from
+    // the validated counts, so a duplicate cannot make the evidence ambiguous.
+    expect(EVIDENCE_SCRIPT).toContain('echo "probe_status=${probe_status_value}"');
+    expect(EVIDENCE_SCRIPT).toContain('probe_status_value=error');
     // The raw file is never copied or dumped into the evidence.
+    expect(EVIDENCE_SCRIPT).not.toMatch(/cat probe-raw\.txt/);
+    expect(EVIDENCE_SCRIPT).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
     expect(probeStep).not.toMatch(/cat probe-raw\.txt/);
-    expect(probeStep).not.toMatch(/tee probe-evidence\.txt < probe-raw\.txt/);
   });
 });
 
@@ -300,6 +349,13 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     const serverDir = join(dir, 'server');
     // The step starts with `cd server`; this directory holds the stub gradlew.
     mkdirSync(serverDir, { recursive: true });
+    // The step invokes `bash tools/probe-evidence.sh`, so the script it runs
+    // must be present exactly where the checkout would put it.
+    mkdirSync(join(serverDir, 'tools'), { recursive: true });
+    copyFileSync(
+      resolve(here, '../server/tools/probe-evidence.sh'),
+      join(serverDir, 'tools', 'probe-evidence.sh'),
+    );
     // The stub reads its output from an absolute path: `$0` and `pwd` are not
     // reliable under Git Bash's MSYS path translation on Windows.
     writeFileSync(join(dir, 'probe-output.txt'), probeOutput, 'utf8');
@@ -316,7 +372,15 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     const executed = spawnSync(bash as string, ['-eo', 'pipefail', scriptPath], {
       cwd: dir,
       encoding: 'utf8',
-      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '' },
+      // Git Bash's own directory is not always on PATH on Windows, and the step
+      // calls `bash tools/probe-evidence.sh` by name.
+      env: {
+        PATH: `${dirname(bash as string)}${delimiter}${process.env.PATH ?? ''}`,
+        HOME: process.env.HOME ?? '',
+        // Actions supplies CHECK_PASS to this step; the harness must too, or
+        // the step's set -u snapshot aborts before the probe starts.
+        CHECK_PASS: 'stub-check-pass',
+      },
       // A wedged child must not hang the suite forever.
       timeout: 60_000,
     });
@@ -412,15 +476,19 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     }
   });
 
-  run('accepts the pre-server-check confirmation line too', () => {
-    // A workflow can run against a ProbeState binary compiled before the
-    // server-side check existed. That binary only prints `enforced`; treating it
-    // as a near-miss would under-report a genuine confirmation.
-    const result = runStep('== read-only state probe ==\n  read_only_transaction=enforced\n  probe_status=ok', 0);
+  run('rejects the legacy `enforced` value instead of rewriting it', () => {
+    // A binary built before the server-side check only printed `enforced`; that
+    // value never demonstrated the protection, so it is not a confirmation.
+    const result = runStep(
+      '== read-only state probe ==\n  read_only_transaction=enforced\n  probe_status=ok',
+      0,
+    );
     try {
-      expect(result.status).toBe(0);
-      // Accepted as a confirmation, and normalised to the current value.
-      expect(result.evidence?.read_only_transaction).toBe('server_confirmed');
+      expect(result.status, result.stdout).toBe(1);
+      expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.evidence?.probe_completion).toBe('failed');
+      expect(result.stdout).toContain('::error::Read-only evidence rejected');
+      expect(result.rawExists).toBe(false);
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
@@ -440,8 +508,9 @@ describe('probe step evidence generation (bash, stub probe)', () => {
       0,
     );
     try {
-      expect(result.status).toBe(0);
+      expect(result.status, result.stdout).toBe(1);
       expect(result.evidence?.read_only_transaction).toBe('not_confirmed');
+      expect(result.stdout).toContain('::error::Read-only evidence rejected');
     } finally {
       rmSync(result.dir, { recursive: true, force: true });
     }
@@ -461,6 +530,7 @@ describe('probe step evidence generation (bash, stub probe)', () => {
         expect(readdirSync(join(result.dir, 'server')).sort()).toEqual([
           'gradlew',
           'probe-evidence.txt',
+          'tools',
         ]);
         const evidence = result.evidence!;
         expect(Object.keys(evidence).sort()).toEqual(
@@ -521,11 +591,192 @@ describe('probe step evidence generation (bash, stub probe)', () => {
     }
   });
 
+  /**
+   * The strict-evidence integration contract.
+   *
+   * A probe process that exits 0 is not evidence: the helper records the
+   * failure in the summary and still exits 0 so the artifact survives. These
+   * cases run the REAL workflow step body under `bash -eo pipefail` against a
+   * stub probe and require the step itself to fail.
+   */
+  const exactConfirmation = '  read_only_transaction=server_confirmed';
+  const okStatus = '  probe_status=ok';
+  const probeHeader = ['== read-only state probe ==', '  target host: db.internal:5432/postgres'];
+  const probeInventory = ['  database=postgres', '  password=sup3rs3cret', '  table=public.profiles'];
+  const rawWith = (...lines: string[]) => [...probeHeader, ...lines, ...probeInventory].join('\n');
+
+  interface InvalidEvidenceCase {
+    name: string;
+    output: string;
+    probeStatus: number;
+    expectedExit: number;
+  }
+
+  const invalidEvidenceCases: InvalidEvidenceCase[] = [
+    {
+      name: 'legacy enforced value',
+      output: rawWith('  read_only_transaction=enforced', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'on value',
+      output: rawWith('  read_only_transaction=on', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'off value',
+      output: rawWith('  read_only_transaction=off', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'missing confirmation',
+      output: rawWith(okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'duplicate confirmation',
+      output: rawWith(exactConfirmation, exactConfirmation, okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'unexpected confirmation value',
+      output: rawWith('  read_only_transaction=server_confirmed_ish', okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'duplicate probe_status=ok',
+      output: rawWith(exactConfirmation, okStatus, okStatus),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'probe_status=error',
+      output: rawWith(exactConfirmation, '  probe_status=error'),
+      probeStatus: 0,
+      expectedExit: 1,
+    },
+    {
+      name: 'exact confirmation with a non-zero probe exit',
+      output: rawWith(exactConfirmation, okStatus),
+      probeStatus: 6,
+      expectedExit: 6,
+    },
+  ];
+
+  const allowlistedKeys = [
+    'database',
+    'error_category',
+    'migration_history',
+    'probe_completion',
+    'probe_status',
+    'read_only_transaction',
+    'supabase_migrations_exists',
+    'target_project_reference',
+    'username_suffix_validation',
+  ];
+
+  for (const testCase of invalidEvidenceCases) {
+    run(`fails the workflow step on invalid evidence: ${testCase.name}`, () => {
+      const result = runStep(testCase.output, testCase.probeStatus);
+      try {
+        // Zero probe exit is not enough; the step's own status must fail, and
+        // the probe's status must be preserved when it was already non-zero.
+        expect(result.status, result.stdout).toBe(testCase.expectedExit);
+        expect(result.status).not.toBe(0);
+        // Sanitized evidence is still generated and never claims success.
+        expect(result.evidence, 'sanitized evidence must still be generated').not.toBeNull();
+        expect(result.evidence!.probe_completion).toBe('failed');
+        // probe_status is accepted only when exactly one ok line and exit 0;
+        // the confirmation failures leave it `ok` and are caught by the
+        // completion/confirmation gate instead.
+        const statusWasAccepted =
+          testCase.probeStatus === 0 &&
+          !['duplicate probe_status=ok', 'probe_status=error'].includes(testCase.name);
+        expect(result.evidence!.probe_status).toBe(statusWasAccepted ? 'ok' : 'error');
+        // Only allowlisted fields are present.
+        expect(Object.keys(result.evidence!).every((key) => allowlistedKeys.includes(key))).toBe(true);
+        // Raw inventory is deleted before the step exits.
+        expect(result.rawExists, 'probe-raw.txt must be deleted before the step exits').toBe(false);
+        // The failure is reported as an Actions error, never as success.
+        if (testCase.probeStatus === 0) {
+          expect(result.stdout).toContain('::error::Read-only evidence rejected');
+        } else {
+          expect(result.stdout).toContain(
+            `::error::Read-only identity probe failed (exit ${testCase.probeStatus})`,
+          );
+        }
+        // Raw inventory, host and secrets are never printed.
+        expect(result.stdout).not.toContain('sup3rs3cret');
+        expect(result.stdout).not.toContain('public.profiles');
+        expect(result.stdout).not.toContain('db.internal');
+      } finally {
+        rmSync(result.dir, { recursive: true, force: true });
+      }
+    });
+  }
+
   run('keeps errexit enabled and runs the probe before deleting anything', () => {
     expect(harness.script).not.toMatch(/^\s*set \+e\b/m);
     const probeIdx = harness.script.indexOf('execProbeState');
     const deleteIdx = harness.script.indexOf('rm -f probe-raw.txt');
     expect(probeIdx).toBeGreaterThan(-1);
     expect(deleteIdx).toBeGreaterThan(probeIdx);
+  });
+});
+
+
+/**
+ * Finding 4 (independent review): the staging workflow must not depend solely on
+ * an external Environment setting the reviewer could not inspect. The job that
+ * consumes staging credentials is pinned to refs/heads/main, so a manual
+ * dispatch that selects another branch is skipped before the environment, its
+ * vars or its secrets are resolved.
+ */
+describe('staging workflow main-only release gate', () => {
+  const yml = read(STAGING_WORKFLOW).replace(/\r\n/g, '\n');
+
+  it('keeps the manual-only trigger', () => {
+    expect(yml).toMatch(/^on:\s*\n\s*workflow_dispatch:/m);
+    expect(yml).not.toMatch(/^\s+(push|pull_request|schedule|workflow_run):/m);
+  });
+
+  it('restricts the job that holds staging credentials to refs/heads/main', () => {
+    // Job-level condition: evaluated before the environment, its secrets and any
+    // step. A late script check after secrets are consumed would not satisfy this.
+    expect(yml).toMatch(/^    if: github\.ref == 'refs\/heads\/main'$/m);
+    const jobIdx = yml.indexOf('\n  apply:\n');
+    const gateIdx = yml.indexOf("    if: github.ref == 'refs/heads/main'");
+    const stepsIdx = yml.indexOf('\n    steps:\n');
+    expect(jobIdx).toBeGreaterThan(-1);
+    expect(gateIdx).toBeGreaterThan(jobIdx);
+    expect(gateIdx).toBeLessThan(stepsIdx);
+    // The restriction is the job condition, not a shell test inside a step.
+    expect(yml).not.toMatch(/if \[+ "\$GITHUB_REF"/);
+  });
+
+  it('keeps the staging environment on the restricted job only', () => {
+    expect(yml).toContain('environment: pos-staging-admin');
+    expect(yml).not.toContain('environment: pos-dev-admin');
+    expect(read(DEV_WORKFLOW)).not.toContain('pos-staging-admin');
+  });
+
+  it('uploads only sanitized evidence, never a raw transcript', () => {
+    expect(yml).toContain('path: server/build/probe-readonly-evidence.txt');
+    expect(yml).not.toMatch(/probe-readonly-\*\.log/);
+    expect(yml).not.toMatch(/Tee-Object/);
+    expect(read(DEV_WORKFLOW)).toContain('path: server/build/probe-readonly-evidence.txt');
+  });
+
+  it('documents that the GitHub Environment protections are externally verified', () => {
+    // The YAML cannot prove required reviewers, prevent-self-review, the
+    // deployment branch policy or secret scoping: those live in GitHub settings.
+    expect(yml).toMatch(/NOT verified by this file/);
+    expect(yml).toMatch(/repository administrator must confirm them independently/);
   });
 });

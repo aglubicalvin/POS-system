@@ -23,6 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Dry run or apply
+        id: probe
         shell: pwsh
         env:
           PROBE_ADMIN_USER: ${{ vars.PROBE_ADMIN_USER }}
@@ -33,10 +34,11 @@ jobs:
           if ($apply) { ./server/tools/probe-readonly.ps1 -Apply }
           else { ./server/tools/probe-readonly.ps1 }
 
-      - name: Upload log
-        if: always()
+      - name: Upload sanitized evidence
+        if: ${{ always() && steps.probe.outputs.evidence_ready == 'true' }}
         uses: actions/upload-artifact@v7.0.2
         with:
-          name: probe-readonly-log
-          path: server/build/probe-readonly-*.log
+          # Only the allowlisted summary: the raw psql transcript never leaves the runner.
+          name: probe-readonly-evidence
+          path: server/build/probe-readonly-evidence.txt
           if-no-files-found: ignore
