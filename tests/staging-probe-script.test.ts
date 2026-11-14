@@ -43,7 +43,14 @@ const STAGING_KEYS = [
 
 const STAGING_REF = 'stagingref0000000001';
 const POOLER_HOST = 'aws-0-eu-west-2.pooler.supabase.com';
-const EVIDENCE_FILE = resolve(repoRoot, 'server/build/probe-readonly-evidence.txt');
+// This suite owns its evidence artifact. Three suites drive probe-readonly.ps1
+// with -Apply and Vitest runs files in parallel, so a single fixed path under
+// server/build let one file delete another's result. Production keeps its
+// default; only this suite is redirected, and the directory is removed in
+// afterAll.
+const EVIDENCE_DIR = mkdtempSync(join(tmpdir(), 'ps-evidence-artifact-'));
+const EVIDENCE_FILE = join(EVIDENCE_DIR, 'probe-readonly-evidence.txt');
+// Only used to prove no raw transcript log is ever written next to the evidence.
 const BUILD_DIR = resolve(repoRoot, 'server/build');
 
 /**
@@ -192,7 +199,7 @@ function runScript(env: Record<string, string>, args: string[] = []): ScriptRun 
   const result = spawnSync(
     powershell as string,
     ['-NoProfile', '-NonInteractive', '-File', scriptPath, ...args],
-    { env: { ...base, ...env }, encoding: 'utf8', timeout: 120_000 },
+    { env: { ...base, ...env, POS_PROBE_EVIDENCE_FILE: EVIDENCE_FILE }, encoding: 'utf8', timeout: 120_000 },
   );
   return {
     status: result.status,
@@ -238,6 +245,7 @@ function scratchDir(prefix: string): string {
 
 afterAll(() => {
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  rmSync(EVIDENCE_DIR, { recursive: true, force: true });
 });
 
 const itPS = powershell ? it : it.skip;
@@ -255,6 +263,68 @@ describe('PowerShell output normalisation', () => {
     const normalised = normalisePowerShellOutput(captured);
     expect(normalised).toContain('does not belong to the designated staging project');
     expect(normalised).not.toContain('\u001b');
+  });
+
+  // The certificate-fingerprint refusal as it reached CI run 43615851571: pwsh
+  // emitted SGR colour and split the sentence across three `|` gutter lines, so
+  // the phrase never appears contiguously in the raw capture. Windows
+  // PowerShell 5.1 prints the same refusal on one line.
+  const FINGERPRINT_PHRASE = 'does not match POS_STAGING_DB_ROOT_CERT_SHA256';
+
+  it('accepts plain one-line refusal text', () => {
+    const plain =
+      'BLOCKED: the SHA-256 of the staged root certificate does not match ' +
+      'POS_STAGING_DB_ROOT_CERT_SHA256. The certificate may have been rotated, ' +
+      'or this is not the approved staging target.';
+    expect(normalisePowerShellOutput(plain)).toContain(FINGERPRINT_PHRASE);
+  });
+
+  it('rejoins a line-wrapped refusal that carries no colour', () => {
+    const wrapped = [
+      'Exception: /home/runner/work/POS-system/POS-system/server/tools/probe-readonly.ps1:271',
+      'Line |',
+      " 271 |      throw 'BLOCKED: the SHA-256 of the staged root certificate does n\u2026",
+      '     |      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~',
+      '     | BLOCKED: the SHA-256 of the staged root certificate does not match',
+      '     | POS_STAGING_DB_ROOT_CERT_SHA256. The certificate may have been rotated,',
+      '     | or this is not the approved staging target.',
+    ].join('\n');
+
+    // The wrap alone defeats the assertion; the normaliser is what repairs it.
+    expect(wrapped).not.toContain(FINGERPRINT_PHRASE);
+    expect(normalisePowerShellOutput(wrapped)).toContain(FINGERPRINT_PHRASE);
+  });
+
+  it('strips ANSI colour before rejoining a coloured, wrapped refusal', () => {
+    const captured = [
+      "\u001b[31;1mException: \u001b[0m/home/runner/work/POS-system/POS-system/server/tools/probe-readonly.ps1:271\u001b[0m",
+      "\u001b[31;1m\u001b[0m\u001b[36;1mLine |\u001b[0m",
+      "\u001b[31;1m\u001b[0m\u001b[36;1m\u001b[36;1m 271 | \u001b[0m     \u001b[36;1mthrow 'BLOCKED: the SHA-256 of the staged root certificate does n\u001b[0m \u2026",
+      "\u001b[31;1m\u001b[0m\u001b[36;1m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[0m\u001b[36;1m     | \u001b[31;1m     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\u001b[0m",
+      "\u001b[31;1m\u001b[0m\u001b[36;1m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[31;1m\u001b[31;1m\u001b[36;1m     | \u001b[31;1mBLOCKED: the SHA-256 of the staged root certificate does not match\u001b[0m",
+      "\u001b[31;1m\u001b[0m\u001b[36;1m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[31;1m\u001b[31;1m\u001b[36;1m\u001b[31;1m\u001b[36;1m     | \u001b[31;1mPOS_STAGING_DB_ROOT_CERT_SHA256. The certificate may have been rotated,\u001b[0m",
+      "\u001b[31;1m\u001b[0m\u001b[36;1m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[0m\u001b[36;1m\u001b[31;1m\u001b[31;1m\u001b[36;1m\u001b[31;1m\u001b[36;1m\u001b[31;1m\u001b[36;1m     | \u001b[31;1mor this is not the approved staging target.\u001b[0m",
+    ].join('\n');
+
+    expect(captured).not.toContain(FINGERPRINT_PHRASE);
+    const normalised = normalisePowerShellOutput(captured);
+    expect(normalised).not.toContain('\u001b');
+    expect(normalised).toContain(FINGERPRINT_PHRASE);
+  });
+
+  it('still requires the complete phrase, not its individual words', () => {
+    // A normaliser that dropped connecting words would let a different refusal
+    // satisfy the assertion in probe-orchestration.test.ts.
+    expect(
+      normalisePowerShellOutput(
+        'BLOCKED: the SHA-256 of the staged root certificate does not match the POS_STAGING_DB_ROOT_CERT_SHA256.',
+      ),
+    ).not.toContain(FINGERPRINT_PHRASE);
+    expect(
+      normalisePowerShellOutput(
+        'BLOCKED: the SHA-256 of the staged root certificate does not match POS_STAGING_DB_ROOT_CERT',
+      ),
+    ).not.toContain(FINGERPRINT_PHRASE);
   });
 });
 

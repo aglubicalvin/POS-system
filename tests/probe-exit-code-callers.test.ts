@@ -668,6 +668,9 @@ describe('probe-readonly exit-code contract', () => {
             PROBE_PW: 'synthetic-probe-pw-not-a-credential',
             POS_REVIEWED_SECURITY_DEFINER_FUNCTIONS: 'a,b,c',
             DOCKER_CALLED: calledPath,
+            // Keep this run's artifact inside its own scratch directory: parallel
+            // test files must not share server/build/probe-readonly-evidence.txt.
+            POS_PROBE_EVIDENCE_FILE: join(work, 'probe-readonly-evidence.txt'),
           },
         },
       );

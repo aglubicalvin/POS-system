@@ -56,7 +56,16 @@ $ServerDir = Split-Path -Parent $PSScriptRoot
 $Sql = Join-Path $PSScriptRoot 'pos_probe_readonly.sql'
 $Assert = Join-Path $PSScriptRoot 'pos_probe_readonly_assert.sql'
 $Preflight = Join-Path $PSScriptRoot 'pos_probe_readonly_preflight.sql'
-$EvidenceFile = Join-Path $ServerDir 'build/probe-readonly-evidence.txt'
+# The sanitized evidence artifact. Production always uses the default path below,
+# which is the one the workflows upload. Test suites may redirect it through
+# POS_PROBE_EVIDENCE_FILE so files running in parallel cannot delete or read each
+# other's result. Nothing else sets this variable, and no validation, identity or
+# read-only control depends on the artifact's location.
+$EvidenceFile = if ([string]::IsNullOrWhiteSpace($env:POS_PROBE_EVIDENCE_FILE)) {
+    Join-Path $ServerDir 'build/probe-readonly-evidence.txt'
+} else {
+    $env:POS_PROBE_EVIDENCE_FILE
+}
 . (Join-Path $PSScriptRoot 'probe-role-evidence.ps1')
 
 # A previous run's result must never be mistaken for this one. An -Apply run

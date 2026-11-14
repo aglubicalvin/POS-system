@@ -4,6 +4,7 @@ import { createHash, generateKeyPairSync } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { normalisePowerShellOutput } from './helpers/ps-output.ts';
 
 /**
  * Production-orchestration tests for F-02.
@@ -182,22 +183,26 @@ const DOCKER_STUB = [
   '',
 ].join('\r\n');
 
-/** The script writes evidence to server/build, regardless of cwd. */
+/**
+ * The evidence artifact for THIS suite, in its own temp directory.
+ *
+ * The script writes to server/build by default, and three suites drive it with
+ * -Apply. Vitest runs test files in parallel workers, so a single fixed path let
+ * one suite delete or observe another suite's artifact. Redirecting each suite
+ * to a private file keeps production's default path untouched and removes the
+ * cross-file race. The whole directory is removed in afterAll.
+ */
+const evidenceDir = mkdtempSync(join(tmpdir(), 'probe-orch-evidence-'));
+
 function evidencePathForScript(): string {
-  return join(repoRoot, 'server', 'build', 'probe-readonly-evidence.txt');
+  return join(evidenceDir, 'probe-readonly-evidence.txt');
 }
 
 const evidencePath = evidencePathForScript();
-const evidenceBeforeSuite = existsSync(evidencePath) ? readFileSync(evidencePath) : undefined;
 
 afterAll(() => {
-  // Harness runs write only the generated evidence path. Restore its exact
-  // pre-suite bytes (or absence) so validation leaves no workspace residue.
-  rmSync(evidencePath, { recursive: true, force: true });
-  if (evidenceBeforeSuite !== undefined) {
-    mkdirSync(dirname(evidencePath), { recursive: true });
-    writeFileSync(evidencePath, evidenceBeforeSuite);
-  }
+  // Nothing outside this directory is written: every run is redirected to it.
+  rmSync(evidenceDir, { recursive: true, force: true });
 });
 
 function buildHarness(transcript: string[]): Harness {
@@ -296,6 +301,10 @@ function runScript(
     // Written by the planted holder itself, once its exclusive handle is open.
     STUB_LOCK_MARKER: join(h.work, 'lock-marker.txt'),
     ...opts.env,
+    // This suite owns its evidence artifact, and the production default stays
+    // as-is. Placed last so a caller-supplied env cannot redirect or disable the
+    // isolation, matching staging-probe-script.test.ts.
+    POS_PROBE_EVIDENCE_FILE: evidencePathForScript(),
   };
 
   const args = [
@@ -795,7 +804,12 @@ describe('production orchestration (real probe-readonly.ps1 -Apply)', () => {
     try {
       const r = runScript(h, 'ok', 0, { env: { POS_STAGING_DB_ROOT_CERT_SHA256: 'a'.repeat(64) } });
       expect(r.status, r.output).not.toBe(0);
-      expect(r.output.replace(/\s+/g, ' '), r.output).toContain(
+      // pwsh (the Linux runner's host) renders the throw in ConciseView form:
+      // ANSI colour plus a `|` gutter at the start of every wrapped line, so the
+      // raw capture never holds the phrase contiguously. Windows PowerShell 5.1
+      // prints it on one line, which is why an unwrapped comparison passed here
+      // and failed on CI.
+      expect(normalisePowerShellOutput(r.output), r.output).toContain(
         'does not match POS_STAGING_DB_ROOT_CERT_SHA256',
       );
       expect(r.events).not.toContain('docker-invoked');
