@@ -174,5 +174,17 @@ tasks.register<JavaExec>("execProbeState") {
     classpath = files(compileProbeState.map { it.outputs.files }) +
         sourceSets.main.get().runtimeClasspath
 
-    environment("PROBE_CONFIRM", "yes")
+    // Staging values are required by ProbeState itself, which fails closed with
+    // its own BLOCKED message. An unset value is passed through as blank so that
+    // validation happens in the probe rather than here.
+    environment(
+        "POS_STAGING_PROJECT_REF" to
+            (project.findProperty("POS_STAGING_PROJECT_REF") as String?
+                ?: System.getenv("POS_STAGING_PROJECT_REF") ?: ""),
+        "POS_STAGING_POOLER_HOST" to (System.getenv("POS_STAGING_POOLER_HOST") ?: ""),
+        "POS_STAGING_DB_ROOT_CERT" to (System.getenv("POS_STAGING_DB_ROOT_CERT") ?: ""),
+        "POS_STAGING_DB_ROOT_CERT_SHA256" to
+            (System.getenv("POS_STAGING_DB_ROOT_CERT_SHA256") ?: ""),
+        "PROBE_CONFIRM" to "yes",
+    )
 }
