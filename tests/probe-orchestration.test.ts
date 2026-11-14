@@ -795,7 +795,9 @@ describe('production orchestration (real probe-readonly.ps1 -Apply)', () => {
     try {
       const r = runScript(h, 'ok', 0, { env: { POS_STAGING_DB_ROOT_CERT_SHA256: 'a'.repeat(64) } });
       expect(r.status, r.output).not.toBe(0);
-      expect(r.output, r.output).toContain('does not match POS_STAGING_DB_ROOT_CERT_SHA256');
+      expect(r.output.replace(/\s+/g, ' '), r.output).toContain(
+        'does not match POS_STAGING_DB_ROOT_CERT_SHA256',
+      );
       expect(r.events).not.toContain('docker-invoked');
       // A precondition refusal removes the previous artifact rather than
       // rewriting it: there is no psql result to report, and nothing at all is
