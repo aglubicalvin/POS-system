@@ -189,11 +189,19 @@ describe.skipIf(!enabled)('F-01: the credential-bearing Gradle process terminate
           'utf8',
         );
 
+        // Fail closed. Now that the test is opted in, a missing cached
+        // distribution is a missing prerequisite, not permission to skip.
+        // A warning followed by `return` reported `passed` without ever
+        // starting Gradle, which is exactly the vacuous pass this gate exists
+        // to prevent.
+        const distsRoot = join(homedir(), '.gradle', 'wrapper', 'dists');
         const seeded = seedGradleHome(gradleHome);
-        if (!seeded) {
-          console.warn('SKIPPED: no cached Gradle distribution to seed the isolated home');
-          return;
-        }
+        expect(
+          seeded,
+          `cannot run the F-01 lifetime proof: no cached Gradle distribution to seed the isolated ` +
+            `GRADLE_USER_HOME from ${distsRoot}. Warm the cache with "server/gradlew --version" ` +
+            `(the version is pinned in server/gradle/wrapper/gradle-wrapper.properties).`,
+        ).toBe(true);
 
         const before = new Set(javaProcesses());
 
@@ -238,19 +246,42 @@ describe.skipIf(!enabled)('F-01: the credential-bearing Gradle process terminate
         const leaked = after.filter((pid) => !before.has(pid));
         expect(leaked, `new java processes survived: ${leaked.join(', ')}`).toEqual([]);
 
+        // Mandatory, not conditional. The single-use guarantee is the whole
+        // point of F-01: `--no-daemon` must leave a daemon log that records the
+        // daemon stopping when the build ends. An absent daemon directory means
+        // that guarantee was never demonstrated, so it fails rather than
+        // silently skipping the assertion.
         const daemonDir = join(gradleHome, 'daemon');
-        if (existsSync(daemonDir)) {
-          const logs = readdirSync(daemonDir, { recursive: true })
-            .map(String)
-            .filter((name) => name.endsWith('.out.log'));
-          const text = logs
-            .map((name) => readFileSync(join(daemonDir, name), 'utf8'))
-            .join('\n');
-          expect(text).toContain('Daemon will be stopped at the end of the build');
-        }
+        expect(
+          existsSync(daemonDir),
+          `no Gradle daemon log directory at ${daemonDir}: the --no-daemon single-use ` +
+            `shutdown was not demonstrated`,
+        ).toBe(true);
+        const logs = readdirSync(daemonDir, { recursive: true })
+          .map(String)
+          .filter((name) => name.endsWith('.out.log'));
+        expect(
+          logs.length,
+          `no Gradle daemon *.out.log files under ${daemonDir}: the single-use ` +
+            `shutdown was not demonstrated`,
+        ).toBeGreaterThan(0);
+        const text = logs
+          .map((name) => readFileSync(join(daemonDir, name), 'utf8'))
+          .join('\n');
+        expect(text).toContain('Daemon will be stopped at the end of the build');
 
         expect(record).not.toContain(SENTINEL);
         expect(childRecord).not.toContain(SENTINEL);
+
+        // Printed so a CI log shows the proof actually ran rather than only a
+        // green job: PIDs, liveness after the wrapper returned, and the
+        // single-use shutdown line.
+        console.log(
+          `[f01] wrapper_exit=${result.status} gradle_pid=${gradlePid} child_pid=${childPid} ` +
+            `gradle_alive=${isAlive(gradlePid)} child_alive=${isAlive(childPid)} ` +
+            `surviving_java=${leaked.length} daemon_logs=${logs.length} ` +
+            `single_use_shutdown=confirmed sentinel_on_disk=false`,
+        );
       } finally {
         rmSync(work, { recursive: true, force: true });
       }
