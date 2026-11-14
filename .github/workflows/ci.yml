@@ -136,6 +136,156 @@ jobs:
       - name: Whitespace check
         run: git diff --check HEAD^ 2>/dev/null || git diff --check
 
+  # F-01: the credential-bearing Gradle invocation in
+  # probe-staging-identity.yml must leave no process holding CHECK_PASS after
+  # the wrapper returns. That can only be demonstrated by starting a real
+  # Gradle build, so the test is opt-in (GRADLE_LIFETIME_TEST=1) and executed
+  # here as its own job instead of inside the parallel root suite, where it
+  # starves the PowerShell-based tests.
+  #
+  # A green job is not evidence: a skipped test, a missing cached
+  # distribution and a vacuous return all used to leave the suite "passing".
+  # This job therefore warms the distribution through the real wrapper, runs
+  # the real test, and then reads the log back to require the test by name,
+  # one passing test, the printed termination proof, and no skip marker.
+  gradle-lifetime-posix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm ci
+
+      # The test seeds an isolated GRADLE_USER_HOME from ~/.gradle, so the
+      # pinned distribution must already be cached. Warming it through the
+      # repository's own wrapper (never a downloaded Gradle binary) also proves
+      # the wrapper reports the version pinned in gradle-wrapper.properties.
+      - name: Warm the pinned Gradle distribution through the real wrapper
+        working-directory: server
+        run: |
+          set -euo pipefail
+          ./gradlew --version | tee gradle-wrapper-version.log
+          pinned=$(sed -n 's/.*gradle-\([0-9][0-9.]*\)-bin\.zip.*/\1/p' gradle/wrapper/gradle-wrapper.properties)
+          if [ -z "$pinned" ]; then
+            echo "::error::could not read the pinned Gradle version from gradle-wrapper.properties"
+            exit 1
+          fi
+          if ! grep -qx "Gradle ${pinned}" gradle-wrapper-version.log; then
+            echo "::error::the wrapper did not report the pinned Gradle ${pinned}"
+            exit 1
+          fi
+          if [ ! -d "${HOME}/.gradle/wrapper/dists/gradle-${pinned}-bin" ]; then
+            echo "::error::the pinned distribution was not cached at ~/.gradle/wrapper/dists/gradle-${pinned}-bin"
+            exit 1
+          fi
+
+      - name: Gradle process-lifetime proof (real build, opt-in gate)
+        env:
+          GRADLE_LIFETIME_TEST: '1'
+        run: |
+          set -uo pipefail
+          log=gradle-lifetime-posix.log
+          # The pipeline runs as an if-condition so a non-zero test exit is
+          # captured (errexit is still on for every other command) and the
+          # evidence below can be asserted before the step decides its status.
+          if npx vitest run tests/gradle-process-lifetime.test.ts --reporter=verbose 2>&1 | tee "$log"; then
+            status=0
+          else
+            status=${PIPESTATUS[0]}
+          fi
+
+          # Strip ANSI so the assertions read the plain text of the log.
+          sed -E 's/\x1B\[[0-9;]*[mK]//g' "$log" > "$log.plain"
+
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the F-01 lifetime test exited ${status}"
+            exit "$status"
+          fi
+
+          # Running and passing, by name. `1 passed` also rules out a suite
+          # that reported only skips.
+          grep -q 'F-01: the credential-bearing Gradle process terminates' "$log.plain" || {
+            echo "::error::the F-01 test was not selected or did not report"
+            exit 1
+          }
+          grep -q 'runs the real wrapper with --no-daemon and leaves no process holding the sentinel' "$log.plain" || {
+            echo "::error::the real-wrapper lifetime test did not report"
+            exit 1
+          }
+          grep -q 'Tests  1 passed (1)' "$log.plain" || {
+            echo "::error::expected exactly one passing test"
+            exit 1
+          }
+          if grep -qE 'skipped|SKIPPED|no cached Gradle distribution' "$log.plain"; then
+            echo "::error::the F-01 test was skipped or its prerequisite was missing; that is not a pass"
+            exit 1
+          fi
+
+          # The proof the test prints after the build: both recorded PIDs are
+          # gone, no Java process survived, and the single-use daemon recorded
+          # that it stopped at the end of the build.
+          grep -qE 'gradle_alive=false child_alive=false' "$log.plain" || {
+            echo "::error::the Gradle process or the child JVM was still alive"
+            exit 1
+          }
+          grep -q 'surviving_java=0' "$log.plain" || {
+            echo "::error::a Java process created by the test survived"
+            exit 1
+          }
+          grep -q 'single_use_shutdown=confirmed' "$log.plain" || {
+            echo "::error::the single-use daemon shutdown was not demonstrated"
+            exit 1
+          }
+          grep -q 'sentinel_on_disk=false' "$log.plain" || {
+            echo "::error::the sentinel was written to disk"
+            exit 1
+          }
+
+          echo "F-01 lifetime proof executed and passed on $(uname -srm)"
+
+      - name: Environment record
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            date -u
+            uname -a
+            node -v || true
+            npx vitest --version || true
+            (java -version 2>&1) || true
+            (pgrep --version 2>&1 | head -1) || true
+            ls -d "${HOME}"/.gradle/wrapper/dists/gradle-*-bin 2>/dev/null || echo "no cached distribution"
+          } | tee gradle-lifetime-environment.txt
+
+      - name: Upload lifetime proof log
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: gradle-lifetime-posix
+          path: |
+            gradle-lifetime-posix.log
+            gradle-lifetime-posix.log.plain
+            gradle-lifetime-environment.txt
+            server/gradle-wrapper-version.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   # The admin app was never built or tested in CI, which is how its lockfile
   # drifted from package.json (expo-secure-store 57.0.4 vs ~58.0.2) and broke
   # `npm ci` without anyone noticing. This job installs exactly what the
