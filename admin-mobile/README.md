@@ -39,6 +39,7 @@ npm run ios                  # iOS Simulator
 npm run android              # Android Emulator
 npm run typecheck            # tsc --noEmit
 npm test                     # vitest: auth gate + sales-summary logic
+npm run expo:compat          # blocking Expo SDK baseline check (offline)
 ```
 
 Create the admin account: add the auth user in the Supabase dashboard (or
@@ -77,3 +78,68 @@ the mobile bundle.
 money formatting) in node. Backend/RLS behavior is asserted against real
 PostgreSQL in the Kotlin server's test suite wherever behavior belongs to
 the server.
+
+## Expo SDK compatibility baseline
+
+`expo-compat-baseline.json` records the package versions that the installed
+Expo SDK considers compatible (`node_modules/expo/bundledNativeModules.json`),
+anchored to the exact `expo` version in `package.json`. It is committed,
+reviewed like source code, and it is the only input to the blocking
+compatibility check.
+
+Why it exists: `expo-doctor` asks `api.expo.dev` for its expectations at run
+time. Expo publishes new patches most days, so the same commit can be green
+today and red tomorrow without a line changing. The baseline makes "are our
+dependencies compatible with SDK 58?" a property of the repository instead of
+a property of the calendar.
+
+What `npm run expo:compat` verifies (offline, no network):
+
+- The installed `expo` matches the baseline anchor, so the SDK matrix cannot
+  change silently underneath the repository.
+- The installed `expo/bundledNativeModules.json` still contains the committed
+  ranges; drift there means the baseline must be regenerated.
+- Every package declared in `package.json` is either covered by the matrix or
+  recorded under `notInSdkMatrix` with a reason.
+- Declared ranges are a subset of the SDK range, so any version an install
+  could pick stays inside the SDK contract (`^58.0.32` fails against
+  `~58.0.32`, even though both resolve to 58.0.32 today).
+- Installed versions satisfy both the declared range and the SDK range, and a
+  declared package missing from `node_modules` fails explicitly.
+- Incomplete validation is a failure, never a silent pass: missing
+  `node_modules`, an unreadable baseline or malformed JSON all exit non-zero.
+
+CI runs this check as a blocking step. `expo-doctor` still runs in the same
+job, pinned to a known version, but with `continue-on-error: true`: a red
+advisory step means upstream published something worth looking at, and it
+must not be the thing that decides whether a pull request is mergeable.
+
+### Updating the baseline
+
+Only when you intentionally move Expo versions:
+
+```bash
+cd admin-mobile
+npm install                     # or: npx expo install <packages>
+npm run expo:baseline:generate  # rewrites expo-compat-baseline.json
+git diff expo-compat-baseline.json
+```
+
+Review every changed range in that diff before committing - that diff is the
+contract CI enforces. The generator refuses to run in CI, and the baseline
+must never be hand-edited to make a check pass. If the checker reports "SDK
+metadata drift", the installed `expo` changed: regenerate, review, and commit
+the baseline together with the dependency change.
+
+### What "compatible" does and does not prove
+
+- Passing the baseline check and the export proves the JavaScript side
+  bundles and that declared dependencies match the SDK's own matrix.
+- `npx expo export --platform android` produces a Hermes bundle; it does not
+  compile native code.
+- `npx expo prebuild` generates a native project; it does not prove that
+  native code compiles.
+- A real Android APK/AAB needs a Gradle build against the Android SDK, NDK and
+  CMake. A real iOS build needs macOS with Xcode. Neither is produced on
+  Windows, and no CI job in this repository produces them today, so nothing
+  here is evidence of native build readiness.
