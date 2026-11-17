@@ -202,10 +202,30 @@ if (failures.length === 0) {
           '    Run `npm run expo:baseline:generate` and review the diff.',
       );
     }
+
+    // Fail closed: a package outside the SDK matrix has no upstream range to fall
+    // back on, so a specification this checker cannot evaluate (file:, git+,
+    // workspace:, a URL, a tag) must never be treated as verified.
+    const rangeIsSemver = semver.validRange(declaredRange) !== null;
+    if (!rangeIsSemver) {
+      fail(
+        `"${name}": package.json declares "${declaredRange}", which is not a semver range.\n` +
+          '    This package is outside the Expo SDK matrix, so there is no upstream range to\n' +
+          '    verify it against; a non-semver specification cannot be checked and is not\n' +
+          '    accepted silently. Declare a semver range, or extend this checker to resolve\n' +
+          '    the specification before the requirement changes.',
+      );
+    }
+
     const installed = installedVersion(name);
     if (installed === null) {
       fail(`"${name}": declared in package.json but not installed in node_modules (missing required package).`);
-    } else if (semver.validRange(declaredRange) && !semver.satisfies(installed, declaredRange)) {
+    } else if (!semver.valid(installed)) {
+      fail(
+        `"${name}": installed node_modules/${name}/package.json has an invalid version "${installed}".\n` +
+          '    Compatibility cannot be established from unverifiable package metadata.',
+      );
+    } else if (rangeIsSemver && !semver.satisfies(installed, declaredRange)) {
       fail(`"${name}": installed ${installed} does not satisfy the declared range ${declaredRange}.`);
     }
     notes.push(`"${name}" is outside the SDK matrix and explicitly handled (${entry.range}).`);
