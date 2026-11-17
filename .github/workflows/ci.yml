@@ -139,8 +139,9 @@ jobs:
   # The admin app was never built or tested in CI, which is how its lockfile
   # drifted from package.json (expo-secure-store 57.0.4 vs ~58.0.2) and broke
   # `npm ci` without anyone noticing. This job installs exactly what the
-  # lockfile pins, runs the unit tests, and runs expo-doctor for SDK
-  # compatibility.
+  # lockfile pins, runs the unit tests, then validates Expo SDK compatibility
+  # twice: the committed baseline is the blocking, deterministic check, and
+  # Expo Doctor stays enabled as an advisory signal for upstream drift.
   admin-mobile:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -165,5 +166,19 @@ jobs:
       - name: Unit tests
         run: npx vitest run
 
-      - name: Expo SDK compatibility
-        run: npx expo-doctor
+      # Blocking and deterministic: compares the committed dependency set with
+      # the committed baseline (expo-compat-baseline.json) and with the matrix
+      # that ships inside the installed `expo` package. No network, no upstream
+      # metadata, so an unchanged commit always yields the same verdict.
+      - name: Expo SDK compatibility - committed baseline (blocking)
+        run: npm run expo:compat
+
+      # Advisory: `expo-doctor` resolves its "expected" versions from
+      # api.expo.dev at run time, so an unchanged commit can turn red the day
+      # Expo publishes a patch. Pinning the executable does NOT freeze that
+      # metadata. A failure here means upstream drift worth reviewing, not a
+      # reason to block a merge; the blocking guarantee is the baseline step
+      # above. Updating the pinned version is a deliberate, reviewed change.
+      - name: Expo SDK compatibility - Expo Doctor (advisory, upstream metadata)
+        run: npx expo-doctor@1.21.8
+        continue-on-error: true
